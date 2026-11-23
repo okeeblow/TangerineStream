@@ -16,7 +16,8 @@ struct Thumbnail {
 class ArtworkLoader {
 public:
     static constexpr UINT readyMessage = WM_APP + 3;
-    const UINT trackReadyMessage;
+    const UINT coverReadyMessage;
+    const UINT lyricsReadyMessage;
     using Generation = std::uint64_t;
 
     ArtworkLoader(Store& store, HWND player);
@@ -29,6 +30,7 @@ public:
     bool request(Generation generation, Id server, int row, int size, const LibraryItem& item);
     std::vector<Thumbnail> take(Generation generation);
     void requestTrack(Id key, bool priority = false);
+    void stageCover(const Track& track);
     std::string trackArtwork(const Track& track);
 
 private:
@@ -55,10 +57,10 @@ private:
 
     void load();
     void loadTrack(Id key);
+    void notifyPlayer(UINT message, Id key);
     void stop();
 };
 
 HBITMAP thumbnailBitmap(int size, const std::vector<std::uint32_t>& pixels);
-const wchar_t* artworkExtension(std::string_view data);
 
 } // namespace tangerine

@@ -5,6 +5,8 @@
 #include "sdk_services.hpp"
 #include <api/service/waservicefactory.h>
 #include <api/memmgr/api_memmgr.h>
+#include <api/syscb/api_syscb.h>
+#include <api/syscb/callbacks/syscb.h>
 #include <AlbumArt/svc_albumArtProvider.h>
 #include <Metadata/svc_metatag.h>
 #include <cstring>
@@ -61,7 +63,7 @@ public:
     int _dispatch(int message, void* result, void** args, int count) override {
         try {
             switch (message) {
-            case SVC_ALBUMARTPROVIDER_PROVIDERTYPE: return returnValue(result, 1); // Database provider
+            case SVC_ALBUMARTPROVIDER_PROVIDERTYPE: return returnValue(result, int(ALBUMARTPROVIDER_TYPE_DATABASE));
             case SVC_ALBUMARTPROVIDER_GETALBUMARTDATA:
                 if (count != 5) return 0;
                 return returnValue(result, get(*static_cast<const wchar_t**>(args[0]),
@@ -261,5 +263,18 @@ HostMetadataServices::HostMetadataServices(void* services, Store& store, const P
 }
 
 HostMetadataServices::~HostMetadataServices() = default;
+
+void HostMetadataServices::artworkChanged(const wchar_t* filename) {
+    if (!registration_) return;
+    auto* factory = registration_->services.service_getServiceByGuid(syscbApiServiceGuid);
+    if (!factory) return;
+    auto* callbacks = static_cast<api_syscb*>(factory->getInterface(FALSE));
+    if (callbacks) {
+        // MetadataCallback::ART_UPDATED, from Wasabi's metacb.h (omitted from the packaged SDK).
+        constexpr int artUpdated = 20;
+        callbacks->syscb_issueCallback(SysCallback::META, artUpdated, reinterpret_cast<intptr_t>(filename), 0);
+        factory->releaseInterface(callbacks);
+    }
+}
 
 } // namespace tangerine

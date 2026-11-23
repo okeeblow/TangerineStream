@@ -51,7 +51,7 @@ int init();
 void quit();
 INT_PTR message(int type, INT_PTR a, INT_PTR b, INT_PTR c);
 
-char description[] = "Tangerine Stream v0.4.1";
+char description[] = "Tangerine Stream v0.4.2";
 winampMediaLibraryPlugin plugin = [] {
     winampMediaLibraryPlugin descriptor{};
 #ifdef MLHDR_VER_OLD
@@ -227,8 +227,23 @@ public:
     void finishAlbums();
     void preparePlayback(const Track& track, const wchar_t* filename, bool cacheAudio);
     void finishPlayback();
-    void updateSidecars(Id key);
-
+    void updateLyrics(Id key);
+    std::wstring playlistFile(const Track& track) {
+        auto name = playback.playlistFile(track);
+        artwork.stageCover(track);
+        artwork.requestTrack(track.key);
+        return name;
+    }
+    std::wstring displayedReference(Id key) {
+        {
+            std::scoped_lock lock(sidecarMutex);
+            if (sidecarKey == key) return sidecarReference.wstring();
+        }
+        const auto index = static_cast<int>(player(IPC_GETLISTPOS));
+        if (index < 0) return {};
+        const auto file = reinterpret_cast<const wchar_t*>(player(IPC_GETPLAYLISTFILEW, index));
+        return reinterpret_cast<UINT_PTR>(file) > 1 && playback.key(file) == key ? file : L"";
+    }
 
     Store store;
     Playback playback;
@@ -257,7 +272,7 @@ private:
     std::mutex sidecarMutex;
     Id sidecarKey = 0;
     std::filesystem::path sidecarReference;
-    std::vector<std::filesystem::path> sidecars;
+    std::filesystem::path lyricsFile;
     Playing playing;
     bool sampling = false;
     std::deque<std::pair<Track, std::int64_t>> unwrittenReports;
@@ -286,23 +301,26 @@ App* inputProfile = nullptr;
 
 void App::finishPlayback() {
     std::scoped_lock lock(sidecarMutex);
-    for (const auto& path : sidecars) {
+    if (!lyricsFile.empty()) {
         std::error_code error;
-        std::filesystem::remove(path, error);
+        std::filesystem::remove(lyricsFile, error);
+        lyricsFile.clear();
     }
-    sidecars.clear();
     sidecarReference.clear();
     sidecarKey = 0;
+    store.activeCover(0);
 }
 
 void App::preparePlayback(const Track& track, const wchar_t* filename, bool cacheAudio) {
     finishPlayback();
     if (std::wstring_view(filename).find(L"://") == std::wstring_view::npos) {
         std::scoped_lock lock(sidecarMutex);
+        store.activeCover(track.key);
         sidecarKey = track.key;
         sidecarReference = filename;
     }
-    updateSidecars(track.key);
+    artwork.stageCover(track);
+    updateLyrics(track.key);
     artwork.requestTrack(track.key, true);
     if (cacheAudio && store.rollingMiB() > 0) {
         {
@@ -314,28 +332,21 @@ void App::preparePlayback(const Track& track, const wchar_t* filename, bool cach
     }
 }
 
-void App::updateSidecars(Id key) {
+void App::updateLyrics(Id key) {
     std::scoped_lock lock(sidecarMutex);
-    if (sidecarKey != key || sidecarReference.empty()) return;
-    auto write = [&](const std::filesystem::path& path, const std::string& data) {
-        if (std::find(sidecars.begin(), sidecars.end(), path) != sidecars.end()) return;
-        auto temporary = path;
-        temporary += L".tmp";
-        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-        output.write(data.data(), data.size());
-        output.close();
-        if (output && MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
-            sidecars.push_back(path);
-        else DeleteFileW(temporary.c_str());
-    };
+    if (sidecarKey != key || sidecarReference.empty() || !lyricsFile.empty()) return;
     auto lyrics = store.lyrics(key);
-    if (lyrics && !lyrics->plain.empty()) {
-        auto path = sidecarReference;
-        write(path.replace_extension(L".txt"), "\xef\xbb\xbf" + lyrics->plain);
-    }
-    auto image = artwork.trackArtwork(store.track(key));
-    if (auto ext = artworkExtension(image))
-        write(sidecarReference.parent_path() / (std::wstring(L"cover.") + ext), image);
+    if (!lyrics || lyrics->plain.empty()) return;
+    auto path = sidecarReference;
+    path.replace_extension(L".txt");
+    auto temporary = path;
+    temporary += L".tmp";
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    output << "\xef\xbb\xbf" << lyrics->plain;
+    output.close();
+    if (output && MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+        lyricsFile = std::move(path);
+    else DeleteFileW(temporary.c_str());
 }
 
 int inputQuery(InputRequest request, const wchar_t* filename, const wchar_t* field,
@@ -345,7 +356,12 @@ int inputQuery(InputRequest request, const wchar_t* filename, const wchar_t* fie
     if (!owner || !filename) return 0;
     auto id = owner->playback.key(filename);
     if (!id) return 0;
-    if (request == InputRequest::recognize) return 1;
+    if (request == InputRequest::recognize) {
+        auto track = owner->store.track(id);
+        if (!track.key) return 0;
+        owner->artwork.stageCover(track);
+        return 1;
+    }
     if (request == InputRequest::ended) { owner->finishPlayback(); return 1; }
     if (!dest || !capacity) return 0;
     auto track = owner->store.track(id);
@@ -419,7 +435,7 @@ void App::finishAlbums() {
         std::vector<itemRecordW> records(tracks.size());
         for (size_t i = 0; i < tracks.size(); ++i) {
             const auto& t = tracks[i];
-            tags.push_back({playback.playlistFile(t), wide(t.title), wide(t.artist), wide(t.album)});
+            tags.push_back({playlistFile(t), wide(t.title), wide(t.artist), wide(t.album)});
             auto& tag = tags.back();
             auto& record = records[i];
             record.filename = tag.url.data();
@@ -429,7 +445,6 @@ void App::finishAlbums() {
             record.length = t.duration;
             record.track = t.trackNumber;
             record.disc = t.discNumber;
-            artwork.requestTrack(t.key);
         }
         const int count = static_cast<int>(records.size());
         itemRecordListW list{records.data(), count, count};
@@ -763,23 +778,18 @@ LRESULT CALLBACK playerProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, D
     if (app && msg == WM_WA_IPC) {
         try { if (supplyMetadata(l, w)) return TRUE; } catch (const std::exception&) {}
     }
-    if (app && app->artwork.trackReadyMessage && msg == app->artwork.trackReadyMessage) {
+    if (app && msg && (msg == app->artwork.coverReadyMessage || msg == app->artwork.lyricsReadyMessage)) {
         try {
             auto key = static_cast<Id>((std::uint64_t(static_cast<DWORD>(l)) << 32) | static_cast<DWORD>(w));
-            app->updateSidecars(key);
-            auto index = static_cast<int>(player(IPC_GETLISTPOS));
-            auto filename = index < 0 ? nullptr :
-                reinterpret_cast<const wchar_t*>(player(IPC_GETPLAYLISTFILEW, index));
-            // The native windows can follow a selected playlist item while another song plays.
-            std::wstring updated;
-            if (reinterpret_cast<UINT_PTR>(filename) > 1 && app->playback.key(filename) == key)
-                updated = filename;
-            else {
-                auto track = app->store.track(key);
-                if (track.key) updated = app->playback.playlistFile(track);
+            auto filename = app->displayedReference(key);
+            if (!filename.empty()) {
+                if (msg == app->artwork.coverReadyMessage) {
+                    app->hostMetadata.artworkChanged(filename.c_str());
+                } else {
+                    app->updateLyrics(key);
+                    player(IPC_FILE_TAG_MAY_HAVE_UPDATEDW, reinterpret_cast<WPARAM>(filename.c_str()));
+                }
             }
-            if (!updated.empty())
-                player(IPC_FILE_TAG_MAY_HAVE_UPDATEDW, reinterpret_cast<WPARAM>(updated.c_str()));
         } catch (const std::exception&) {}
         return 0;
     }
@@ -908,6 +918,10 @@ public:
     void command(int id, int notification);
     void refresh();
     void updateButtons();
+    void prefetchTrack(int row) {
+        if (showTracks() && row >= 0 && static_cast<size_t>(row) < tracks.size())
+            app->artwork.requestTrack(tracks[row].key);
+    }
     void layout(int width, int height);
     void beginDrag(const NMLISTVIEW& notification);
     void drag(POINT point, bool released);
@@ -1083,6 +1097,7 @@ void View::receive(SearchResult result) {
     more = result.page.more && nextOffset < INT_MAX - pageSize && (emptyPage || rowCount() != oldCount);
     nextOffset += pageSize;
     updateRowCount();
+    if (!oldCount) prefetchTrack(0);
     if (emptyPage || rowCount() < 12) scheduleMore();
 }
 
@@ -1423,10 +1438,9 @@ void View::play(bool enqueue) {
     updateStatus();
     if (!enqueue) player(IPC_DELETE);
     for (const auto& track : items) {
-        auto url = app->playback.playlistFile(track);
+        auto url = app->playlistFile(track);
         auto title = wide(playlistTitle(track));
         enqueueFileWithMetaStructW item{url.c_str(), title.c_str(), track.duration ? track.duration : -1};
-        app->artwork.requestTrack(track.key);
         player(IPC_ENQUEUEFILEW, reinterpret_cast<WPARAM>(&item));
     }
     if (!enqueue) player(IPC_STARTPLAY);
@@ -1632,6 +1646,11 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             }
             if (notification->code == LVN_ITEMCHANGED || notification->code == LVN_ODSTATECHANGED)
                 view->updateButtons();
+            if (notification->code == LVN_ITEMCHANGED) {
+                const auto& change = *reinterpret_cast<const NMLISTVIEW*>(l);
+                if ((change.uNewState & LVIS_FOCUSED) && !(change.uOldState & LVIS_FOCUSED))
+                    view->prefetchTrack(change.iItem);
+            }
             break;
         }
         case WM_TIMER:

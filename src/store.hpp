@@ -40,6 +40,8 @@ public:
     Track track(Id key);
     std::string albumCover(Id server, const std::string& albumId);
     std::string artwork(Id server, const LibraryItem& item);
+    bool stageCover(const Track& track, const LibraryItem& song, const LibraryItem& album);
+    void activeCover(Id key);
     void saveArtwork(Id server, const LibraryItem& item, const std::string& data);
     std::optional<Lyrics> lyrics(Id key, bool fresh = false);
     void saveLyrics(Id key, const Lyrics& lyrics);
@@ -81,6 +83,7 @@ private:
     std::map<Id, std::chrono::steady_clock::time_point> retryConnection_;
     std::int64_t budget_ = 0;
     bool offline_ = false;
+    Id activeCover_ = 0;
 };
 
 } // namespace tangerine

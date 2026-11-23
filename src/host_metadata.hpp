@@ -20,6 +20,7 @@ public:
     ~HostMetadataServices();
     HostMetadataServices(const HostMetadataServices&) = delete;
     HostMetadataServices& operator=(const HostMetadataServices&) = delete;
+    void artworkChanged(const wchar_t* filename);
 
 private:
     struct Registration;

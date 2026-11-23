@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <charconv>
 #include <set>
+#include <fstream>
 #include <system_error>
 
 // The plugin uses the SQLite C ABI exported by Windows 10 and later.
@@ -209,6 +210,8 @@ Store::Store(const std::filesystem::path& directory) : cache_(directory / L"cach
             "PRIMARY KEY(server,cover_key)) WITHOUT ROWID").run();
         Statement(db_, "CREATE TABLE IF NOT EXISTS lyrics (track INTEGER PRIMARY KEY REFERENCES tracks(key),"
             "plain TEXT NOT NULL,structured TEXT NOT NULL,checked INTEGER NOT NULL)").run();
+        Statement(db_, "CREATE TABLE IF NOT EXISTS playlist_covers (track INTEGER PRIMARY KEY,"
+            "cover_key TEXT NOT NULL,ext TEXT NOT NULL,bytes INTEGER NOT NULL,last_use INTEGER NOT NULL)").run();
         migration.commit();
         auto budget = setting("rolling_mib");
         budget_ = (budget.empty() ? defaultBudget : std::stoi(budget)) * MiB;
@@ -567,10 +570,95 @@ std::string Store::artwork(Id server, const LibraryItem& item) {
     return data;
 }
 
+void Store::activeCover(Id key) {
+    std::scoped_lock lock(mutex_);
+    activeCover_ = key;
+}
+
+// WACUP can look for folder art as soon as a marker enters the playlist.
+// Keep these native-readable copies bounded independently of the database blobs.
+bool Store::stageCover(const Track& track, const LibraryItem& song, const LibraryItem& album) {
+    std::scoped_lock lock(mutex_);
+    auto directory = cache_.parent_path() / L"items" / std::to_wstring(track.key);
+    std::error_code ec;
+    if (!std::filesystem::is_directory(directory, ec)) return false;
+    const auto primary = artworkKey(song);
+    Statement match(db_, "SELECT cover_key,length(data) FROM artwork WHERE server=? AND cover_key IN (?,?)"
+                         " ORDER BY cover_key=? DESC LIMIT 1");
+    match.bind(track.server).bind(primary).bind(album.target.id.empty() ? primary : artworkKey(album)).bind(primary);
+    if (!match.row()) return false;
+    const auto key = match.text(0);
+    const auto bytes = match.integer(1);
+    auto pathFor = [&](Id id, const std::string& ext) {
+        return cache_.parent_path() / L"items" / std::to_wstring(id) / (L"cover." + wide(ext));
+    };
+    auto validExt = [](const std::string& ext) {
+        return ext == "jpg" || ext == "png" || ext == "gif" || ext == "bmp" || ext == "webp";
+    };
+    std::string oldExt;
+    {
+        Statement old(db_, "SELECT cover_key,ext,bytes,last_use FROM playlist_covers WHERE track=?");
+        old.bind(track.key);
+        if (old.row()) {
+            oldExt = old.text(1);
+            if (!validExt(oldExt)) oldExt.clear();
+            if (!oldExt.empty() && old.text(0) == key && old.integer(2) == bytes &&
+                std::filesystem::file_size(pathFor(track.key, oldExt), ec) == static_cast<uintmax_t>(bytes) && !ec) {
+                // Avoid journaling on every metadata query during playback.
+                if (old.integer(3) < nowMs() - 60000)
+                    Statement(db_, "UPDATE playlist_covers SET last_use=? WHERE track=?")
+                        .bind(nowMs()).bind(track.key).run();
+                return false;
+            }
+        }
+    }
+    Statement payload(db_, "SELECT data FROM artwork WHERE server=? AND cover_key=?");
+    payload.bind(track.server).bind(key);
+    if (!payload.row()) return false;
+    auto data = payload.blob(0);
+    auto ext = artworkExtension(data);
+    if (!ext) return false;
+    auto path = directory / (std::wstring(L"cover.") + ext);
+    auto tmp = directory / L"cover.tmp";
+    std::ofstream output(tmp, std::ios::binary | std::ios::trunc);
+    output.write(data.data(), data.size());
+    output.close();
+    if (!output || !MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    if (!oldExt.empty() && wide(oldExt) != ext) DeleteFileW(pathFor(track.key, oldExt).c_str());
+    Transaction transaction(db_);
+    Statement(db_, "INSERT OR REPLACE INTO playlist_covers VALUES(?,?,?,?,?)")
+        .bind(track.key).bind(key).bind(utf8(ext)).bind(bytes).bind(nowMs()).run();
+
+    Statement overflow(db_, "SELECT track,ext FROM (SELECT track,ext,"
+        "sum(bytes) OVER (ORDER BY (track=? OR track=?) DESC,last_use DESC,track) AS total "
+        "FROM playlist_covers) WHERE total>?");
+    overflow.bind(activeCover_).bind(track.key).bind(24 * MiB);
+    std::vector<std::pair<Id, std::string>> evict;
+    while (overflow.row()) evict.emplace_back(overflow.integer(0), overflow.text(1));
+    for (const auto& [id, extension] : evict) {
+        if (validExt(extension)) {
+            auto old = pathFor(id, extension);
+            DeleteFileW((old.parent_path() / L"cover.tmp").c_str());
+            if (!DeleteFileW(old.c_str())) {
+                const auto error = GetLastError();
+                if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) continue;
+            }
+        }
+        Statement(db_, "DELETE FROM playlist_covers WHERE track=?").bind(id).run();
+    }
+    transaction.commit();
+    return true;
+}
+
 void Store::saveArtwork(Id server, const LibraryItem& item, const std::string& data) {
     if (data.empty()) return;
     std::scoped_lock lock(mutex_);
     Transaction transaction(db_);
+    Statement(db_, "UPDATE playlist_covers SET cover_key='' WHERE cover_key=? AND track IN"
+        " (SELECT key FROM tracks WHERE server=?)").bind(artworkKey(item)).bind(server).run();
     Statement(db_, "INSERT INTO artwork VALUES(?,?,?,?) ON CONFLICT(server,cover_key) DO UPDATE SET"
         " data=excluded.data,last_use=excluded.last_use")
         .bind(server).bind(artworkKey(item)).bindBlob(data).bind(nowMs()).run();

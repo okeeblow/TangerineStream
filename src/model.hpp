@@ -100,6 +100,7 @@ std::wstring wide(std::string_view value);
 std::string utf8(std::wstring_view value);
 bool matches(const std::string& value, const std::wstring& query);
 std::string playlistTitle(const Track& track);
+const wchar_t* artworkExtension(std::string_view data);
 std::string randomHex();
 std::int64_t nowMs();
 

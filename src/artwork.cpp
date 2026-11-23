@@ -87,7 +87,8 @@ std::vector<std::uint32_t> decode(IWICImagingFactory* factory, std::string& byte
 } // namespace
 
 ArtworkLoader::ArtworkLoader(Store& store, HWND player)
-    : trackReadyMessage(RegisterWindowMessageW(L"ml_tangerinestream.trackMetadataReady")),
+    : coverReadyMessage(RegisterWindowMessageW(L"ml_tangerinestream.coverReady")),
+      lyricsReadyMessage(RegisterWindowMessageW(L"ml_tangerinestream.lyricsReady")),
       store_(store), player_(player) {
     try {
         for (int i = 0; i < 3; ++i) workers_.emplace_back([this] { load(); });
@@ -169,15 +170,23 @@ std::string ArtworkLoader::trackArtwork(const Track& track) {
     return data;
 }
 
+void ArtworkLoader::notifyPlayer(UINT message, Id key) {
+    const auto bits = static_cast<std::uint64_t>(key);
+    if (message) PostMessageW(player_, message, static_cast<DWORD>(bits), static_cast<LPARAM>(bits >> 32));
+}
+
+void ArtworkLoader::stageCover(const Track& track) {
+    try {
+        if (store_.stageCover(track, songArtwork(track), albumArtwork(store_, track)))
+            notifyPlayer(coverReadyMessage, track.key);
+    } catch (const std::exception&) {
+        // A cover write failure must not interrupt playback or enqueueing.
+    }
+}
+
 void ArtworkLoader::loadTrack(Id key) {
     auto track = store_.track(key);
     if (!track.key || !store_.networkAvailable(track.server)) return;
-    auto notifyPlayer = [&] {
-        const auto bits = static_cast<std::uint64_t>(key);
-        if (trackReadyMessage)
-            PostMessageW(player_, trackReadyMessage, static_cast<DWORD>(bits),
-                         static_cast<LPARAM>(static_cast<DWORD>(bits >> 32)));
-    };
     auto connection = connect(store_.server(track.server));
     try {
         const auto item = songArtwork(track);
@@ -187,7 +196,7 @@ void ArtworkLoader::loadTrack(Id key) {
                 auto album = albumArtwork(store_, track);
                 data = loadArtwork(store_, *connection, track.server, album);
             }
-            if (!data.empty()) notifyPlayer();
+            if (!data.empty()) stageCover(track);
         }
     } catch (const ConnectionError&) {
         store_.connectionFailed(track.server);
@@ -196,7 +205,7 @@ void ArtworkLoader::loadTrack(Id key) {
         try {
             auto lyrics = connection->lyrics(track);
             store_.saveLyrics(key, lyrics);
-            if (!lyrics.plain.empty()) notifyPlayer();
+            if (!lyrics.plain.empty()) notifyPlayer(lyricsReadyMessage, key);
         } catch (const ConnectionError&) {
             store_.connectionFailed(track.server);
         } catch (const std::exception&) {}

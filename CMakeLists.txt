@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ml_tangerinestream VERSION 0.4.1 LANGUAGES CXX RC)
+project(ml_tangerinestream VERSION 0.4.2 LANGUAGES CXX RC)
 
 set(WINAMP_SDK "" CACHE PATH "Winamp SDK directory override")
 set(sdk_directory "${WINAMP_SDK}")
