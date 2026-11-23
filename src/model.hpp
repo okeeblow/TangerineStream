@@ -49,6 +49,7 @@ struct BrowseLocation {
     BrowseKind kind;
     std::string id;
     std::string title;
+    Id server = 0;
 };
 
 inline bool localLocation(const BrowseLocation& location) {

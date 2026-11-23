@@ -267,9 +267,7 @@ Server Store::server(Id id) {
     return loadServer(id);
 }
 
-void Store::save(Server& server, int rollingMiB) {
-    std::scoped_lock lock(mutex_);
-    Transaction transaction(db_);
+Id Store::saveProfile(const Server& server) {
     auto id = server.id;
     if (!id) {
         Statement duplicate(db_, "SELECT id FROM servers WHERE url=? AND user=?");
@@ -288,10 +286,24 @@ void Store::save(Server& server, int rollingMiB) {
     }
     if (!server.cacheFavorites)
         Statement(db_, "UPDATE tracks SET favorite=0 WHERE server=? AND favorite=1").bind(id).run();
+    return id;
+}
+
+bool Store::unifiedTree() {
+    std::scoped_lock lock(mutex_);
+    return setting("unified_tree") != "0";
+}
+
+void Store::saveProfiles(std::vector<Server>& profiles, int rollingMiB, bool unified) {
+    std::scoped_lock lock(mutex_);
+    Transaction transaction(db_);
+    std::vector<Id> ids;
+    for (const auto& profile : profiles) ids.push_back(saveProfile(profile));
+    setSetting("unified_tree", unified ? "1" : "0");
     setSetting("rolling_mib", std::to_string(rollingMiB));
     transaction.commit();
     budget_ = rollingMiB * MiB;
-    server.id = id;
+    for (size_t i = 0; i < ids.size(); ++i) profiles[i].id = ids[i];
 }
 
 int Store::rollingMiB() {

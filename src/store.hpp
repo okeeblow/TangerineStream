@@ -21,7 +21,8 @@ public:
 
     std::vector<Server> servers();
     Server server(Id id);
-    void save(Server& server, int rollingMiB);
+    void saveProfiles(std::vector<Server>& profiles, int rollingMiB, bool unified);
+    bool unifiedTree();
     int rollingMiB();
     std::string playbackSecret();
     int playbackPort();
@@ -70,6 +71,7 @@ private:
     std::string setting(const char* key);
     void setSetting(const char* key, const std::string& value);
     Server loadServer(Id id);
+    Id saveProfile(const Server& server);
     Track loadTrack(Id key);
     std::filesystem::path audioPath(const Track& track) const;
     void reconcile();

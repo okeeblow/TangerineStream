@@ -37,7 +37,9 @@ Declare each new plug-in with `add_wacup_plugin(target sources...)` in CMake. Th
    Double-click a tile to open it and use **Back** to return. Type in **Search** to filter the current view. Choose **View > Text list** to browse the same results in rows.
 5. Double-click a track to play it. Select albums or tracks and use **Play** or **Enqueue** in the bottom bar.
 
-Open **View** to add or switch server profiles. **Server settings** lets you update the profile name, password, browsing mode, and favorite download preference. Each profile keeps its own track IDs, cached music, and pending reports.
+Open **Preferences > Plug-ins > Media Library**, select **Tangerine Stream**, and click **Configure** to add or edit server profiles. **Unify Libraries** puts the categories directly under Tangerine Stream. Clear it to give each server its own branch. A single server always uses the unified tree.
+
+The server filter beside Search lets you choose **<All>** or a named profile in either tree layout. Switching servers keeps the current category. Each profile keeps its own track IDs, cached music, and pending reports.
 
 Playlist entries use the server's artist and track title. Use WACUP's **Album Art** and **Lyrics** windows for track covers and lyrics. Tangerine Stream supplies cover images through the player's album art service and plain lyrics through track metadata. The cache keeps OpenSubsonic line and word timing for future synchronized display. [OpenSubsonic song lyrics](https://opensubsonic.github.io/docs/endpoints/getlyricsbysongid/)
 

@@ -17,6 +17,7 @@
 #include <optional>
 #include <set>
 #include <thread>
+#include <tuple>
 
 #include "sdk_services.hpp"
 
@@ -116,6 +117,12 @@ std::string getText(HWND dialog, int item) {
     text.resize(written);
     return utf8(text);
 }
+
+struct Navigation {
+    BrowseKind category;
+    Id server;
+    bool branch;
+};
 
 struct Search {
     HWND view;
@@ -225,7 +232,7 @@ public:
         return status.downloads;
     }
     void sample(Id startedKey = 0);
-    void sendAlbums(Id server, std::vector<BrowseLocation> albums, AlbumAction action, mlDropItemStruct drop = {});
+    void sendAlbums(std::vector<BrowseLocation> albums, AlbumAction action, mlDropItemStruct drop = {});
     void finishAlbums();
     void preparePlayback(const Track& track, const wchar_t* filename, bool cacheAudio);
     void finishPlayback();
@@ -253,8 +260,11 @@ public:
     HostMetadataServices hostMetadata;
     HWND activeView = nullptr;
     Id selectedServer = 0;
+    Id filterServer = 0;
     UINT_PTR treeId = 0;
-    std::map<UINT_PTR, BrowseKind> navigation;
+    std::map<UINT_PTR, Navigation> navigation;
+    std::vector<std::pair<Id, std::string>> serverBranches;
+    const UINT navigationChanged = RegisterWindowMessageW(L"ml_tangerinestream.navigationChanged");
     bool attached = false;
     std::string reportError;
 
@@ -408,11 +418,11 @@ std::vector<Track> App::albumTracks(Id server, const BrowseLocation& album) {
     }
 }
 
-void App::sendAlbums(Id server, std::vector<BrowseLocation> albums, AlbumAction action, mlDropItemStruct drop) {
-    auto resolve = [this, server, albums = std::move(albums)] {
+void App::sendAlbums(std::vector<BrowseLocation> albums, AlbumAction action, mlDropItemStruct drop) {
+    auto resolve = [this, albums = std::move(albums)] {
         std::vector<Track> result;
         for (const auto& album : albums) {
-            auto tracks = albumTracks(server, album);
+            auto tracks = albumTracks(album.server, album);
             std::move(tracks.begin(), tracks.end(), std::back_inserter(result));
         }
         return result;
@@ -778,7 +788,18 @@ bool supplyMetadata(LPARAM command, WPARAM data) {
     return false;
 }
 
+void refreshNavigation();
+void selectCategory(BrowseKind category, Id server);
+constexpr UINT allServersCommand = 2000;
+
 LRESULT CALLBACK playerProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+    if (app && msg && msg == app->navigationChanged) {
+        try {
+            refreshNavigation();
+            if (app->activeView) SendMessageW(app->activeView, profilesChanged, 0, 0);
+        } catch (const std::exception& error) { showError(plugin.hwndLibraryParent, error); }
+        return 0;
+    }
     if (app && msg == WM_WA_IPC) {
         try { if (supplyMetadata(l, w)) return TRUE; } catch (const std::exception&) {}
     }
@@ -809,8 +830,66 @@ LRESULT CALLBACK playerProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, D
 }
 
 struct Settings {
-    Server profile;
+    std::vector<Server> profiles;
+    size_t selected;
     int budget;
+    bool unified;
+    bool loadingForm = false;
+
+    void updateTreeOption(HWND hwnd) const {
+        size_t defined = 0;
+        for (size_t i = 0; i < profiles.size(); ++i) {
+            const auto& s = profiles[i];
+            const bool filled = i == selected ?
+                GetWindowTextLengthW(GetDlgItem(hwnd, IDC_URL)) && GetWindowTextLengthW(GetDlgItem(hwnd, IDC_USERNAME)) &&
+                    GetWindowTextLengthW(GetDlgItem(hwnd, IDC_PASSWORD)) :
+                !s.url.empty() && !s.user.empty() && !s.password.empty();
+            if (s.id || filled) ++defined;
+        }
+        CheckDlgButton(hwnd, IDC_UNIFIED, (defined <= 1 || unified) ? BST_CHECKED : BST_UNCHECKED);
+        EnableWindow(GetDlgItem(hwnd, IDC_UNIFIED), defined > 1);
+    }
+
+    void read(HWND hwnd) {
+        auto& s = profiles.at(selected);
+        s.name = getText(hwnd, IDC_NAME);
+        s.url = getText(hwnd, IDC_URL);
+        s.user = getText(hwnd, IDC_USERNAME);
+        s.password = getText(hwnd, IDC_PASSWORD);
+        s.native = IsDlgButtonChecked(hwnd, IDC_NATIVE) == BST_CHECKED;
+        s.cacheFavorites = IsDlgButtonChecked(hwnd, IDC_FAVORITES) == BST_CHECKED;
+    }
+
+    void select(HWND hwnd, size_t index) {
+        loadingForm = true;
+        selected = index;
+        auto list = GetDlgItem(hwnd, IDC_SERVERS);
+        for (size_t i = 0; i < profiles.size(); ++i) {
+            const auto& profile = profiles[i];
+            auto label = wide(profile.name.empty() ? (profile.url.empty() ? "New server" : profile.url) : profile.name);
+            LVITEMW row{};
+            row.mask = LVIF_TEXT;
+            row.iItem = static_cast<int>(i);
+            row.pszText = label.data();
+            if (row.iItem == ListView_GetItemCount(list)) ListView_InsertItem(list, &row);
+            else ListView_SetItemText(list, row.iItem, 0, row.pszText);
+        }
+        ListView_SetItemState(list, static_cast<int>(index), LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(list, static_cast<int>(index), FALSE);
+        const auto& s = profiles.at(index);
+        SetDlgItemTextW(hwnd, IDC_NAME, wide(s.name).c_str());
+        SetDlgItemTextW(hwnd, IDC_URL, wide(s.url).c_str());
+        SetDlgItemTextW(hwnd, IDC_USERNAME, wide(s.user).c_str());
+        SetDlgItemTextW(hwnd, IDC_PASSWORD, wide(s.password).c_str());
+        SendDlgItemMessageW(hwnd, IDC_URL, EM_SETREADONLY, s.id != 0, 0);
+        SendDlgItemMessageW(hwnd, IDC_USERNAME, EM_SETREADONLY, s.id != 0, 0);
+        SendDlgItemMessageW(hwnd, IDC_PASSWORD, EM_SETCUEBANNER, FALSE,
+            reinterpret_cast<LPARAM>(s.id ? L"Leave blank to keep saved password" : L""));
+        CheckDlgButton(hwnd, IDC_NATIVE, s.native ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hwnd, IDC_FAVORITES, s.cacheFavorites ? BST_CHECKED : BST_UNCHECKED);
+        loadingForm = false;
+        updateTreeOption(hwnd);
+    }
 };
 
 INT_PTR CALLBACK settingsProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
@@ -818,19 +897,30 @@ INT_PTR CALLBACK settingsProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_INITDIALOG) {
         settings = reinterpret_cast<Settings*>(l);
         SetWindowLongPtrW(hwnd, DWLP_USER, l);
-        const auto& s = settings->profile;
-        SetDlgItemTextW(hwnd, IDC_NAME, wide(s.name).c_str());
-        SetDlgItemTextW(hwnd, IDC_URL, wide(s.url).c_str());
-        SetDlgItemTextW(hwnd, IDC_USERNAME, wide(s.user).c_str());
-        SetDlgItemInt(hwnd, IDC_BUDGET, settings->budget, FALSE);
-        CheckDlgButton(hwnd, IDC_NATIVE, s.native ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hwnd, IDC_FAVORITES, s.cacheFavorites ? BST_CHECKED : BST_UNCHECKED);
-        if (s.id) {
-            SendDlgItemMessageW(hwnd, IDC_URL, EM_SETREADONLY, TRUE, 0);
-            SendDlgItemMessageW(hwnd, IDC_USERNAME, EM_SETREADONLY, TRUE, 0);
-            SendDlgItemMessageW(hwnd, IDC_PASSWORD, EM_SETCUEBANNER, FALSE,
-                                reinterpret_cast<LPARAM>(L"Leave blank to keep saved password"));
+        skinWindow(hwnd, SKINNEDWND_TYPE_DIALOG);
+        for (HWND control = GetWindow(hwnd, GW_CHILD); control; control = GetWindow(control, GW_HWNDNEXT)) {
+            switch (GetDlgCtrlID(control)) {
+            case IDC_SERVERS: {
+                skinWindow(control, SKINNEDWND_TYPE_LISTVIEW, SWLVS_FULLROWSELECT | SWLVS_SELALWAYS | SWLVS_DOUBLEBUFFER);
+                RECT r{};
+                GetClientRect(control, &r);
+                LVCOLUMNW column{};
+                column.mask = LVCF_WIDTH;
+                column.cx = std::max(1L, r.right - GetSystemMetrics(SM_CXVSCROLL));
+                ListView_InsertColumn(control, 0, &column);
+                break;
+            }
+            case IDC_NAME: case IDC_URL: case IDC_USERNAME: case IDC_PASSWORD: case IDC_BUDGET:
+                skinWindow(control, SKINNEDWND_TYPE_EDIT, SWES_VCENTER);
+                break;
+            case IDC_UNIFIED: case IDC_NATIVE: case IDC_FAVORITES: case IDC_ADD_SERVER: case IDOK: case IDCANCEL:
+                skinWindow(control, SKINNEDWND_TYPE_BUTTON);
+                break;
+            default: skinWindow(control, SKINNEDWND_TYPE_STATIC); break;
+            }
         }
+        settings->select(hwnd, settings->selected);
+        SetDlgItemInt(hwnd, IDC_BUDGET, settings->budget, FALSE);
         SendDlgItemMessageW(hwnd, IDC_NAME, EM_SETLIMITTEXT, 160, 0);
         SendDlgItemMessageW(hwnd, IDC_URL, EM_SETLIMITTEXT, 512, 0);
         SendDlgItemMessageW(hwnd, IDC_USERNAME, EM_SETLIMITTEXT, 160, 0);
@@ -838,40 +928,89 @@ INT_PTR CALLBACK settingsProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         SendDlgItemMessageW(hwnd, IDC_BUDGET, EM_SETLIMITTEXT, 7, 0);
         return TRUE;
     }
-    if (!settings || msg != WM_COMMAND) return FALSE;
+    if (!settings) return FALSE;
+    if (msg == WM_NOTIFY && !settings->loadingForm) {
+        const auto* header = reinterpret_cast<const NMHDR*>(l);
+        if (header->idFrom == IDC_SERVERS && header->code == LVN_ITEMCHANGED) {
+            const auto& change = *reinterpret_cast<const NMLISTVIEW*>(l);
+            if (change.iItem >= 0 && (change.uNewState & LVIS_SELECTED) && !(change.uOldState & LVIS_SELECTED)) {
+                settings->read(hwnd);
+                settings->select(hwnd, static_cast<size_t>(change.iItem));
+            }
+        }
+        return FALSE;
+    }
+    if (msg != WM_COMMAND) return FALSE;
     if (LOWORD(w) == IDCANCEL) {
         EndDialog(hwnd, IDCANCEL);
         return TRUE;
     }
-    if (LOWORD(w) != IDOK) return FALSE;
     try {
-        auto updated = settings->profile;
-        updated.name = getText(hwnd, IDC_NAME);
-        updated.url = normalizeUrl(getText(hwnd, IDC_URL));
-        updated.user = getText(hwnd, IDC_USERNAME);
-        updated.password = getText(hwnd, IDC_PASSWORD);
-        updated.native = IsDlgButtonChecked(hwnd, IDC_NATIVE) == BST_CHECKED;
-        updated.cacheFavorites = IsDlgButtonChecked(hwnd, IDC_FAVORITES) == BST_CHECKED;
-        if (updated.user.empty() || (!updated.id && updated.password.empty()))
-            throw Error("Enter the server username and password.");
-        if (updated.name.empty()) updated.name = updated.user + " @ " + updated.url;
+        if (LOWORD(w) == IDC_UNIFIED && HIWORD(w) == BN_CLICKED) {
+            settings->unified = IsDlgButtonChecked(hwnd, IDC_UNIFIED) == BST_CHECKED;
+            return TRUE;
+        }
+        if (!settings->loadingForm && HIWORD(w) == EN_CHANGE &&
+            (LOWORD(w) == IDC_URL || LOWORD(w) == IDC_USERNAME || LOWORD(w) == IDC_PASSWORD)) {
+            settings->updateTreeOption(hwnd);
+            return TRUE;
+        }
+        if (LOWORD(w) == IDC_ADD_SERVER) {
+            settings->read(hwnd);
+            auto empty = std::find_if(settings->profiles.begin(), settings->profiles.end(), [](const Server& s) {
+                return !s.id && s.url.empty() && s.user.empty() && s.name.empty() && s.password.empty();
+            });
+            auto index = static_cast<size_t>(empty - settings->profiles.begin());
+            if (empty == settings->profiles.end()) settings->profiles.emplace_back();
+            settings->select(hwnd, index);
+            SetFocus(GetDlgItem(hwnd, IDC_NAME));
+            return TRUE;
+        }
+        if (LOWORD(w) != IDOK) return FALSE;
+        settings->read(hwnd);
+        std::vector<Server> updated;
+        size_t selection = 0;
+        std::set<std::pair<std::string, std::string>> accounts;
+        for (size_t i = 0; i < settings->profiles.size(); ++i) {
+            auto s = settings->profiles[i];
+            if (!s.id && s.name.empty() && s.url.empty() && s.user.empty() && s.password.empty()) continue;
+            try {
+                s.url = normalizeUrl(s.url);
+                if (s.user.empty() || (!s.id && s.password.empty())) throw Error("Enter the server username and password.");
+                if (!accounts.emplace(s.url, s.user).second) throw Error("This server and username already have a profile.");
+            } catch (const std::exception&) {
+                settings->select(hwnd, i);
+                throw;
+            }
+            if (s.name.empty()) s.name = s.user + " @ " + s.url;
+            if (i == settings->selected) selection = updated.size();
+            updated.push_back(std::move(s));
+        }
         BOOL valid = FALSE;
         auto budget = GetDlgItemInt(hwnd, IDC_BUDGET, &valid, FALSE);
         if (!valid || budget > 1'048'576) throw Error("Enter a rolling cache size from 0 to 1048576 MiB.");
-        app->store.save(updated, static_cast<int>(budget));
-        settings->profile.id = updated.id;
+        app->store.saveProfiles(updated, static_cast<int>(budget), settings->unified);
+        settings->profiles = std::move(updated);
+        settings->selected = selection;
         EndDialog(hwnd, IDOK);
     } catch (const std::exception& error) { showError(hwnd, error); }
     return TRUE;
 }
 
-void configure(HWND hwnd, const Server& profile = {}) {
-    Settings settings{profile, app->store.rollingMiB()};
+void configure(HWND hwnd, Id preferred, bool add = false) {
+    Settings settings{app->store.servers(), 0, app->store.rollingMiB(), app->store.unifiedTree()};
+    if (add || settings.profiles.empty()) {
+        settings.selected = settings.profiles.size();
+        settings.profiles.emplace_back();
+    } else {
+        for (size_t i = 0; i < settings.profiles.size(); ++i)
+            if (settings.profiles[i].id == preferred) settings.selected = i;
+    }
     if (DialogBoxParamW(plugin.hDllInstance, MAKEINTRESOURCEW(IDD_SERVER), hwnd, settingsProc,
                         reinterpret_cast<LPARAM>(&settings)) == IDOK) {
-        app->selectedServer = settings.profile.id;
+        app->selectedServer = settings.profiles.empty() ? 0 : settings.profiles[settings.selected].id;
         app->wakeMaintenance(true);
-        if (app->activeView) SendMessageW(app->activeView, profilesChanged, 0, 0);
+        PostMessageW(plugin.hwndWinampParent, app->navigationChanged, 0, 0);
     }
 }
 
@@ -897,8 +1036,8 @@ LRESULT CALLBACK libraryListProc(HWND list, UINT msg, WPARAM w, LPARAM l) {
 
 class View {
 public:
-    View(HWND window, BrowseKind category)
-        : hwnd(window), list(GetDlgItem(hwnd, IDC_TRACKS)), category(category), location(categoryLocation(category)) {
+    View(HWND window, const Navigation& node)
+        : hwnd(window), list(GetDlgItem(hwnd, IDC_TRACKS)), category(node.category), location(categoryLocation(category)), treeServer(node.server) {
         LVCOLUMNW column{};
         column.mask = LVCF_TEXT | LVCF_WIDTH;
         const wchar_t* names[] = {L"Name", L"Details", L"Album", L"Time", L"Cache"};
@@ -920,7 +1059,7 @@ public:
         skinWindow(GetDlgItem(hwnd, IDC_QUERY), SKINNEDWND_TYPE_EDIT, SWES_VCENTER);
         for (int id : {IDC_SEARCH_LABEL, IDC_STATUS})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_STATIC);
-        for (int id : {IDC_VIEW_MENU, IDC_ADD_SERVER, IDC_BACK, IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_CACHE_MENU})
+        for (int id : {IDC_VIEW_MENU, IDC_SOURCE_MENU, IDC_ADD_SERVER, IDC_BACK, IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_CACHE_MENU})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_BUTTON);
         tileSize = std::clamp(MulDiv(160, GetDpiForWindow(hwnd), 96), 96, 384);
         SetTimer(hwnd, viewTimer, 2000, nullptr);
@@ -937,6 +1076,7 @@ public:
             ImageList_Destroy(images);
         }
     }
+    void setCategory(BrowseKind kind) { category = kind; }
     void populateServers();
     void receive(SearchResult result);
     void receiveArtwork();
@@ -961,14 +1101,20 @@ public:
     HWND hwnd, list;
 
 private:
+    struct Source {
+        Id server;
+        int offset = 0;
+        bool more = true;
+        bool cached = false;
+        std::string error;
+    };
     struct History {
         BrowseLocation location;
         std::string query;
         std::vector<LibraryItem> items;
-        int nextOffset;
+        std::vector<Source> sources;
+        size_t nextSource;
         int focused;
-        bool more;
-        bool cached;
     };
     struct ImageSlot {
         int row;
@@ -983,16 +1129,17 @@ private:
     std::vector<Server> servers;
     std::vector<LibraryItem> items;
     std::vector<Track> tracks;
-    std::set<std::pair<BrowseKind, std::string>> knownItems;
+    std::set<std::tuple<Id, BrowseKind, std::string>> knownItems;
     std::set<Id> knownTracks;
-    int nextOffset = 0;
+    std::vector<Source> sources;
+    size_t nextSource = 0;
     bool loading = false, more = false, morePosted = false;
     bool selectionPending = false;
     double browseSeconds = 0;
     std::wstring selectionSummary;
-    bool cached = false;
     std::string message;
     LRESULT legacySkin = 0;
+    const Id treeServer;
     Id currentServer = 0;
     int tileSize = 160;
     bool textList = false;
@@ -1046,7 +1193,7 @@ const Server* View::selected() const {
 
 void View::populateServers() {
     servers = app->store.servers();
-    currentServer = app->selectedServer;
+    currentServer = treeServer ? treeServer : app->selectedServer;
     if (!selected()) currentServer = servers.empty() ? 0 : servers.front().id;
     resetLocation();
 }
@@ -1062,8 +1209,8 @@ void View::resetContent() {
     cancelDrag();
     app->cancelSearch(hwnd);
     loading = more = morePosted = false;
-    cached = false;
-    nextOffset = 0;
+    sources.clear();
+    nextSource = 0;
     browseSeconds = 0;
     selectionSummary.clear();
     message.clear();
@@ -1073,9 +1220,13 @@ void View::resetContent() {
     knownItems.clear();
     knownTracks.clear();
     resetImages();
-    auto server = selected();
-    currentServer = server ? server->id : 0;
-    if (server) app->selectedServer = server->id;
+    const Id scope = location.server ? location.server : (treeServer ? treeServer : app->filterServer);
+    if (scope) currentServer = scope;
+    else if (!servers.empty()) currentServer = servers.front().id;
+    for (const auto& server : servers) {
+        if (!scope || server.id == scope)
+            sources.push_back({server.id, 0, true, false, {}});
+    }
     changePresentation();
     updateButtons();
     updateStatus();
@@ -1085,7 +1236,7 @@ void View::startSearch() {
     KillTimer(hwnd, searchTimer);
     query = getText(hwnd, IDC_QUERY);
     resetContent();
-    more = currentServer != 0;
+    more = !sources.empty();
     fetchMore();
 }
 
@@ -1095,7 +1246,8 @@ void View::fetchMore() {
     loading = true;
     updateButtons();
     updateStatus();
-    app->search(hwnd, currentServer, location, query, nextOffset, cached);
+    const auto& source = sources.at(nextSource);
+    app->search(hwnd, source.server, location, query, source.offset, source.cached);
 }
 
 void View::scheduleMore() {
@@ -1110,21 +1262,17 @@ void View::updateRowCount() {
 }
 
 void View::receive(SearchResult result) {
-    if (result.restart) resetContent();
+    if (result.restart) { startSearch(); return; }
     browseSeconds += result.seconds;
     loading = false;
-    cached = result.cached;
-    message = std::move(result.error);
-    if (!message.empty()) {
-        more = false;
-        updateStatus();
-        updateButtons();
-        return;
-    }
+    auto& source = sources.at(nextSource);
+    source.cached = result.cached;
+    source.error = std::move(result.error);
     const auto oldCount = rowCount();
     const bool emptyPage = result.page.items.empty() && result.page.tracks.empty();
     for (auto& item : result.page.items) {
-        if (knownItems.emplace(item.target.kind, item.target.id).second)
+        item.target.server = source.server;
+        if (knownItems.emplace(source.server, item.target.kind, item.target.id).second)
             items.push_back(std::move(item));
     }
     const bool pagedTracks = location.kind == BrowseKind::tracks || location.kind == BrowseKind::offline;
@@ -1132,18 +1280,24 @@ void View::receive(SearchResult result) {
         if (!pagedTracks || knownTracks.insert(track.key).second) tracks.push_back(std::move(track));
     }
     // A repeated server page must not get stuck in an endless scroll loop.
-    more = result.page.more && nextOffset < INT_MAX - pageSize && (emptyPage || rowCount() != oldCount);
-    nextOffset += pageSize;
+    source.more = source.error.empty() && result.page.more && source.offset <= INT_MAX - 2 * pageSize &&
+                  (emptyPage || rowCount() != oldCount);
+    source.offset += pageSize;
+    more = false;
+    for (size_t step = 1; step <= sources.size(); ++step) {
+        const auto i = (nextSource + step) % sources.size();
+        if (sources[i].more) { nextSource = i; more = true; break; }
+    }
     updateRowCount();
     if (!oldCount) prefetchTrack(0);
-    if (emptyPage || rowCount() < 12) scheduleMore();
+    if (emptyPage || rowCount() < 12 || (more && sources[nextSource].offset == 0)) scheduleMore();
 }
 
 void View::refresh() {
-    if (cached && !loading && currentServer && location.kind != BrowseKind::offline &&
-        !localLocation(location) && app->store.networkAvailable(currentServer)) {
-        startSearch();
-        return;
+    if (!loading && location.kind != BrowseKind::offline && !localLocation(location)) {
+        for (const auto& source : sources) {
+            if (source.cached && app->store.networkAvailable(source.server)) { startSearch(); return; }
+        }
     }
     const int first = std::max(0, ListView_GetTopIndex(list));
     const int last = std::min(static_cast<int>(tracks.size()), first + ListView_GetCountPerPage(list) + 1);
@@ -1216,7 +1370,7 @@ int View::imageFor(int row) {
         return existing->second;
     }
     if (!pendingArt.count(row) && !missingArt.count(row)) {
-        if (app->artwork.request(artGeneration, currentServer, row, tileSize, items[row]))
+        if (app->artwork.request(artGeneration, items[row].target.server, row, tileSize, items[row]))
             pendingArt.insert(row);
         else artQueueFull = true;
     }
@@ -1259,6 +1413,13 @@ void View::receiveArtwork() {
 }
 
 void View::changePresentation() {
+    const Id filter = treeServer ? treeServer : app->filterServer;
+    const auto source = std::find_if(servers.begin(), servers.end(),
+        [filter](const Server& profile) { return profile.id == filter; });
+    std::wstring caption = source == servers.end() ? L"<All>" : wide(source->name);
+    for (size_t pos = 0; (pos = caption.find(L'&', pos)) != caption.npos; pos += 2)
+        caption.insert(pos, 1, L'&');
+    SetDlgItemTextW(hwnd, IDC_SOURCE_MENU, caption.c_str());
     const bool tiles = showTiles();
     if (tiles && !images) {
         images = ImageList_Create(tileSize, tileSize, ILC_COLOR32, 1, 8);
@@ -1337,7 +1498,7 @@ void View::activate(int index) {
         return;
     }
     auto target = items[index].target;
-    history.push_back({location, query, std::move(items), nextOffset, index, more, cached});
+    history.push_back({location, query, std::move(items), std::move(sources), nextSource, index});
     location = std::move(target);
     SetDlgItemTextW(hwnd, IDC_QUERY, L"");
     startSearch();
@@ -1353,22 +1514,26 @@ void View::back() {
     SetDlgItemTextW(hwnd, IDC_QUERY, wide(query).c_str());
     KillTimer(hwnd, searchTimer);
     resetContent();
-    const bool useCache = currentServer && (localLocation(location) || !app->store.networkAvailable(currentServer));
-    if (useCache != outer.cached) {
-        startSearch();
-        SetFocus(list);
-        return;
+    for (const auto& source : outer.sources) {
+        const bool useCache = location.kind == BrowseKind::offline || localLocation(location) ||
+                              !app->store.networkAvailable(source.server);
+        if (source.offset && useCache != source.cached) {
+            startSearch();
+            SetFocus(list);
+            return;
+        }
     }
     items = std::move(outer.items);
-    nextOffset = outer.nextOffset;
-    more = outer.more;
-    cached = outer.cached;
-    for (const auto& item : items) knownItems.emplace(item.target.kind, item.target.id);
+    sources = std::move(outer.sources);
+    nextSource = outer.nextSource;
+    more = !sources.empty() && sources[nextSource].more;
+    for (const auto& item : items) knownItems.emplace(item.target.server, item.target.kind, item.target.id);
     updateRowCount();
     if (outer.focused >= 0 && outer.focused < rowCount()) {
         ListView_SetItemState(list, outer.focused, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
         ListView_EnsureVisible(list, outer.focused, FALSE);
     }
+    if (more && sources[nextSource].offset == 0) scheduleMore();
     SetFocus(list);
 }
 
@@ -1425,16 +1590,26 @@ void View::updateStatus() {
         if (rowCount() == 0) status = showTracks() ? L"No tracks" : L"No results";
         else status = selectionSummary;
         if (loading) status += L"  |  Loading more...";
-        auto count = app->store.reportCount(server->id);
-        if (count) status += L"  |  " + std::to_wstring(count) + L" play reports queued";
-        auto error = app->maintenanceError(server->id);
-        if (!error.empty()) status += L"  |  " + wide(error);
+        const bool offline = app->store.offlineMode();
+        std::int64_t reports = 0;
+        for (const auto& source : sources) {
+            reports += app->store.reportCount(source.server);
+            auto error = source.error.empty() ? app->maintenanceError(source.server) : source.error;
+            if (error.empty() && !offline && source.cached && location.kind != BrowseKind::offline &&
+                !localLocation(location)) error = "Server offline";
+            if (!error.empty()) {
+                const auto profile = std::find_if(servers.begin(), servers.end(),
+                    [&](const Server& s) { return s.id == source.server; });
+                status += L"  |  ";
+                if (sources.size() > 1 && profile != servers.end()) status += wide(profile->name) + L": ";
+                status += wide(error);
+            }
+        }
+        if (reports) status += L"  |  " + std::to_wstring(reports) + L" play reports queued";
     }
-    const bool manualOffline = app->store.offlineMode();
-    if (server && (manualOffline || (cached && location.kind != BrowseKind::offline && !localLocation(location))))
-        status = (manualOffline ? L"Offline  |  " : L"Server offline  |  ") + status;
+    if (server && app->store.offlineMode()) status = L"Offline  |  " + status;
     if (!history.empty()) status += L"  |  " + wide(location.title);
-    if (server && servers.size() > 1) status += L"  |  " + wide(server->name);
+    if (server && servers.size() > 1 && sources.size() == 1) status += L"  |  " + wide(server->name);
     SetDlgItemTextW(hwnd, IDC_STATUS, status.c_str());
 }
 
@@ -1491,7 +1666,7 @@ void View::drag(POINT point, bool released) {
     if (released && !draggedAlbums.empty()) {
         auto albums = std::move(draggedAlbums);
         cancelDrag();
-        if (drop.result > 0) app->sendAlbums(currentServer, std::move(albums), AlbumAction::drop, drop);
+        if (drop.result > 0) app->sendAlbums(std::move(albums), AlbumAction::drop, drop);
     }
 }
 
@@ -1509,20 +1684,19 @@ std::vector<BrowseLocation> View::selectedAlbums() const {
 void View::play(bool enqueue) {
     if (!showTracks()) {
         auto albums = selectedAlbums();
-        if (!albums.empty()) app->sendAlbums(currentServer, std::move(albums),
+        if (!albums.empty()) app->sendAlbums(std::move(albums),
                                              enqueue ? AlbumAction::enqueue : AlbumAction::play);
         return;
     }
     auto items = selection();
     if (items.empty()) return;
-    if (!app->store.networkAvailable(currentServer)) {
-        items.erase(std::remove_if(items.begin(), items.end(),
-            [](const Track& track) { return app->store.track(track.key).bytes <= 0; }), items.end());
-        if (items.empty()) {
-            message = "No selected tracks are downloaded.";
-            updateStatus();
-            return;
-        }
+    items.erase(std::remove_if(items.begin(), items.end(), [](const Track& track) {
+        return !app->store.networkAvailable(track.server) && app->store.track(track.key).bytes <= 0;
+    }), items.end());
+    if (items.empty()) {
+        message = "No selected tracks are downloaded.";
+        updateStatus();
+        return;
     }
     message.clear();
     updateStatus();
@@ -1547,25 +1721,24 @@ void View::cache(bool pin) {
 void View::popup(int button) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
-    constexpr UINT firstServer = 2000;
     if (button == IDC_CACHE_MENU) {
         AppendMenuW(menu, MF_STRING, IDC_KEEP_OFFLINE, L"Keep offline");
         AppendMenuW(menu, MF_STRING, IDC_UNPIN, L"Unpin");
-    } else {
+    } else if (button == IDC_VIEW_MENU) {
         if (!showTracks()) {
             AppendMenuW(menu, MF_STRING | (textList ? MF_CHECKED : 0), IDC_TEXT_LIST, L"Text list");
         }
         AppendMenuW(menu, MF_STRING | (app->store.offlineMode() ? MF_CHECKED : 0), IDC_OFFLINE, L"Work offline");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    } else {
+        const Id filter = treeServer ? treeServer : app->filterServer;
+        AppendMenuW(menu, MF_STRING | (!filter ? MF_CHECKED : 0), allServersCommand, L"<All>");
         for (size_t i = 0; i < servers.size(); ++i) {
             auto label = wide(servers[i].name);
             for (size_t pos = 0; (pos = label.find(L'&', pos)) != label.npos; pos += 2)
                 label.insert(pos, 1, L'&');
-            AppendMenuW(menu, MF_STRING | (servers[i].id == currentServer ? MF_CHECKED : 0),
-                        firstServer + i, label.c_str());
+            AppendMenuW(menu, MF_STRING | (filter == servers[i].id ? MF_CHECKED : 0),
+                        allServersCommand + 1 + i, label.c_str());
         }
-        AppendMenuW(menu, MF_STRING, IDC_ADD_SERVER, L"Add server...");
-        AppendMenuW(menu, selected() ? MF_STRING : MF_GRAYED, IDC_SETTINGS, L"Server settings...");
     }
     RECT anchor{};
     GetWindowRect(GetDlgItem(hwnd, button), &anchor);
@@ -1574,23 +1747,24 @@ void View::popup(int button) {
     popup.hmenu = menu;
     popup.hwnd = hwnd;
     popup.fuFlags = TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON |
-        (button == IDC_VIEW_MENU ? TPM_RIGHTALIGN : TPM_LEFTALIGN | TPM_BOTTOMALIGN);
-    popup.x = button == IDC_VIEW_MENU ? anchor.right : anchor.left;
-    popup.y = button == IDC_VIEW_MENU ? anchor.bottom : anchor.top;
+        (button == IDC_CACHE_MENU ? TPM_LEFTALIGN | TPM_BOTTOMALIGN : TPM_RIGHTALIGN);
+    popup.x = button == IDC_CACHE_MENU ? anchor.left : anchor.right;
+    popup.y = button == IDC_CACHE_MENU ? anchor.top : anchor.bottom;
     popup.skinStyle = SMS_USESKINFONT;
     const UINT chosen = static_cast<UINT>(library(ML_IPC_TRACKSKINNEDPOPUPEX, reinterpret_cast<WPARAM>(&popup)));
     DestroyMenu(menu);
-    if (chosen >= firstServer && chosen - firstServer < servers.size()) {
-        currentServer = servers[chosen - firstServer].id;
-        resetLocation();
-    } else if (chosen) command(chosen, 0);
+    if (chosen) command(chosen, 0);
 }
 
 void View::command(int id, int notification) {
+    if (id >= static_cast<int>(allServersCommand)) {
+        const auto index = static_cast<size_t>(id - allServersCommand);
+        if (index <= servers.size()) selectCategory(category, index ? servers[index - 1].id : 0);
+        return;
+    }
     switch (id) {
-    case IDC_ADD_SERVER: configure(hwnd); break;
-    case IDC_SETTINGS: if (auto server = selected()) configure(hwnd, *server); break;
-    case IDC_VIEW_MENU: case IDC_CACHE_MENU: popup(id); break;
+    case IDC_ADD_SERVER: configure(hwnd, currentServer, true); break;
+    case IDC_VIEW_MENU: case IDC_SOURCE_MENU: case IDC_CACHE_MENU: popup(id); break;
     case IDC_QUERY:
         if (notification == EN_CHANGE) SetTimer(hwnd, searchTimer, 300, nullptr);
         break;
@@ -1646,7 +1820,10 @@ void View::layout(int width, int height) {
     place(IDC_SEARCH_LABEL, gap, 0);
     const int menuWidth = controlWidth(IDC_VIEW_MENU, 9);
     const int menuLeft = std::max(0, width - gap - menuWidth);
-    move(IDC_QUERY, left, gap, menuLeft - gap - left, row);
+    const int sourceWidth = std::min(controlWidth(IDC_SOURCE_MENU, 12), width / 3);
+    const int sourceLeft = std::max(0, menuLeft - gap - sourceWidth);
+    move(IDC_QUERY, left, gap, sourceLeft - gap - left, row);
+    move(IDC_SOURCE_MENU, sourceLeft, gap, sourceWidth, row);
     move(IDC_VIEW_MENU, menuLeft, gap, menuWidth, row);
     const int listTop = row + gap * 2;
     move(IDC_TRACKS, gap, listTop, width - gap * 2, footer - gap - listTop);
@@ -1697,7 +1874,7 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     auto view = reinterpret_cast<View*>(GetWindowLongPtrW(hwnd, DWLP_USER));
     try {
         if (msg == WM_INITDIALOG && app) {
-            view = new View(hwnd, static_cast<BrowseKind>(l));
+            view = new View(hwnd, *reinterpret_cast<const Navigation*>(l));
             SetWindowLongPtrW(hwnd, DWLP_USER, reinterpret_cast<LONG_PTR>(view));
             app->activeView = hwnd;
             SetWindowSubclass(GetDlgItem(hwnd, IDC_QUERY), searchProc, 1, reinterpret_cast<DWORD_PTR>(hwnd));
@@ -1747,7 +1924,10 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             if (w == viewTimer) view->refresh();
             if (w == searchTimer) view->command(IDC_SEARCH, 0);
             return TRUE;
-        case profilesChanged: view->populateServers(); return TRUE;
+        case profilesChanged:
+            if (l) view->setCategory(static_cast<BrowseKind>(w));
+            view->populateServers();
+            return TRUE;
         case viewReady:
             if (auto result = app->takeResult(hwnd)) view->receive(std::move(*result));
             return TRUE;
@@ -1793,6 +1973,71 @@ UINT_PTR addTreeItem(const wchar_t* title, UINT_PTR parent, bool branch) {
     return item.id;
 }
 
+// In the grouped tree the root represents <All>; its view retains the requested category.
+void selectCategory(BrowseKind category, Id server) {
+    const bool grouped = !app->serverBranches.empty();
+    UINT_PTR target = app->treeId;
+    if (grouped && !server) {
+        app->navigation.at(target).category = category;
+    } else {
+        const auto scope = grouped ? server : 0;
+        const auto found = std::find_if(app->navigation.begin(), app->navigation.end(), [&](const auto& item) {
+            return !item.second.branch && item.second.category == category && item.second.server == scope;
+        });
+        if (found == app->navigation.end()) return;
+        target = found->first;
+    }
+    app->filterServer = server;
+    if (server) app->selectedServer = server;
+    const auto handle = library(ML_IPC_TREEITEM_GETHANDLE, target);
+    if (handle && handle != library(ML_IPC_TREEITEM_GETSELECTED))
+        library(ML_IPC_TREEITEM_SELECT, handle);
+    else if (handle && app->activeView)
+        SendMessageW(app->activeView, profilesChanged, static_cast<WPARAM>(category), 1);
+}
+
+void refreshNavigation() {
+    const auto profiles = app->store.servers();
+    std::vector<std::pair<Id, std::string>> branches;
+    if (profiles.size() > 1 && !app->store.unifiedTree())
+        for (const auto& profile : profiles) branches.emplace_back(profile.id, profile.name);
+    if (!app->navigation.empty() && branches == app->serverBranches) return;
+
+    const auto root = app->treeId;
+    const auto rootHandle = library(ML_IPC_TREEITEM_GETHANDLE, root);
+    const auto selectedHandle = library(ML_IPC_TREEITEM_GETSELECTED);
+    MLTREEITEMINFOW info{};
+    info.item.size = sizeof(info.item);
+    info.handle = selectedHandle;
+    info.mask = MLTI_ID;
+    if (selectedHandle) library(ML_IPC_TREEITEM_GETINFOW, reinterpret_cast<WPARAM>(&info));
+    const auto selected = app->navigation.find(info.item.id);
+    const bool restore = selected != app->navigation.end();
+    const auto category = restore ? selected->second.category : BrowseKind::albums;
+    const auto filter = app->filterServer;
+    if (restore && selectedHandle != rootHandle) library(ML_IPC_TREEITEM_SELECT, rootHandle);
+
+    while (const auto child = library(ML_IPC_TREEITEM_GETCHILD, rootHandle)) {
+        library(ML_IPC_TREEITEM_DELETE, child);
+        if (library(ML_IPC_TREEITEM_GETCHILD, rootHandle) == child)
+            throw Error("WACUP could not refresh the Tangerine Stream tree.");
+    }
+    app->navigation.clear();
+    app->navigation.emplace(root, Navigation{BrowseKind::albums, 0, true});
+    auto addCategories = [&](UINT_PTR parent, Id server) {
+        for (const auto& entry : categories)
+            app->navigation.emplace(addTreeItem(entry.name, parent, false), Navigation{entry.kind, server, false});
+    };
+    if (branches.empty()) addCategories(root, 0);
+    for (const auto& [server, name] : branches) {
+        const auto parent = addTreeItem(wide(name).c_str(), root, true);
+        app->navigation.emplace(parent, Navigation{BrowseKind::albums, server, true});
+        addCategories(parent, server);
+    }
+    app->serverBranches = std::move(branches);
+    if (restore) selectCategory(category, filter);
+}
+
 int init() {
     try {
         INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
@@ -1805,9 +2050,7 @@ int init() {
         if (!SetTimer(plugin.hwndWinampParent, playbackTimer, 350, nullptr))
             throw Error("WACUP playback tracking could not start.");
         app->treeId = addTreeItem(pluginName, 0, true);
-        app->navigation.emplace(app->treeId, BrowseKind::albums);
-        for (const auto& category : categories)
-            app->navigation.emplace(addTreeItem(category.name, app->treeId, false), category.kind);
+        refreshNavigation();
         // WACUP reads the second line of its Preferences row from this per-profile catalog.
         const auto descriptions = settings / L"plugin_descriptions.ini";
         wchar_t existing[256]{};
@@ -1845,17 +2088,16 @@ INT_PTR message(int type, INT_PTR a, INT_PTR b, INT_PTR) {
     try {
         if (type == ML_MSG_TREE_ONCREATEVIEW) {
             auto entry = app->navigation.find(static_cast<UINT_PTR>(a));
-            if (entry != app->navigation.end())
+            if (entry != app->navigation.end()) {
+                if (!app->serverBranches.empty()) app->filterServer = entry->second.server;
+                if (entry->second.server) app->selectedServer = entry->second.server;
                 return reinterpret_cast<INT_PTR>(CreateDialogParamW(plugin.hDllInstance,
                     MAKEINTRESOURCEW(IDD_LIBRARY), reinterpret_cast<HWND>(b), viewProc,
-                    static_cast<LPARAM>(entry->second)));
+                    reinterpret_cast<LPARAM>(&entry->second)));
+            }
         }
         if (type == ML_MSG_CONFIG) {
-            auto servers = app->store.servers();
-            auto selected = std::find_if(servers.begin(), servers.end(),
-                [](const auto& s) { return s.id == app->selectedServer; });
-            if (selected == servers.end()) selected = servers.begin();
-            configure(reinterpret_cast<HWND>(a), selected == servers.end() ? Server{} : *selected);
+            configure(reinterpret_cast<HWND>(a), app->selectedServer);
             return TRUE;
         }
     } catch (const std::exception& error) { showError(plugin.hwndLibraryParent, error); }
