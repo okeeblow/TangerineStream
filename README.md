@@ -6,15 +6,25 @@ Tangerine Stream adds Navidrome and OpenSubsonic browsing to the WACUP Media Lib
 
 Keep the extracted Nullsoft SDK in `WA5.55_SDK`, or set `WINAMP_SDK` to its location when configuring CMake.
 
-From the MSYS2 **MINGW32** shell under `C:\msys64`, install the 32-bit compiler and build tools, then build the plugin.
+Double-click **build.bat** to build with 32-bit MSYS2. The DLL goes to `build-mingw32/ml_tangerinestream.dll`. The script uses `C:\msys64` by default. Set the `MSYS2_ROOT` environment variable if MSYS2 is installed elsewhere. CMake and Ninja can come from MSYS2 or from your Windows PATH.
+
+If you need the tools, install them from the MSYS2 **MINGW32** shell.
 
 ~~~sh
 pacman -S --needed mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-ninja
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
 ~~~
 
-Close WACUP, copy `build/ml_tangerinestream.dll` into its `Plugins` directory, then reopen WACUP. Select **Tangerine Stream** in the Media Library. The MinGW build links its compiler runtime statically and uses Windows-provided DLLs.
+Close WACUP before running **build-and-install.bat**. It builds and copies the DLL into the detected WACUP `Plugins` folder. Use **Run as administrator** if the folder requires elevated write access. Reopen WACUP and select **Tangerine Stream** in the Media Library.
+
+From Command Prompt, pass `vs` to use Visual Studio's 32-bit C++ tools and write the build to `build-vs`. Pass `--no-pause` when running either script unattended. For a portable WACUP installation, set `WACUP_PLUGINS_DIR` to its actual plugin directory.
+
+~~~bat
+build.bat vs
+set "WACUP_PLUGINS_DIR=D:\Portable\WACUP\Plugins"
+build-and-install.bat --no-pause
+~~~
+
+With the toolchain environment set up, `cmake --build build-mingw32 --target install` also builds and installs the DLL. To set the destination when configuring CMake, pass `-DWACUP_PLUGINS_DIR="D:\Portable\WACUP\Plugins"`. The MinGW build links its compiler runtime statically and uses Windows-provided DLLs.
 
 ## Connect and play
 
