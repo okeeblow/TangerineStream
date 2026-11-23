@@ -25,7 +25,6 @@ public:
     int rollingMiB();
     std::string playbackSecret();
     int playbackPort();
-    void savePlaybackPort(int port);
     bool textCatalog();
     void saveTextCatalog(bool text);
     bool offlineMode();
@@ -49,7 +48,7 @@ public:
     std::vector<Track> pendingPins(Id server);
     void postponePin(Id key);
 
-    std::filesystem::path audioPath(Id key) const;
+    HANDLE openCached(Id key, std::filesystem::path& path);
     std::filesystem::path partialPath(Id key) const;
     bool reserve(Id key, std::int64_t bytes);
     void publish(Id key, std::int64_t bytes, const std::string& mime);
@@ -70,6 +69,7 @@ private:
     void setSetting(const char* key, const std::string& value);
     Server loadServer(Id id);
     Track loadTrack(Id key);
+    std::filesystem::path audioPath(const Track& track) const;
     void reconcile();
     bool trimUnlocked(std::int64_t incoming);
 

@@ -9,4 +9,4 @@
 
 The Winamp SDK files retain their original notices and line endings. The SHA-256 of the Winamp 5.9 SDK installer is `1f14e0c73251ea899ac10754e40e219ebbe0a2f5827f8de1b88cc698749598c5`.
 
-Set `WACUP_SDK_HOME` to select a Winamp SDK directory for a build. The plug-in uses the legacy Media Library ABI and provides an opaque declaration for the Wasabi service pointer in the later SDKs.
+Set `WACUP_SDK_HOME` to select a Winamp SDK directory for a build. The Media Library plug-in uses the legacy Media Library ABI. The build includes the bundled 5.55 Wasabi and Agave service headers because the 5.666 package omits them.

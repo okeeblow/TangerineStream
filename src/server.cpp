@@ -568,10 +568,14 @@ public:
         return result;
     }
 
+    std::string streamUrl(const Track& track) override {
+        return url("stream", {{"id", track.id}, {"format", "raw"}});
+    }
+
     std::unique_ptr<Response> audio(const Track& track, const std::string& range,
                                     bool head) override {
         auto headers = range.empty() ? L"" : L"Range: " + wide(range) + L"\r\n";
-        return std::make_unique<Response>(url("stream", {{"id", track.id}, {"format", "raw"}}),
+        return std::make_unique<Response>(streamUrl(track),
                                           head ? L"HEAD" : L"GET", headers);
     }
 

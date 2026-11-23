@@ -295,23 +295,13 @@ int Store::rollingMiB() {
 
 std::string Store::playbackSecret() {
     std::scoped_lock lock(mutex_);
-    auto secret = setting("playback_secret");
-    if (secret.empty()) {
-        secret = randomHex();
-        setSetting("playback_secret", secret);
-    }
-    return secret;
+    return setting("playback_secret");
 }
 
 int Store::playbackPort() {
     std::scoped_lock lock(mutex_);
     auto port = setting("playback_port");
     return port.empty() ? 0 : std::stoi(port);
-}
-
-void Store::savePlaybackPort(int port) {
-    std::scoped_lock lock(mutex_);
-    setSetting("playback_port", std::to_string(port));
 }
 
 bool Store::textCatalog() {
@@ -645,7 +635,23 @@ void Store::postponePin(Id key) {
     Statement(db_, "UPDATE tracks SET retry_at=? WHERE key=?").bind(nowMs() + 60'000).bind(key).run();
 }
 
-std::filesystem::path Store::audioPath(Id key) const { return cache_ / (std::to_wstring(key) + L".audio"); }
+std::filesystem::path Store::audioPath(const Track& track) const {
+    auto suffix = track.suffix;
+    if (suffix.empty() || suffix.size() > 12 ||
+        suffix.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != suffix.npos)
+        suffix = "mp3";
+    return cache_ / (std::to_wstring(track.key) + L".media." + wide(suffix));
+}
+
+HANDLE Store::openCached(Id key, std::filesystem::path& path) {
+    std::scoped_lock lock(mutex_);
+    auto track = loadTrack(key);
+    if (!track.bytes) return INVALID_HANDLE_VALUE;
+    path = audioPath(track);
+    auto file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    return file;
+}
+
 std::filesystem::path Store::partialPath(Id key) const { return cache_ / (std::to_wstring(key) + L".part"); }
 
 void Store::reconcile() {
@@ -655,15 +661,21 @@ void Store::reconcile() {
     while (saved.row()) files.emplace(saved.integer(0), saved.integer(1));
     for (const auto& [key, bytes] : files) {
         std::error_code error;
-        if (std::filesystem::file_size(audioPath(key), error) != bytes || error) missing.push_back(key);
+        auto path = audioPath(loadTrack(key));
+        auto legacy = cache_ / (std::to_wstring(key) + L".audio");
+        if (!std::filesystem::exists(path) && std::filesystem::exists(legacy))
+            std::filesystem::rename(legacy, path);
+        if (std::filesystem::file_size(path, error) != bytes || error) missing.push_back(key);
     }
     for (const auto& entry : std::filesystem::directory_iterator(cache_)) {
         auto extension = entry.path().extension();
         auto stem = entry.path().stem().string();
+        const bool media = stem.size() > 6 && stem.compare(stem.size()-6, 6, ".media") == 0;
+        if (media) stem.resize(stem.size()-6);
         Id key;
         auto parsed = std::from_chars(stem.data(), stem.data() + stem.size(), key);
         if (parsed.ec != std::errc{} || parsed.ptr != stem.data() + stem.size()) continue;
-        if (extension == L".part" || (extension == L".audio" &&
+        if (extension == L".part" || ((media || extension == L".audio") &&
             (!files.count(key) || std::find(missing.begin(), missing.end(), key) != missing.end()))) {
             std::error_code error;
             std::filesystem::remove(entry.path(), error);
@@ -687,7 +699,7 @@ bool Store::trimUnlocked(std::int64_t incoming) {
     std::vector<std::pair<Id, std::int64_t>> candidates;
     while (oldest.row()) candidates.emplace_back(oldest.integer(0), oldest.integer(1));
     for (const auto& [key, bytes] : candidates) {
-        auto path = audioPath(key);
+        auto path = audioPath(loadTrack(key));
         if (!DeleteFileW(path.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) continue;
         Statement(db_, "UPDATE tracks SET bytes=0 WHERE key=?").bind(key).run();
         used -= bytes;
@@ -710,14 +722,14 @@ void Store::publish(Id key, std::int64_t bytes, const std::string& mime) {
     downloads_.at(key) = 0;
     auto track = loadTrack(key);
     if (bytes <= 0 || (!track.pinned && !track.favorite && !trimUnlocked(bytes))) return;
-    if (!MoveFileExW(partialPath(key).c_str(), audioPath(key).c_str(),
+    if (!MoveFileExW(partialPath(key).c_str(), audioPath(track).c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         throw Error("The completed audio file could not be saved.");
     try {
         Statement(db_, "UPDATE tracks SET bytes=?,last_use=?,mime=?,retry_at=0 WHERE key=?")
             .bind(bytes).bind(nowMs()).bind(mime).bind(key).run();
     } catch (...) {
-        DeleteFileW(audioPath(key).c_str());
+        DeleteFileW(audioPath(track).c_str());
         throw;
     }
 }

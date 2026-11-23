@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 set "ts_toolchain=msys2"
-set "ts_install="
+set "ts_target=wacup_plugins"
 set "ts_no_pause="
 set "ts_pushed="
 set "ts_exit=1"
@@ -13,11 +13,11 @@ if /i "%~1"=="msys2" (
 ) else if /i "%~1"=="vs" (
     set "ts_toolchain=vs"
 ) else if /i "%~1"=="--install" (
-    set "ts_install=--target install"
+    set "ts_target=install"
 ) else if /i "%~1"=="--no-pause" (
     set "ts_no_pause=1"
 ) else (
-    echo Usage: %~nx0 [msys2^|vs] [--no-pause]
+    echo Usage: %~nx0 [msys2^|vs] [--install] [--no-pause]
     goto finish
 )
 shift
@@ -26,7 +26,6 @@ goto arguments
 :start
 pushd "%~dp0" || goto finish
 set "ts_pushed=1"
-if not defined WACUP_SDK_HOME set "WACUP_SDK_HOME=%~dp0SDKs\Winamp-5.666"
 if /i "%ts_toolchain%"=="vs" goto setup_vs
 
 if not defined MSYS2_ROOT set "MSYS2_ROOT=C:\msys64"
@@ -84,10 +83,10 @@ if errorlevel 1 (
     set "ts_exit=%errorlevel%"
     goto finish
 )
-cmake.exe --build "%ts_build%" --config Release %ts_parallel% %ts_install%
+cmake.exe --build "%ts_build%" --config Release %ts_parallel% --target %ts_target%
 set "ts_exit=%errorlevel%"
 if not "%ts_exit%"=="0" goto finish
-echo Built "%ts_build%\ml_tangerinestream.dll".
+echo Built WACUP plug-ins in "%ts_build%".
 
 :finish
 if defined ts_pushed popd

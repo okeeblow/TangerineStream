@@ -1,11 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
-project(ml_tangerinestream VERSION 0.3.1 LANGUAGES CXX RC)
+project(ml_tangerinestream VERSION 0.4.0 LANGUAGES CXX RC)
 
-set(WINAMP_SDK "" CACHE PATH "Winamp SDK directory override")
-if(WINAMP_SDK STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}/WA5.55_SDK" AND NOT EXISTS "${WINAMP_SDK}")
-    # The original default may still be cached in an existing build.
-    set(WINAMP_SDK "" CACHE PATH "Winamp SDK directory override" FORCE)
+# Early releases cached the bundled SDK as a default. Discard that entry if
+# the SDK moved, while still diagnosing a missing user-supplied override.
+get_property(sdk_cache_help CACHE WINAMP_SDK PROPERTY HELPSTRING)
+if(sdk_cache_help STREQUAL "Nullsoft Winamp SDK" AND NOT IS_DIRECTORY "${WINAMP_SDK}")
+    unset(WINAMP_SDK CACHE)
 endif()
+set(WINAMP_SDK "" CACHE PATH "Winamp SDK directory override")
 set(sdk_directory "${WINAMP_SDK}")
 if(NOT sdk_directory)
     set(sdk_directory "$ENV{WACUP_SDK_HOME}")
@@ -15,48 +17,12 @@ if(NOT sdk_directory)
 endif()
 file(TO_CMAKE_PATH "${sdk_directory}" sdk_directory)
 cmake_path(ABSOLUTE_PATH sdk_directory BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" NORMALIZE)
-foreach(header IN ITEMS gen_ml/ml.h gen_ml/ml_ipc_0313.h Winamp/wa_ipc.h)
+foreach(header IN ITEMS gen_ml/ml.h gen_ml/ml_ipc_0313.h Winamp/wa_ipc.h Winamp/in2.h)
     if(NOT EXISTS "${sdk_directory}/${header}")
         message(FATAL_ERROR "Missing ${header} in ${sdk_directory}. Set WACUP_SDK_HOME or WINAMP_SDK to a Winamp SDK directory.")
     endif()
 endforeach()
 message(STATUS "Using Winamp SDK at ${sdk_directory}")
-
-add_library(ml_tangerinestream SHARED
-    src/plugin.cpp src/server.cpp src/store.cpp src/playback.cpp src/artwork.cpp
-    src/host_metadata.cpp src/plugin.rc)
-set_target_properties(ml_tangerinestream PROPERTIES PREFIX "")
-target_compile_features(ml_tangerinestream PRIVATE cxx_std_17)
-target_compile_definitions(ml_tangerinestream PRIVATE
-    UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
-target_include_directories(ml_tangerinestream PRIVATE src/compat)
-target_include_directories(ml_tangerinestream SYSTEM PRIVATE "${sdk_directory}")
-target_link_libraries(ml_tangerinestream PRIVATE
-    comctl32 winhttp ws2_32 crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
-
-if(MINGW)
-    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
-        set(sqlite_machine i386)
-        set(sqlite_def src/winsqlite3-x86.def)
-        set(sqlite_options --kill-at)
-    else()
-        set(sqlite_machine i386:x86-64)
-        set(sqlite_def src/winsqlite3.def)
-    endif()
-    set(sqlite_import "${CMAKE_CURRENT_BINARY_DIR}/libwinsqlite3.a")
-    add_custom_command(OUTPUT "${sqlite_import}"
-        COMMAND "${CMAKE_DLLTOOL}" -m "${sqlite_machine}" ${sqlite_options}
-            -d "${CMAKE_CURRENT_SOURCE_DIR}/${sqlite_def}" -l "${sqlite_import}"
-        DEPENDS "${sqlite_def}" VERBATIM)
-    add_custom_target(sqlite_import DEPENDS "${sqlite_import}")
-    add_dependencies(ml_tangerinestream sqlite_import)
-    target_link_libraries(ml_tangerinestream PRIVATE "${sqlite_import}")
-    target_link_options(ml_tangerinestream PRIVATE -static -static-libgcc -static-libstdc++)
-    target_compile_options(ml_tangerinestream PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>")
-else()
-    set_property(TARGET ml_tangerinestream PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-    target_link_libraries(ml_tangerinestream PRIVATE winsqlite3)
-endif()
 
 set(WACUP_PLUGINS_DIR "" CACHE PATH "WACUP Plugins directory (empty to detect the installed copy)")
 set(plugin_destination "${WACUP_PLUGINS_DIR}")
@@ -100,5 +66,60 @@ else()
     file(TO_CMAKE_PATH "${plugin_destination}" plugin_destination)
     cmake_path(ABSOLUTE_PATH plugin_destination BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" NORMALIZE)
     message(STATUS "WACUP plugin install destination: ${plugin_destination}")
-    install(TARGETS ml_tangerinestream RUNTIME DESTINATION "${plugin_destination}")
+endif()
+
+add_custom_target(wacup_plugins ALL)
+
+function(add_wacup_plugin target)
+    add_library(${target} MODULE ${ARGN})
+    set_target_properties(${target} PROPERTIES PREFIX "")
+    target_compile_features(${target} PRIVATE cxx_std_17)
+    target_compile_definitions(${target} PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_include_directories(${target} SYSTEM PRIVATE "${sdk_directory}")
+    if(MINGW)
+        target_link_options(${target} PRIVATE -static -static-libgcc -static-libstdc++)
+        target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>")
+    elseif(MSVC)
+        set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_dependencies(wacup_plugins ${target})
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND plugin_destination)
+        install(TARGETS ${target} LIBRARY DESTINATION "${plugin_destination}")
+    endif()
+endfunction()
+
+add_wacup_plugin(in_tangerinestream src/input.cpp src/input.rc)
+target_compile_definitions(in_tangerinestream PRIVATE UNICODE_INPUT_PLUGIN)
+target_link_libraries(in_tangerinestream PRIVATE user32)
+
+add_wacup_plugin(ml_tangerinestream
+    src/plugin.cpp src/server.cpp src/store.cpp src/playback.cpp src/artwork.cpp
+    src/host_metadata.cpp src/plugin.rc)
+target_compile_definitions(ml_tangerinestream PRIVATE _WIN32_WINNT=0x0A00)
+# The 5.666 package omits the Wasabi art and metadata service headers.
+target_include_directories(ml_tangerinestream SYSTEM PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Wasabi"
+    "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Agave")
+target_link_libraries(ml_tangerinestream PRIVATE
+    comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
+
+if(MINGW)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        set(sqlite_machine i386)
+        set(sqlite_def src/winsqlite3-x86.def)
+        set(sqlite_options --kill-at)
+    else()
+        set(sqlite_machine i386:x86-64)
+        set(sqlite_def src/winsqlite3.def)
+    endif()
+    set(sqlite_import "${CMAKE_CURRENT_BINARY_DIR}/libwinsqlite3.a")
+    add_custom_command(OUTPUT "${sqlite_import}"
+        COMMAND "${CMAKE_DLLTOOL}" -m "${sqlite_machine}" ${sqlite_options}
+            -d "${CMAKE_CURRENT_SOURCE_DIR}/${sqlite_def}" -l "${sqlite_import}"
+        DEPENDS "${sqlite_def}" VERBATIM)
+    add_custom_target(sqlite_import DEPENDS "${sqlite_import}")
+    add_dependencies(ml_tangerinestream sqlite_import)
+    target_link_libraries(ml_tangerinestream PRIVATE "${sqlite_import}")
+else()
+    target_link_libraries(ml_tangerinestream PRIVATE winsqlite3)
 endif()
