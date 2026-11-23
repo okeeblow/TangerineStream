@@ -4,7 +4,7 @@ Tangerine Stream adds Navidrome and OpenSubsonic browsing to the WACUP Media Lib
 
 ## Build and install
 
-Keep the extracted Nullsoft SDK in `WA5.55_SDK`, or set `WINAMP_SDK` to its location when configuring CMake.
+The build defaults to the Winamp 5.666 headers in `SDKs/Winamp-5.666`. Set `WACUP_SDK_HOME` in the build environment to select another SDK directory. The CMake cache option `WINAMP_SDK` takes precedence. [SDK sources and versions](SDKs/README.md)
 
 Double-click **build.bat** to build with 32-bit MSYS2. The DLL goes to `build-mingw32/ml_tangerinestream.dll`. The script uses `C:\msys64` by default. Set the `MSYS2_ROOT` environment variable if MSYS2 is installed elsewhere. CMake and Ninja can come from MSYS2 or from your Windows PATH.
 

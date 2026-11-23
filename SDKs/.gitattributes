@@ -1,0 +1,2 @@
+# Preserve the SDK files as supplied, including their original line endings.
+Winamp-*/** -text

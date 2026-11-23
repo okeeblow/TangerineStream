@@ -40,7 +40,20 @@ void quit();
 INT_PTR message(int type, INT_PTR a, INT_PTR b, INT_PTR c);
 
 char description[] = "Tangerine Stream v0.2.0";
-winampMediaLibraryPlugin plugin{MLHDR_VER, description, init, quit, message, nullptr, nullptr, nullptr};
+winampMediaLibraryPlugin plugin = [] {
+    winampMediaLibraryPlugin descriptor{};
+#ifdef MLHDR_VER_OLD
+    // These SDKs also define a later ABI with a UTF-16 description.
+    descriptor.version = MLHDR_VER_OLD;
+#else
+    descriptor.version = MLHDR_VER;
+#endif
+    descriptor.description = description;
+    descriptor.init = init;
+    descriptor.quit = quit;
+    descriptor.MessageProc = message;
+    return descriptor;
+}();
 
 LRESULT player(UINT command, WPARAM value = 0) {
     return SendMessageW(plugin.hwndWinampParent, WM_WA_IPC, value, command);

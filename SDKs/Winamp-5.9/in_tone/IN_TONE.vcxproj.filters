@@ -1,0 +1,24 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{ffc9d315-699d-4918-8e9b-ac525e0a9aca}</UniqueIdentifier>
+      <Extensions>cpp;c;cxx;rc;def;r;odl;hpj;bat;for;f90</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Main.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  <ItemGroup>
+    <ClInclude Include="resource.h">
+      <Filter>Header Files</Filter>
+   </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="in_tone.rc">
+      <Filter>Ressource Files</Filter>
+   </ResourceCompile>
+  </ItemGroup>
+  </ItemGroup>
+</Project>

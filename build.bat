@@ -26,6 +26,7 @@ goto arguments
 :start
 pushd "%~dp0" || goto finish
 set "ts_pushed=1"
+if not defined WACUP_SDK_HOME set "WACUP_SDK_HOME=%~dp0SDKs\Winamp-5.666"
 if /i "%ts_toolchain%"=="vs" goto setup_vs
 
 if not defined MSYS2_ROOT set "MSYS2_ROOT=C:\msys64"

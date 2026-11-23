@@ -1,10 +1,26 @@
 cmake_minimum_required(VERSION 3.20)
 project(ml_tangerinestream VERSION 0.2.0 LANGUAGES CXX RC)
 
-set(WINAMP_SDK "${CMAKE_CURRENT_SOURCE_DIR}/WA5.55_SDK" CACHE PATH "Nullsoft Winamp SDK")
-if(NOT EXISTS "${WINAMP_SDK}/gen_ml/ml.h")
-    message(FATAL_ERROR "Set WINAMP_SDK to the extracted Nullsoft Winamp SDK")
+set(WINAMP_SDK "" CACHE PATH "Winamp SDK directory override")
+if(WINAMP_SDK STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}/WA5.55_SDK" AND NOT EXISTS "${WINAMP_SDK}")
+    # The original default may still be cached in an existing build.
+    set(WINAMP_SDK "" CACHE PATH "Winamp SDK directory override" FORCE)
 endif()
+set(sdk_directory "${WINAMP_SDK}")
+if(NOT sdk_directory)
+    set(sdk_directory "$ENV{WACUP_SDK_HOME}")
+endif()
+if(NOT sdk_directory)
+    set(sdk_directory "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.666")
+endif()
+file(TO_CMAKE_PATH "${sdk_directory}" sdk_directory)
+cmake_path(ABSOLUTE_PATH sdk_directory BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" NORMALIZE)
+foreach(header IN ITEMS gen_ml/ml.h gen_ml/ml_ipc_0313.h Winamp/wa_ipc.h)
+    if(NOT EXISTS "${sdk_directory}/${header}")
+        message(FATAL_ERROR "Missing ${header} in ${sdk_directory}. Set WACUP_SDK_HOME or WINAMP_SDK to a Winamp SDK directory.")
+    endif()
+endforeach()
+message(STATUS "Using Winamp SDK at ${sdk_directory}")
 
 add_library(ml_tangerinestream SHARED
     src/plugin.cpp src/server.cpp src/store.cpp src/playback.cpp src/artwork.cpp src/plugin.rc)
@@ -12,7 +28,8 @@ set_target_properties(ml_tangerinestream PROPERTIES PREFIX "")
 target_compile_features(ml_tangerinestream PRIVATE cxx_std_17)
 target_compile_definitions(ml_tangerinestream PRIVATE
     UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
-target_include_directories(ml_tangerinestream PRIVATE "${WINAMP_SDK}")
+target_include_directories(ml_tangerinestream PRIVATE src/compat)
+target_include_directories(ml_tangerinestream SYSTEM PRIVATE "${sdk_directory}")
 target_link_libraries(ml_tangerinestream PRIVATE
     comctl32 winhttp ws2_32 crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
 
