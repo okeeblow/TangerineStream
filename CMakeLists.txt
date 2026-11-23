@@ -1,12 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(ml_tangerinestream VERSION 0.4.1 LANGUAGES CXX RC)
 
-# Early releases cached the bundled SDK as a default. Discard that entry if
-# the SDK moved, while still diagnosing a missing user-supplied override.
-get_property(sdk_cache_help CACHE WINAMP_SDK PROPERTY HELPSTRING)
-if(sdk_cache_help STREQUAL "Nullsoft Winamp SDK" AND NOT IS_DIRECTORY "${WINAMP_SDK}")
-    unset(WINAMP_SDK CACHE)
-endif()
 set(WINAMP_SDK "" CACHE PATH "Winamp SDK directory override")
 set(sdk_directory "${WINAMP_SDK}")
 if(NOT sdk_directory)
