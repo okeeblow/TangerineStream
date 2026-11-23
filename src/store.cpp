@@ -205,6 +205,9 @@ Store::Store(const std::filesystem::path& directory) : cache_(directory / L"cach
             "slot INTEGER NOT NULL,title TEXT NOT NULL,subtitle TEXT NOT NULL,cover_id TEXT NOT NULL,"
             "track_key INTEGER NOT NULL,PRIMARY KEY(server,parent_kind,parent_id,kind,id,slot)) WITHOUT ROWID").run();
         Statement(db_, "CREATE INDEX IF NOT EXISTS catalog_objects ON catalog(server,kind,id)").run();
+        Statement(db_, "CREATE TABLE IF NOT EXISTS catalog_totals (server INTEGER NOT NULL REFERENCES servers(id),"
+            "kind INTEGER NOT NULL,id TEXT NOT NULL,songs INTEGER NOT NULL,duration INTEGER NOT NULL,"
+            "PRIMARY KEY(server,kind,id)) WITHOUT ROWID").run();
         Statement(db_, "CREATE TABLE IF NOT EXISTS artwork (server INTEGER NOT NULL REFERENCES servers(id),"
             "cover_key TEXT NOT NULL,data BLOB NOT NULL,last_use INTEGER NOT NULL,"
             "PRIMARY KEY(server,cover_key)) WITHOUT ROWID").run();
@@ -419,7 +422,27 @@ void Store::rememberCatalog(Id server, const BrowseLocation& location, bool unfi
             .bind(item.target.id).bind(slot).bind(item.target.title).bind(item.subtitle).bind(item.coverId)
             .bind(key).run();
     };
-    for (const auto& item : page.items) save(item, 0, 0);
+    auto saveTotals = [&](BrowseKind kind, const std::string& id, int songs, std::int64_t duration) {
+        if (songs < 0 && duration <= 0) return;
+        Statement(db_, "INSERT INTO catalog_totals VALUES(?,?,?,?,?) ON CONFLICT(server,kind,id) DO UPDATE SET"
+            " songs=CASE WHEN excluded.songs>=0 THEN excluded.songs ELSE catalog_totals.songs END,"
+            " duration=CASE WHEN excluded.songs=0 OR excluded.duration>0 THEN excluded.duration"
+            " ELSE catalog_totals.duration END").bind(server).bind(static_cast<int>(kind)).bind(id)
+            .bind(songs).bind(duration).run();
+    };
+    for (const auto& item : page.items) {
+        save(item, 0, 0);
+        saveTotals(item.target.kind, item.target.id, item.songCount, item.duration);
+    }
+    if (unfiltered && !offset && !page.more &&
+        (location.kind == BrowseKind::albumTracks || location.kind == BrowseKind::playlistTracks)) {
+        std::int64_t duration = 0;
+        for (const auto& track : page.tracks) {
+            if (track.duration <= 0) { duration = 0; break; }
+            duration += track.duration;
+        }
+        saveTotals(location.kind, location.id, static_cast<int>(page.tracks.size()), duration);
+    }
     if (location.kind == BrowseKind::playlistTracks) {
         Id position = offset;
         for (const auto& track : page.tracks)
@@ -469,7 +492,8 @@ BrowsePage Store::cachedPage(Id server, const BrowseLocation& location, const st
             else if (result.items.size() == pageSize) result.more = true;
             else result.items.push_back(std::move(item));
         };
-        auto sql = std::string("SELECT kind,id,title,subtitle,cover_id FROM catalog WHERE server=? AND ");
+        auto sql = std::string("SELECT kind,id,title,subtitle,cover_id,coalesce(songs,-1),coalesce(duration,0)"
+            " FROM catalog LEFT JOIN catalog_totals USING(server,kind,id) WHERE server=? AND ");
         if (kind == BrowseKind::albums) sql += "kind=?";
         else sql += "parent_kind=? AND parent_id=?";
         sql += " ORDER BY title COLLATE NOCASE,id,cover_id DESC";
@@ -480,7 +504,8 @@ BrowsePage Store::cachedPage(Id server, const BrowseLocation& location, const st
         while (!result.more && entries.row()) {
             names.emplace(entries.text(2), entries.text(3));
             addItem({{static_cast<BrowseKind>(entries.integer(0)), entries.text(1), entries.text(2)},
-                entries.text(3), entries.text(4)});
+                entries.text(3), entries.text(4), static_cast<int>(entries.integer(5)),
+                entries.integer(6)});
         }
         if (result.more) return result;
         if (kind == BrowseKind::genres) {
@@ -510,7 +535,8 @@ BrowsePage Store::cachedPage(Id server, const BrowseLocation& location, const st
         }
         if (kind == BrowseKind::albums || kind == BrowseKind::genreAlbums || kind == BrowseKind::artistAlbums) {
             auto albumSql = std::string("SELECT album_id,album,min(coalesce(nullif(album_artist,''),artist)),"
-                "max(cover_id) FROM tracks WHERE server=? AND album<>''");
+                "max(cover_id),count(*),CASE WHEN min(duration)>0 THEN sum(duration) ELSE 0 END"
+                " FROM tracks WHERE server=? AND album<>''");
             if (kind == BrowseKind::genreAlbums) albumSql += " AND genre=?";
             if (kind == BrowseKind::artistAlbums) albumSql += localLocation(location) ?
                 " AND (artist=? OR album_artist=?)" : " AND (artist_id=? OR album_artist_id=?"
@@ -533,7 +559,8 @@ BrowsePage Store::cachedPage(Id server, const BrowseLocation& location, const st
                 names.emplace(album, albumArtist);
                 if (albumId.empty()) albumId = '\x1f' + album + '\x1f' + albumArtist;
                 addItem({{BrowseKind::albumTracks, std::move(albumId), std::move(album)},
-                    std::move(albumArtist), albums.text(3)});
+                    std::move(albumArtist), albums.text(3), static_cast<int>(albums.integer(4)),
+                    albums.integer(5)});
             }
         }
     }

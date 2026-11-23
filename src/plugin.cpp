@@ -40,6 +40,7 @@ constexpr wchar_t pluginName[] = L"Tangerine Stream";
 constexpr auto viewReady = WM_APP + 1;
 constexpr auto profilesChanged = WM_APP + 2;
 constexpr auto moreRequested = WM_APP + 4;
+constexpr auto selectionChanged = WM_APP + 5;
 constexpr UINT_PTR playbackTimer = 0x7151;
 constexpr UINT_PTR viewTimer = 1;
 constexpr UINT_PTR searchTimer = 2;
@@ -133,6 +134,7 @@ struct SearchResult {
     std::string error;
     bool cached = false;
     bool restart = false;
+    double seconds = 0;
 };
 
 struct Playing {
@@ -474,6 +476,7 @@ void App::browse() {
             request.reset();
         }
         SearchResult ready{search.view, search.serial, {}, {}};
+        const auto started = Clock::now();
         try {
             ready.cached = search.cached || search.location.kind == BrowseKind::offline ||
                 localLocation(search.location) || !store.networkAvailable(search.server);
@@ -512,6 +515,7 @@ void App::browse() {
         } catch (const std::exception& error) {
             ready.error = error.what();
         }
+        ready.seconds = std::chrono::duration<double>(Clock::now() - started).count();
         std::scoped_lock lock(searchMutex);
         if (!stopping && serial == ready.serial) {
             result = std::move(ready);
@@ -942,6 +946,10 @@ public:
     void command(int id, int notification);
     void refresh();
     void updateButtons();
+    void queueSelectionUpdate() {
+        if (!selectionPending) selectionPending = PostMessageW(hwnd, selectionChanged, 0, 0) != FALSE;
+    }
+    void updateSelection();
     void prefetchTrack(int row) {
         if (showTracks() && row >= 0 && static_cast<size_t>(row) < tracks.size())
             app->artwork.requestTrack(tracks[row].key);
@@ -979,6 +987,9 @@ private:
     std::set<Id> knownTracks;
     int nextOffset = 0;
     bool loading = false, more = false, morePosted = false;
+    bool selectionPending = false;
+    double browseSeconds = 0;
+    std::wstring selectionSummary;
     bool cached = false;
     std::string message;
     LRESULT legacySkin = 0;
@@ -1053,6 +1064,8 @@ void View::resetContent() {
     loading = more = morePosted = false;
     cached = false;
     nextOffset = 0;
+    browseSeconds = 0;
+    selectionSummary.clear();
     message.clear();
     ListView_SetItemCount(list, 0);
     items.clear();
@@ -1093,12 +1106,12 @@ void View::scheduleMore() {
 void View::updateRowCount() {
     ListView_SetItemCountEx(list, rowCount(), LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
     InvalidateRect(list, nullptr, FALSE);
-    updateStatus();
-    updateButtons();
+    updateSelection();
 }
 
 void View::receive(SearchResult result) {
     if (result.restart) resetContent();
+    browseSeconds += result.seconds;
     loading = false;
     cached = result.cached;
     message = std::move(result.error);
@@ -1359,6 +1372,48 @@ void View::back() {
     SetFocus(list);
 }
 
+void View::updateSelection() {
+    selectionPending = false;
+    const auto started = Clock::now();
+    const int selectedRows = ListView_GetSelectedCount(list);
+    const int count = selectedRows ? selectedRows : rowCount();
+    std::int64_t seconds = 0, songs = 0;
+    bool knownDuration = true, knownCount = true;
+    auto include = [&](int i) {
+        const auto duration = showTracks() ? tracks[i].duration : items[i].duration;
+        const int n = showTracks() ? 1 : items[i].songCount;
+        knownDuration &= duration > 0 || n == 0;
+        knownCount &= n >= 0;
+        seconds += duration;
+        songs += std::max(0, n);
+    };
+    if (selectedRows) {
+        for (int i = ListView_GetNextItem(list, -1, LVNI_SELECTED); i >= 0 && i < rowCount();
+             i = ListView_GetNextItem(list, i, LVNI_SELECTED)) include(i);
+    } else {
+        for (int i = 0; i < count; ++i) include(i);
+    }
+    auto numberOf = [](std::int64_t n, const wchar_t* one, const wchar_t* many) {
+        return std::to_wstring(n) + L" " + (n == 1 ? one : many);
+    };
+    selectionSummary = showTracks() ? numberOf(count, L"track", L"tracks") : numberOf(count, L"item", L"items");
+    if (selectedRows) selectionSummary += L" selected";
+    if (!showTracks() && count && knownCount) selectionSummary += L"  |  " + numberOf(songs, L"track", L"tracks");
+    if (knownDuration && seconds > 0) {
+        auto padded = [](std::int64_t n) { return (n < 10 ? L"0" : L"") + std::to_wstring(n); };
+        selectionSummary += L" [" + (seconds >= 3600 ? std::to_wstring(seconds / 3600) + L":" +
+            padded(seconds / 60 % 60) : std::to_wstring(seconds / 60)) + L":" + padded(seconds % 60) + L"]";
+    }
+    const auto elapsed = selectedRows ? std::chrono::duration<double>(Clock::now() - started).count() : browseSeconds;
+    if (count && elapsed > 0) {
+        wchar_t timing[64]{};
+        std::swprintf(timing, std::size(timing), L" in %.4f sec.", elapsed);
+        selectionSummary += timing;
+    }
+    updateStatus();
+    updateButtons();
+}
+
 void View::updateStatus() {
     auto server = selected();
     std::wstring status;
@@ -1368,7 +1423,7 @@ void View::updateStatus() {
     else if (!app->reportError.empty()) status = wide(app->reportError);
     else {
         if (rowCount() == 0) status = showTracks() ? L"No tracks" : L"No results";
-        else status = std::to_wstring(rowCount()) + (showTracks() ? L" tracks" : L" items");
+        else status = selectionSummary;
         if (loading) status += L"  |  Loading more...";
         auto count = app->store.reportCount(server->id);
         if (count) status += L"  |  " + std::to_wstring(count) + L" play reports queued";
@@ -1679,10 +1734,10 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                 if (key == VK_ESCAPE) view->cancelDrag();
                 if (key == VK_RETURN) view->activate(ListView_GetNextItem(view->list, -1, LVNI_SELECTED));
             }
-            if (notification->code == LVN_ITEMCHANGED || notification->code == LVN_ODSTATECHANGED)
-                view->updateButtons();
+            if (notification->code == LVN_ODSTATECHANGED) view->queueSelectionUpdate();
             if (notification->code == LVN_ITEMCHANGED) {
                 const auto& change = *reinterpret_cast<const NMLISTVIEW*>(l);
+                if ((change.uOldState ^ change.uNewState) & LVIS_SELECTED) view->queueSelectionUpdate();
                 if ((change.uNewState & LVIS_FOCUSED) && !(change.uOldState & LVIS_FOCUSED))
                     view->prefetchTrack(change.iItem);
             }
@@ -1698,6 +1753,7 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             return TRUE;
         case ArtworkLoader::readyMessage: view->receiveArtwork(); return TRUE;
         case moreRequested: view->fetchMore(); return TRUE;
+        case selectionChanged: view->updateSelection(); return TRUE;
         case WM_DESTROY:
             if (app) app->forgetView(hwnd);
             SetWindowLongPtrW(hwnd, DWLP_USER, 0);

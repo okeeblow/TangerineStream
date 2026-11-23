@@ -360,8 +360,11 @@ void appendItems(std::vector<LibraryItem>& result, const Json& items, BrowseKind
             break;
         default: break;
         }
+        const auto& count = node.at("songCount");
         result.push_back({{kind, std::move(id), std::move(name)}, std::move(subtitle),
-                          node.at("coverArt").string()});
+                          node.at("coverArt").string(), kind == BrowseKind::song ? 1 :
+                          (std::holds_alternative<double>(count.value) ? count.seconds() : -1),
+                          node.at("duration").seconds()});
     }
 }
 
@@ -617,7 +620,8 @@ private:
             auto isDirectory = std::get_if<bool>(&node.at("isDir").value);
             auto kind = isDirectory && *isDirectory ? BrowseKind::directory : BrowseKind::song;
             result.push_back({{kind, std::move(id), std::move(title)}, std::move(artist),
-                              node.at("coverArt").string()});
+                              node.at("coverArt").string(), kind == BrowseKind::song ? 1 : -1,
+                              node.at("duration").seconds()});
         }
     }
 

@@ -59,6 +59,8 @@ struct LibraryItem {
     BrowseLocation target;
     std::string subtitle;
     std::string coverId;
+    int songCount = -1;
+    std::int64_t duration = 0;
 };
 
 struct BrowsePage {
