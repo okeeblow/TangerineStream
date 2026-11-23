@@ -4,8 +4,8 @@
 IDI_TANGERINE ICON "tangerine.ico"
 
 1 VERSIONINFO
-FILEVERSION 0,3,0,0
-PRODUCTVERSION 0,3,0,0
+FILEVERSION 0,3,1,0
+PRODUCTVERSION 0,3,1,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_DLL
 BEGIN
@@ -15,11 +15,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "COOLTRAINER"
             VALUE "FileDescription", "Tangerine Stream Media Library Plugin"
-            VALUE "FileVersion", "0.3.0"
+            VALUE "FileVersion", "0.3.1"
             VALUE "InternalName", "ml_tangerinestream"
             VALUE "OriginalFilename", "ml_tangerinestream.dll"
             VALUE "ProductName", "Tangerine Stream"
-            VALUE "ProductVersion", "0.3.0"
+            VALUE "ProductVersion", "0.3.1"
             VALUE "Comments", "By COOLTRAINER"
         END
     END
@@ -48,17 +48,7 @@ BEGIN
     PUSHBUTTON "Enqueue", IDC_ENQUEUE, 44, 213, 53, 15
     PUSHBUTTON "Keep offline", IDC_KEEP_OFFLINE, 101, 213, 68, 15
     PUSHBUTTON "Unpin", IDC_UNPIN, 173, 213, 39, 15
-    PUSHBUTTON "Lyrics...", IDC_LYRICS, 216, 213, 50, 15
     LTEXT "", IDC_STATUS, 4, 232, 422, 14, SS_NOPREFIX | SS_ENDELLIPSIS
-END
-
-IDD_LYRICS DIALOGEX 0, 0, 270, 224
-STYLE DS_SETFONT | DS_MODALFRAME | WS_CAPTION | WS_SYSMENU | WS_POPUP
-CAPTION "Lyrics"
-FONT 9, "Segoe UI"
-BEGIN
-    EDITTEXT IDC_LYRIC_TEXT, 5, 5, 260, 194, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL
-    DEFPUSHBUTTON "Close", IDCANCEL, 212, 204, 53, 15
 END
 
 IDD_SERVER DIALOGEX 0, 0, 300, 167

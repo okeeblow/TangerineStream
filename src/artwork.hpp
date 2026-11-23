@@ -16,7 +16,7 @@ struct Thumbnail {
 class ArtworkLoader {
 public:
     static constexpr UINT readyMessage = WM_APP + 3;
-    static constexpr UINT trackReadyMessage = WM_APP + 5;
+    const UINT trackReadyMessage;
     using Generation = std::uint64_t;
 
     ArtworkLoader(Store& store, HWND player);
@@ -29,7 +29,6 @@ public:
     bool request(Generation generation, Id server, int row, int size, const LibraryItem& item);
     std::vector<Thumbnail> take(Generation generation);
     void requestTrack(Id key, bool priority = false);
-    bool trackPending(Id key);
     std::string trackArtwork(const Track& track);
 
 private:

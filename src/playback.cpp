@@ -75,6 +75,7 @@ struct Request {
     bool head = false;
     std::string path;
     std::string range;
+    bool metadata = false;
 };
 
 Request readRequest(SOCKET client, const std::atomic_bool& stopping) {
@@ -101,22 +102,87 @@ Request readRequest(SOCKET client, const std::atomic_bool& stopping) {
         if (lineEnd == std::string::npos || lineEnd == start) break;
         std::string_view line(input.data() + start, lineEnd - start);
         const auto colon = line.find(':');
-        if (colon == std::string_view::npos || colon != 5) continue;
+        if (colon == std::string_view::npos) continue;
         std::string name(line.substr(0, colon));
         for (auto& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-        if (name != "range") continue;
+        if (name != "range" && name != "icy-metadata") continue;
         line.remove_prefix(colon + 1);
         const auto initial = line.find_first_not_of(" \t");
         if (initial != std::string_view::npos) {
             line.remove_prefix(initial);
             line = line.substr(0, line.find_last_not_of(" \t") + 1);
         }
+        if (name == "icy-metadata") {
+            result.metadata = line == "1";
+            continue;
+        }
         if (line.size() > 60 || line.substr(0, 6) != "bytes=" ||
             line.substr(6).find_first_not_of("0123456789-") != std::string_view::npos) return {};
         result.range = line;
     }
+    if (result.metadata && result.range == "bytes=0-") result.range.clear();
     return result;
 }
+
+// in_url asks for ICY metadata and uses StreamTitle when it refreshes the playlist.
+// Insert metadata only on the downstream connection. Cache files contain original audio.
+class StreamBody {
+public:
+    StreamBody(SOCKET client, const Request& request, const Track& track)
+        : client_(client), framed_(request.metadata && request.range.empty()) {
+        auto title = playlistTitle(track);
+        for (char& ch : title)
+            if (static_cast<unsigned char>(ch) < 32 || ch == 127) ch = ' ';
+        if (title.size() > 2048) {
+            size_t end = 2048;
+            while ((static_cast<unsigned char>(title[end]) & 0xc0) == 0x80) --end;
+            title.resize(end);
+        }
+        headers = "icy-name: " + title + "\r\n";
+        if (!framed_) return;
+        headers += "icy-metaint: " + std::to_string(interval) + "\r\n";
+        auto field = "StreamTitle='" + title + "';";
+        const size_t blocks = (field.size() + 15) / 16;
+        metadata_.assign(1, static_cast<char>(blocks));
+        metadata_ += field;
+        metadata_.resize(1 + blocks * 16, '\0');
+    }
+
+    std::string lengthHeader(std::int64_t size) const {
+        if (size < 0) return {};
+        if (framed_ && size >= static_cast<std::int64_t>(interval)) {
+            // Each completed interval has a length byte. Only the first has a title.
+            const auto overhead = size / static_cast<std::int64_t>(interval) +
+                                  static_cast<std::int64_t>(metadata_.size() - 1);
+            if (size > std::numeric_limits<std::int64_t>::max() - overhead) return {};
+            size += overhead;
+        }
+        return "Content-Length: " + std::to_string(size) + "\r\n";
+    }
+
+    bool send(std::string_view bytes) {
+        if (!framed_) return sendAll(client_, bytes);
+        while (!bytes.empty()) {
+            auto n = std::min(bytes.size(), remaining_);
+            if (!sendAll(client_, bytes.substr(0, n))) return false;
+            bytes.remove_prefix(n);
+            remaining_ -= n;
+            if (!remaining_) {
+                if (!sendAll(client_, metadata_)) return false;
+                metadata_.assign(1, '\0');
+                remaining_ = interval;
+            }
+        }
+        return true;
+    }
+    std::string headers;
+private:
+    static constexpr size_t interval = 8192;
+    SOCKET client_;
+    bool framed_;
+    size_t remaining_ = interval;
+    std::string metadata_;
+};
 
 struct ByteRange {
     std::int64_t start;
@@ -210,8 +276,9 @@ void sendCached(SOCKET client, const Request& request, const Track& track, const
     }
     auto remaining = range.end - range.start + 1;
     const bool partial = !request.range.empty();
+    StreamBody body(client, request, track);
     std::string headers = "Accept-Ranges: bytes\r\nContent-Type: " + mimeFor(track) +
-        "\r\nContent-Length: " + std::to_string(remaining) + "\r\n";
+        "\r\n" + body.headers + body.lengthHeader(remaining);
     if (partial)
         headers += "Content-Range: bytes " + std::to_string(range.start) + "-" +
                    std::to_string(range.end) + "/" + std::to_string(size.QuadPart) + "\r\n";
@@ -227,7 +294,7 @@ void sendCached(SOCKET client, const Request& request, const Track& track, const
     while (remaining > 0 && !stopping) {
         DWORD count = 0;
         if (!ReadFile(file.get(), buffer, static_cast<DWORD>(std::min<std::int64_t>(remaining, sizeof(buffer))),
-                      &count, nullptr) || count == 0 || !sendAll(client, {buffer, count})) return;
+                      &count, nullptr) || count == 0 || !body.send({buffer, count})) return;
         remaining -= count;
     }
 }
@@ -269,8 +336,8 @@ void relay(SOCKET client, const Request& request, const Track& track, Response& 
         downstreamStatus = 206;
         acceptsRanges = "bytes";
     }
-    auto headers = "Content-Type: " + mime + "\r\n";
-    if (bytesToSend >= 0) headers += "Content-Length: " + std::to_string(bytesToSend) + "\r\n";
+    StreamBody body(client, request, track);
+    auto headers = "Content-Type: " + mime + "\r\n" + body.headers + body.lengthHeader(bytesToSend);
     if (!range.empty()) headers += "Content-Range: " + range + "\r\n";
     if (!acceptsRanges.empty()) headers += "Accept-Ranges: " + acceptsRanges + "\r\n";
     if (!sendHeaders(client, downstreamStatus == 206 ? "206 Partial Content" : "200 OK", std::move(headers)) ||
@@ -296,7 +363,7 @@ void relay(SOCKET client, const Request& request, const Track& track, Response& 
             count -= discard;
             if (count == 0) continue;
             if (cache) cache->write(buffer + discard, count);
-            if (!sendAll(client, {buffer + discard, count})) return;
+            if (!body.send({buffer + discard, count})) return;
             if (remaining > 0) remaining -= count;
         }
         if (cache && remaining == 0) cache->finish(mime);

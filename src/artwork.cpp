@@ -86,7 +86,9 @@ std::vector<std::uint32_t> decode(IWICImagingFactory* factory, std::string& byte
 
 } // namespace
 
-ArtworkLoader::ArtworkLoader(Store& store, HWND player) : store_(store), player_(player) {
+ArtworkLoader::ArtworkLoader(Store& store, HWND player)
+    : trackReadyMessage(RegisterWindowMessageW(L"ml_tangerinestream.trackMetadataReady")),
+      store_(store), player_(player) {
     try {
         for (int i = 0; i < 3; ++i) workers_.emplace_back([this] { load(); });
     } catch (...) {
@@ -161,11 +163,6 @@ void ArtworkLoader::requestTrack(Id key, bool priority) {
     ready_.notify_one();
 }
 
-bool ArtworkLoader::trackPending(Id key) {
-    std::scoped_lock lock(mutex_);
-    return pendingTracks_.count(key) != 0;
-}
-
 std::string ArtworkLoader::trackArtwork(const Track& track) {
     auto data = store_.artwork(track.server, songArtwork(track));
     if (data.empty() && !track.albumId.empty()) data = store_.artwork(track.server, albumArtwork(store_, track));
@@ -181,9 +178,12 @@ void ArtworkLoader::loadTrack(Id key) {
         const auto item = songArtwork(track);
         if (store_.artwork(track.server, item).empty()) {
             auto data = loadArtwork(store_, *connection, track.server, item);
-            if (data.empty() && !track.albumId.empty())
-                data = loadArtwork(store_, *connection, track.server, albumArtwork(store_, track));
             changed = !data.empty();
+            if (!changed && !track.albumId.empty()) {
+                auto album = albumArtwork(store_, track);
+                if (store_.artwork(track.server, album).empty())
+                    changed = !loadArtwork(store_, *connection, track.server, album).empty();
+            }
         }
     } catch (const ConnectionError&) {
         store_.connectionFailed(track.server);
@@ -197,7 +197,7 @@ void ArtworkLoader::loadTrack(Id key) {
             store_.connectionFailed(track.server);
         } catch (const std::exception&) {}
     }
-    if (changed) {
+    if (changed && trackReadyMessage) {
         auto bits = static_cast<std::uint64_t>(key);
         PostMessageW(player_, trackReadyMessage, static_cast<DWORD>(bits),
                      static_cast<LPARAM>(static_cast<DWORD>(bits >> 32)));

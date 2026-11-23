@@ -1,12 +1,13 @@
 #include "playback.hpp"
 #include "artwork.hpp"
-#include "album_art.hpp"
+#include "host_metadata.hpp"
 #include "resources.h"
 
 #include <commctrl.h>
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <future>
 #include <optional>
 #include <set>
 
@@ -40,7 +41,7 @@ int init();
 void quit();
 INT_PTR message(int type, INT_PTR a, INT_PTR b, INT_PTR c);
 
-char description[] = "Tangerine Stream v0.3.0 by COOLTRAINER";
+char description[] = "Tangerine Stream v0.3.1";
 winampMediaLibraryPlugin plugin = [] {
     winampMediaLibraryPlugin descriptor{};
 #ifdef MLHDR_VER_OLD
@@ -139,11 +140,17 @@ struct ServiceStatus {
     std::string reports, favorites, downloads;
 };
 
+struct AlbumDrop {
+    mlDropItemStruct drop;
+    HWND target;
+    std::future<std::vector<Track>> tracks;
+};
+
 class App {
 public:
     explicit App(const std::filesystem::path& profile)
         : store(profile), playback(store), artwork(store, plugin.hwndWinampParent),
-          albumArt(reinterpret_cast<void*>(player(IPC_GET_API_SERVICE)), store, playback, artwork) {
+          hostMetadata(reinterpret_cast<void*>(player(IPC_GET_API_SERVICE)), store, playback, artwork) {
         try {
             browser = std::thread([this] { browse(); });
             maintenance = std::thread([this] { maintain(); });
@@ -203,11 +210,13 @@ public:
         return status.downloads;
     }
     void sample(Id startedKey = 0);
+    void dropAlbum(Id server, BrowseLocation album, mlDropItemStruct drop);
+    void finishDrops();
 
     Store store;
     Playback playback;
     ArtworkLoader artwork;
-    AlbumArtRegistration albumArt;
+    HostMetadataServices hostMetadata;
     HWND activeView = nullptr;
     Id selectedServer = 0;
     UINT_PTR treeId = 0;
@@ -216,6 +225,7 @@ public:
     std::string reportError;
 
 private:
+    std::deque<AlbumDrop> drops;
     std::atomic_bool stopping{false};
     std::thread browser, maintenance, reporter;
     std::mutex searchMutex, maintenanceMutex;
@@ -248,6 +258,63 @@ private:
 };
 
 std::unique_ptr<App> app;
+
+void App::dropAlbum(Id server, BrowseLocation album, mlDropItemStruct drop) {
+    auto resolve = [this, server, album = std::move(album)] {
+        if (store.networkAvailable(server) && !localLocation(album)) {
+            try {
+                auto page = connect(store.server(server))->browse(album, {}, 0);
+                store.rememberPage(server, album, true, 0, page);
+                return std::move(page.tracks);
+            } catch (const ConnectionError&) { store.connectionFailed(server); }
+        }
+        std::vector<Track> downloaded;
+        for (int offset = 0; ; offset += pageSize) {
+            auto page = store.cachedPage(server, album, {}, offset);
+            for (auto& track : page.tracks)
+                if (track.bytes > 0) downloaded.push_back(std::move(track));
+            if (!page.more) return downloaded;
+        }
+    };
+    drops.push_back({drop, WindowFromPoint(drop.p), std::async(std::launch::async, std::move(resolve))});
+}
+
+void App::finishDrops() {
+    while (!drops.empty() && drops.front().tracks.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        auto job = std::move(drops.front());
+        drops.pop_front();
+        if (!IsWindow(job.target) || WindowFromPoint(job.drop.p) != job.target) continue;
+        auto tracks = job.tracks.get();
+        if (tracks.empty()) {
+            MessageBoxW(activeView, L"No tracks from this album are available.", pluginName, MB_OK);
+            continue;
+        }
+        struct Tags { std::wstring url, title, artist, album; };
+        std::vector<Tags> tags;
+        tags.reserve(tracks.size());
+        std::vector<itemRecordW> records(tracks.size());
+        for (size_t i = 0; i < tracks.size(); ++i) {
+            const auto& t = tracks[i];
+            tags.push_back({playback.url(t), wide(t.title), wide(t.artist), wide(t.album)});
+            auto& tag = tags.back();
+            auto& record = records[i];
+            record.filename = tag.url.data();
+            record.title = tag.title.data();
+            record.artist = tag.artist.data();
+            record.album = tag.album.data();
+            record.length = t.duration;
+            record.track = t.trackNumber;
+            record.disc = t.discNumber;
+            artwork.requestTrack(t.key);
+        }
+        const int count = static_cast<int>(records.size());
+        itemRecordListW list{records.data(), count, count};
+        job.drop.flags = 0;
+        job.drop.result = 0;
+        job.drop.data = &list;
+        library(ML_IPC_HANDLEDROP, reinterpret_cast<WPARAM>(&job.drop));
+    }
+}
 
 void App::browse() {
     Server current;
@@ -482,27 +549,6 @@ void App::sample(Id startedKey) {
     }
 }
 
-std::optional<std::string> metadata(const Track& track, const wchar_t* field) {
-    if (!field) return {};
-    auto is = [&](const wchar_t* name) { return _wcsicmp(field, name) == 0; };
-    if (is(L"title")) return track.title.empty() ? track.id : track.title;
-    if (is(L"artist")) return track.artist;
-    if (is(L"album")) return track.album;
-    if (is(L"albumartist") || is(L"album artist")) return track.albumArtist;
-    if (is(L"genre")) return track.genre;
-    if (is(L"year") && track.year) return std::to_string(track.year);
-    if (is(L"track") && track.trackNumber) return std::to_string(track.trackNumber);
-    if ((is(L"disc") || is(L"discnumber")) && track.discNumber) return std::to_string(track.discNumber);
-    if (is(L"length") && track.duration) return std::to_string(Id(track.duration) * 1000);
-    if (is(L"length_seconds") && track.duration) return std::to_string(track.duration);
-    if (is(L"lyrics") || is(L"unsyncedlyrics") || is(L"unsynced lyrics")) {
-        const auto lyrics = app->store.lyrics(track.key);
-        if (lyrics && !lyrics->plain.empty()) return lyrics->plain;
-        if (!lyrics && app->store.networkAvailable(track.server)) app->artwork.requestTrack(track.key, true);
-    }
-    return {};
-}
-
 Track hostTrack(const wchar_t* url) {
     auto key = url ? app->playback.key(url) : 0;
     return key ? app->store.track(key) : Track{};
@@ -553,7 +599,7 @@ bool supplyMetadata(LPARAM command, WPARAM data) {
         const auto& info = *reinterpret_cast<const extendedFileInfoStructW*>(data);
         auto track = hostTrack(info.filename);
         if (track.key) {
-            if (auto value = metadata(track, info.metadata)) {
+            if (auto value = trackMetadata(app->store, app->artwork, track, info.metadata)) {
                 copyMetadata(info.ret, info.retlen, *value);
                 return true;
             }
@@ -564,7 +610,7 @@ bool supplyMetadata(LPARAM command, WPARAM data) {
         auto track = hostTrack(info.filename ? wide(info.filename).c_str() : nullptr);
         if (track.key) {
             auto field = info.metadata ? wide(info.metadata) : std::wstring{};
-            if (auto value = metadata(track, field.c_str())) {
+            if (auto value = trackMetadata(app->store, app->artwork, track, field.c_str())) {
                 copyMetadata(info.ret, info.retlen, *value);
                 return true;
             }
@@ -577,22 +623,29 @@ LRESULT CALLBACK playerProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, D
     if (app && msg == WM_WA_IPC) {
         try { if (supplyMetadata(l, w)) return TRUE; } catch (const std::exception&) {}
     }
-    if (app && msg == ArtworkLoader::trackReadyMessage) {
+    if (app && app->artwork.trackReadyMessage && msg == app->artwork.trackReadyMessage) {
         try {
             auto key = static_cast<Id>((std::uint64_t(static_cast<DWORD>(l)) << 32) | static_cast<DWORD>(w));
             auto index = static_cast<int>(player(IPC_GETLISTPOS));
             auto filename = index < 0 ? nullptr :
                 reinterpret_cast<const wchar_t*>(player(IPC_GETPLAYLISTFILEW, index));
-            if (reinterpret_cast<UINT_PTR>(filename) > 1 && app->playback.key(filename) == key) {
-                std::wstring current = filename;
-                player(IPC_FILE_TAG_MAY_HAVE_UPDATEDW, reinterpret_cast<WPARAM>(current.c_str()));
+            // The native windows can follow a selected playlist item while another song plays.
+            std::wstring updated;
+            if (reinterpret_cast<UINT_PTR>(filename) > 1 && app->playback.key(filename) == key)
+                updated = filename;
+            else {
+                auto track = app->store.track(key);
+                if (track.key) updated = app->playback.url(track);
             }
+            if (!updated.empty())
+                player(IPC_FILE_TAG_MAY_HAVE_UPDATEDW, reinterpret_cast<WPARAM>(updated.c_str()));
         } catch (const std::exception&) {}
         return 0;
     }
     if (app && ((msg == WM_TIMER && w == playbackTimer) ||
                 (msg == WM_WA_IPC && l == IPC_PLAYING_FILEW && w > 1))) {
         try {
+            if (msg == WM_TIMER) app->finishDrops();
             auto key = msg == WM_WA_IPC ? app->playback.key(reinterpret_cast<const wchar_t*>(w)) : 0;
             app->sample(key);
         } catch (const std::exception& error) { app->reportError = error.what(); }
@@ -667,48 +720,6 @@ void configure(HWND hwnd, const Server& profile = {}) {
     }
 }
 
-INT_PTR CALLBACK lyricsProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
-    if (msg == WM_COMMAND && (LOWORD(w) == IDCANCEL || LOWORD(w) == IDOK)) {
-        EndDialog(hwnd, 0);
-        return TRUE;
-    }
-    if (msg != WM_INITDIALOG && msg != WM_TIMER) return FALSE;
-    if (!app) return FALSE;
-    try {
-        if (msg == WM_INITDIALOG) {
-            SetWindowLongPtrW(hwnd, DWLP_USER, l);
-            skinWindow(hwnd, SKINNEDWND_TYPE_DIALOG);
-            skinWindow(GetDlgItem(hwnd, IDC_LYRIC_TEXT), SKINNEDWND_TYPE_EDIT);
-            skinWindow(GetDlgItem(hwnd, IDCANCEL), SKINNEDWND_TYPE_BUTTON);
-            auto icon = LoadImageW(plugin.hDllInstance, MAKEINTRESOURCEW(IDI_TANGERINE),
-                                   IMAGE_ICON, 16, 16, LR_SHARED);
-            if (icon) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon));
-            SetTimer(hwnd, viewTimer, 250, nullptr);
-        }
-        const auto& track = *reinterpret_cast<const Track*>(GetWindowLongPtrW(hwnd, DWLP_USER));
-        if (msg == WM_INITDIALOG) SetWindowTextW(hwnd, (L"Lyrics – " + wide(playlistTitle(track))).c_str());
-        auto lyrics = app->store.lyrics(track.key, app->store.networkAvailable(track.server));
-        if (lyrics) {
-            KillTimer(hwnd, viewTimer);
-            SetDlgItemTextW(hwnd, IDC_LYRIC_TEXT,
-                            lyrics->plain.empty() ? L"No lyrics found." : wide(lyrics->plain).c_str());
-        } else if (!app->store.networkAvailable(track.server)) {
-            KillTimer(hwnd, viewTimer);
-            SetDlgItemTextW(hwnd, IDC_LYRIC_TEXT, L"Lyrics are unavailable offline.");
-        } else if (msg == WM_INITDIALOG) {
-            SetDlgItemTextW(hwnd, IDC_LYRIC_TEXT, L"Loading lyrics...");
-            app->artwork.requestTrack(track.key, true);
-        } else if (!app->artwork.trackPending(track.key)) {
-            KillTimer(hwnd, viewTimer);
-            SetDlgItemTextW(hwnd, IDC_LYRIC_TEXT, L"Lyrics are unavailable.");
-        }
-    } catch (const std::exception& error) {
-        KillTimer(hwnd, viewTimer);
-        SetDlgItemTextW(hwnd, IDC_LYRIC_TEXT, wide(error.what()).c_str());
-    }
-    return TRUE;
-}
-
 class View {
 public:
     View(HWND window, BrowseKind category)
@@ -731,7 +742,7 @@ public:
         for (int id : {IDC_LOCATION, IDC_STATUS})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_STATIC);
         for (int id : {IDC_ADD_SERVER, IDC_SETTINGS, IDC_BACK, IDC_SEARCH, IDC_TEXT_LIST,
-                       IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_KEEP_OFFLINE, IDC_UNPIN, IDC_OFFLINE, IDC_LYRICS})
+                       IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_KEEP_OFFLINE, IDC_UNPIN, IDC_OFFLINE})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_BUTTON);
         ListView_SetTextBkColor(list, CLR_NONE);
         tileSize = std::clamp(MulDiv(128, GetDpiForWindow(hwnd), 96), 96, 256);
@@ -759,6 +770,9 @@ public:
     void refresh();
     void updateButtons();
     void layout(int width, int height);
+    void beginDrag(const NMLISTVIEW& notification);
+    void drag(POINT point, bool released);
+    void cancelDrag();
     HWND hwnd, list;
 
 private:
@@ -778,6 +792,7 @@ private:
 
     BrowseKind category;
     BrowseLocation location;
+    std::optional<BrowseLocation> draggedAlbum;
     std::string query;
     std::vector<History> history;
     std::vector<Server> servers;
@@ -849,6 +864,7 @@ void View::resetLocation() {
 }
 
 void View::resetContent() {
+    cancelDrag();
     app->cancelSearch(hwnd);
     loading = more = morePosted = false;
     cached = false;
@@ -1084,7 +1100,7 @@ void View::changePresentation() {
     SetDlgItemTextW(hwnd, IDC_LOCATION, breadcrumb.c_str());
     SendDlgItemMessageW(hwnd, IDC_QUERY, EM_SETCUEBANNER, FALSE,
         reinterpret_cast<LPARAM>(showTracks() ? L"Search tracks" : L"Search this view"));
-    for (int id : {IDC_PLAY, IDC_ENQUEUE, IDC_KEEP_OFFLINE, IDC_UNPIN, IDC_LYRICS})
+    for (int id : {IDC_PLAY, IDC_ENQUEUE, IDC_KEEP_OFFLINE, IDC_UNPIN})
         ShowWindow(GetDlgItem(hwnd, id), showTracks() ? SW_SHOWNA : SW_HIDE);
     ShowWindow(GetDlgItem(hwnd, IDC_OPEN), showTracks() ? SW_HIDE : SW_SHOWNA);
     ShowWindow(GetDlgItem(hwnd, IDC_TEXT_LIST), showTracks() ? SW_HIDE : SW_SHOWNA);
@@ -1173,7 +1189,6 @@ void View::updateButtons() {
         EnableWindow(GetDlgItem(hwnd, id), haveServer);
     for (int id : {IDC_PLAY, IDC_ENQUEUE, IDC_KEEP_OFFLINE, IDC_UNPIN})
         EnableWindow(GetDlgItem(hwnd, id), haveRows);
-    EnableWindow(GetDlgItem(hwnd, IDC_LYRICS), ListView_GetSelectedCount(list) == 1);
     EnableWindow(GetDlgItem(hwnd, IDC_OPEN), haveRows);
 }
 
@@ -1184,6 +1199,37 @@ std::vector<Track> View::selection() {
         if (static_cast<std::size_t>(i) < tracks.size()) selectedTracks.push_back(tracks[i]);
     }
     return selectedTracks;
+}
+
+void View::beginDrag(const NMLISTVIEW& notification) {
+    const int index = notification.iItem;
+    if (showTracks() || index < 0 || index >= rowCount() ||
+        items[index].target.kind != BrowseKind::albumTracks) return;
+    draggedAlbum = items[index].target;
+    SetCapture(hwnd);
+    POINT point = notification.ptAction;
+    MapWindowPoints(list, hwnd, &point, 1);
+    drag(point, false);
+}
+
+void View::cancelDrag() {
+    draggedAlbum.reset();
+    if (GetCapture() == hwnd) ReleaseCapture();
+}
+
+void View::drag(POINT point, bool released) {
+    if (!draggedAlbum) return;
+    mlDropItemStruct drop{};
+    drop.type = ML_TYPE_ITEMRECORDLISTW;
+    drop.p = point;
+    if (!ClientToScreen(hwnd, &drop.p)) { cancelDrag(); return; }
+    drop.flags = released ? ML_HANDLEDRAG_FLAG_NOCURSOR : 0;
+    library(ML_IPC_HANDLEDRAG, reinterpret_cast<WPARAM>(&drop));
+    if (released && draggedAlbum) {
+        auto album = std::move(*draggedAlbum);
+        cancelDrag();
+        if (drop.result > 0) app->dropAlbum(currentServer, std::move(album), drop);
+    }
 }
 
 void View::play(bool enqueue) {
@@ -1240,13 +1286,6 @@ void View::command(int id, int notification) {
     case IDC_ENQUEUE: play(true); break;
     case IDC_KEEP_OFFLINE: cache(true); break;
     case IDC_UNPIN: cache(false); break;
-    case IDC_LYRICS: {
-        auto selectedTracks = selection();
-        if (selectedTracks.size() == 1)
-            DialogBoxParamW(plugin.hDllInstance, MAKEINTRESOURCEW(IDD_LYRICS), hwnd, lyricsProc,
-                            reinterpret_cast<LPARAM>(&selectedTracks.front()));
-        break;
-    }
     }
 }
 
@@ -1277,7 +1316,6 @@ void View::layout(int width, int height) {
     move(IDC_ENQUEUE, x(44), h - y(37), x(49), y(15));
     move(IDC_KEEP_OFFLINE, x(97), h - y(37), x(60), y(15));
     move(IDC_UNPIN, x(161), h - y(37), x(39), y(15));
-    move(IDC_LYRICS, x(204), h - y(37), x(50), y(15));
     move(IDC_STATUS, x(4), h - y(18), w - x(8), y(14));
     resizeColumns();
 }
@@ -1320,19 +1358,34 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         }
         if (!view) return FALSE;
         switch (msg) {
+        case WM_MOUSEMOVE: case WM_LBUTTONUP:
+            if (GetCapture() == hwnd) {
+                POINT point{static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
+                view->drag(point, msg == WM_LBUTTONUP);
+            }
+            break;
+        case WM_CANCELMODE: case WM_CAPTURECHANGED: view->cancelDrag(); break;
+        case WM_KEYDOWN: if (w == VK_ESCAPE) view->cancelDrag(); break;
         case WM_SIZE: view->layout(LOWORD(l), HIWORD(l)); return TRUE;
         case WM_COMMAND: view->command(LOWORD(w), HIWORD(w)); return TRUE;
         case WM_NOTIFY: {
             auto notification = reinterpret_cast<NMHDR*>(l);
             if (notification->idFrom != IDC_TRACKS) break;
+            if (notification->code == LVN_BEGINDRAG) {
+                view->beginDrag(*reinterpret_cast<NMLISTVIEW*>(l));
+                return TRUE;
+            }
             if (notification->code == LVN_GETDISPINFOW) {
                 view->display(*reinterpret_cast<NMLVDISPINFOW*>(l));
                 return TRUE;
             }
             if (notification->code == NM_DBLCLK)
                 view->activate(reinterpret_cast<NMITEMACTIVATE*>(l)->iItem);
-            if (notification->code == LVN_KEYDOWN && reinterpret_cast<NMLVKEYDOWN*>(l)->wVKey == VK_RETURN)
-                view->activate(ListView_GetNextItem(view->list, -1, LVNI_SELECTED));
+            if (notification->code == LVN_KEYDOWN) {
+                auto key = reinterpret_cast<NMLVKEYDOWN*>(l)->wVKey;
+                if (key == VK_ESCAPE) view->cancelDrag();
+                if (key == VK_RETURN) view->activate(ListView_GetNextItem(view->list, -1, LVNI_SELECTED));
+            }
             if (notification->code == LVN_ITEMCHANGED || notification->code == LVN_ODSTATECHANGED)
                 view->updateButtons();
             break;
@@ -1357,10 +1410,10 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     return FALSE;
 }
 
-std::filesystem::path profileDirectory() {
+std::filesystem::path settingsDirectory() {
     auto wideDirectory = reinterpret_cast<const wchar_t*>(player(getIniDirectoryW));
     if (reinterpret_cast<UINT_PTR>(wideDirectory) > 1 && *wideDirectory)
-        return std::filesystem::path(wideDirectory) / L"Plugins" / pluginName;
+        return std::filesystem::path(wideDirectory);
     auto iniDirectory = reinterpret_cast<const char*>(player(IPC_GETINIDIRECTORY));
     if (reinterpret_cast<UINT_PTR>(iniDirectory) > 1 && *iniDirectory) {
         int size = MultiByteToWideChar(CP_ACP, 0, iniDirectory, -1, nullptr, 0);
@@ -1368,7 +1421,7 @@ std::filesystem::path profileDirectory() {
             std::wstring directory(size, L'\0');
             MultiByteToWideChar(CP_ACP, 0, iniDirectory, -1, directory.data(), size);
             directory.pop_back();
-            return std::filesystem::path(directory) / L"Plugins" / pluginName;
+            return std::filesystem::path(directory);
         }
     }
     throw Error("WACUP did not provide its profile directory.");
@@ -1387,7 +1440,8 @@ int init() {
     try {
         INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
         if (!InitCommonControlsEx(&controls)) throw Error("Windows could not initialize Media Library controls.");
-        app = std::make_unique<App>(profileDirectory());
+        const auto settings = settingsDirectory();
+        app = std::make_unique<App>(settings / L"Plugins" / pluginName);
         if (!SetWindowSubclass(plugin.hwndWinampParent, playerProc, playerSubclass, 0))
             throw Error("WACUP playback notifications could not be attached.");
         app->attached = true;
@@ -1397,6 +1451,14 @@ int init() {
         app->navigation.emplace(app->treeId, BrowseKind::albums);
         for (const auto& category : categories)
             app->navigation.emplace(addTreeItem(category.name, app->treeId, false), category.kind);
+        // WACUP reads the second line of its Preferences row from this per-profile catalog.
+        const auto descriptions = settings / L"plugin_descriptions.ini";
+        wchar_t existing[256]{};
+        GetPrivateProfileStringW(L"library", L"ml_tangerinestream.dll", L"", existing,
+                                 static_cast<DWORD>(std::size(existing)), descriptions.c_str());
+        if (!*existing)
+            WritePrivateProfileStringW(L"library", L"ml_tangerinestream.dll",
+                L"Navidrome and OpenSubsonic browsing by COOLTRAINER", descriptions.c_str());
         return 0;
     } catch (const std::exception& error) {
         quit();

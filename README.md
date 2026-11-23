@@ -31,11 +31,12 @@ With the toolchain environment set up, `cmake --build build-mingw32 --target ins
 1. Select **Add server…** and enter the server base URL, including its installation subpath if it has one, plus the account username and password. Use the HTTPS URL when the server provides one.
 2. Use the default OpenSubsonic browser for Navidrome or another compatible server. Enable **Use Navidrome’s native song browser** to use Navidrome’s native login and song list with OpenSubsonic playback, favorites, and reporting. [Navidrome compatibility](https://www.navidrome.org/docs/developers/subsonic-api/) · [Feishin’s Navidrome controller](https://github.com/jeffvli/feishin/blob/development/src/renderer/api/navidrome/navidrome-controller.ts)
 3. Expand **Tangerine Stream** and choose **Albums**, **Genres**, **Album Artists**, **Artists**, **Tracks**, **Folders**, **Playlists**, **Favorites**, or **Offline Cache**. Album browsing uses the WACUP Media Library's skinned list-view and loads server artwork as you scroll.
-4. Double-click a tile to open it and use **Back** to return to your previous selection. Use **Text list** to browse the same results in rows. Double-click a track to play it, or select several tracks and use **Play** or **Enqueue**.
+4. Double-click a tile to open it and use **Back** to return. Use **Text list** to browse the same results in rows. Drag an album from either view onto WACUP's Playlist Editor to enqueue its tracks in album order. Offline, the drop includes the tracks downloaded from that album.
+5. Double-click a track to play it, or select several tracks and use **Play** or **Enqueue**.
 
 Add profiles for other servers or accounts and switch between them using the server selector. **Settings** lets you update the profile name, password, browsing mode, and favorite download preference. Each profile keeps its own track IDs, cached music, and pending reports.
 
-Playlist entries use the server's artist and track title. Tangerine Stream supplies track covers and plain lyrics to the player as they become available. Select one track and use **Lyrics...** to read the server's lyrics directly in the Media Library. The cache keeps OpenSubsonic line and word timing for future synchronized display. [OpenSubsonic song lyrics](https://opensubsonic.github.io/docs/endpoints/getlyricsbysongid/)
+Playlist entries use the server's artist and track title. Use WACUP's **Album Art** and **Lyrics** windows for track covers and lyrics. Tangerine Stream supplies cover images through the player's album art service and plain lyrics through track metadata. The cache keeps OpenSubsonic line and word timing for future synchronized display. [OpenSubsonic song lyrics](https://opensubsonic.github.io/docs/endpoints/getlyricsbysongid/)
 
 ## Offline playback and reports
 
