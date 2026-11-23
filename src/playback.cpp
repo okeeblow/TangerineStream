@@ -32,6 +32,27 @@ std::int64_t number(std::string_view value) {
     return parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size() && result >= 0 ? result : -1;
 }
 
+std::string mediaFilename(const Track& track) {
+    auto title = wide(playlistTitle(track));
+    if (title.size() > 120) {
+        title.resize(120);
+        if (title.back() >= 0xd800 && title.back() <= 0xdbff) title.pop_back();
+    }
+    constexpr char hex[] = "0123456789ABCDEF";
+    std::string name;
+    for (unsigned char ch : utf8(title)) {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+            name += static_cast<char>(ch);
+        } else {
+            name += '%';
+            name += hex[ch >> 4];
+            name += hex[ch & 15];
+        }
+    }
+    return (name.empty() ? "track" : name) + "." + track.suffix;
+}
+
 bool sendAll(SOCKET client, std::string_view data) {
     while (!data.empty()) {
         int sent = send(client, data.data(), static_cast<int>(data.size()), 0);
@@ -336,7 +357,7 @@ void Playback::stop() {
 }
 
 std::wstring Playback::url(const Track& track) const {
-    return wide(urlPrefix_ + std::to_string(track.key) + "/track." + track.suffix);
+    return wide(urlPrefix_ + std::to_string(track.key) + "/" + mediaFilename(track));
 }
 
 Id Playback::key(std::wstring_view url) const {
@@ -349,7 +370,7 @@ Id Playback::pathKey(std::string_view path) const {
     if (path.substr(0, pathPrefix_.size()) != pathPrefix_) return 0;
     path.remove_prefix(pathPrefix_.size());
     auto slash = path.find('/');
-    if (slash == std::string_view::npos || path.substr(slash, 7) != "/track.") return 0;
+    if (slash == std::string_view::npos || path.size() == slash + 1) return 0;
     auto id = number(path.substr(0, slash));
     return id > 0 ? id : 0;
 }
@@ -409,16 +430,28 @@ void Playback::serve(SOCKET client) {
         sendCached(client, request, track, file, stopping_);
         return;
     }
-    auto api = connect(store_.server(track.server));
-    auto upstream = api->audio(track, request.range, request.head);
-    if (request.head && (upstream->status == 404 || upstream->status == 405))
-        upstream = api->audio(track, request.range, false);
-    relay(client, request, track, *upstream, store_, stopping_);
+    if (!store_.networkAvailable(track.server)) {
+        fail(client, "503 Service Unavailable");
+        return;
+    }
+    try {
+        auto api = connect(store_.server(track.server));
+        auto upstream = api->audio(track, request.range, request.head);
+        if (request.head && (upstream->status == 404 || upstream->status == 405))
+            upstream = api->audio(track, request.range, false);
+        if (upstream->status == 408 || upstream->status >= 500) store_.connectionFailed(track.server);
+        relay(client, request, track, *upstream, store_, stopping_);
+    } catch (const ConnectionError&) {
+        store_.connectionFailed(track.server);
+        fail(client, "503 Service Unavailable");
+    }
 }
 
 void downloadPinned(Store& store, const Track& track, ServerApi& api, const std::atomic_bool& stopping) {
     auto response = api.audio(track, {}, false);
     auto mime = response->header(WINHTTP_QUERY_CONTENT_TYPE);
+    if (response->status == 408 || response->status >= 500)
+        throw ConnectionError("The server returned HTTP " + std::to_string(response->status) + ".");
     if (response->status != 200 || (!mime.empty() && !audioType(mime)))
         throw Error("The server did not provide a complete audio file.");
     CacheWrite cache(store, track.key, number(response->header(WINHTTP_QUERY_CONTENT_LENGTH)));

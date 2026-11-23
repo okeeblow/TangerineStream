@@ -3,6 +3,7 @@
 #include <wincrypt.h>
 #include <algorithm>
 #include <charconv>
+#include <set>
 #include <system_error>
 
 // The plugin uses the SQLite C ABI exported by Windows 10 and later.
@@ -16,9 +17,12 @@ int WINAPI sqlite3_prepare_v2(sqlite3*, const char*, int, sqlite3_stmt**, const 
 int WINAPI sqlite3_finalize(sqlite3_stmt*);
 int WINAPI sqlite3_bind_int64(sqlite3_stmt*, int, std::int64_t);
 int WINAPI sqlite3_bind_text(sqlite3_stmt*, int, const char*, int, void (*)(void*));
+int WINAPI sqlite3_bind_blob(sqlite3_stmt*, int, const void*, int, void (*)(void*));
 int WINAPI sqlite3_step(sqlite3_stmt*);
 std::int64_t WINAPI sqlite3_column_int64(sqlite3_stmt*, int);
 const unsigned char* WINAPI sqlite3_column_text(sqlite3_stmt*, int);
+const void* WINAPI sqlite3_column_blob(sqlite3_stmt*, int);
+int WINAPI sqlite3_column_bytes(sqlite3_stmt*, int);
 std::int64_t WINAPI sqlite3_last_insert_rowid(sqlite3*);
 }
 
@@ -47,8 +51,12 @@ public:
     }
     Statement& bind(const std::string& value) {
         // SQLite copies the value before bind returns (SQLITE_TRANSIENT).
-        auto copy = reinterpret_cast<void (*)(void*)>(static_cast<std::intptr_t>(-1));
         if (sqlite3_bind_text(statement_, next_++, value.c_str(), static_cast<int>(value.size()),
+                              copy) != sqliteOk) databaseError(db_);
+        return *this;
+    }
+    Statement& bindBlob(const std::string& value) {
+        if (sqlite3_bind_blob(statement_, next_++, value.data(), static_cast<int>(value.size()),
                               copy) != sqliteOk) databaseError(db_);
         return *this;
     }
@@ -64,8 +72,13 @@ public:
         auto text = sqlite3_column_text(statement_, index);
         return text ? reinterpret_cast<const char*>(text) : "";
     }
+    std::string blob(int index) const {
+        auto bytes = static_cast<const char*>(sqlite3_column_blob(statement_, index));
+        return bytes ? std::string(bytes, sqlite3_column_bytes(statement_, index)) : std::string{};
+    }
 
 private:
+    inline static const auto copy = reinterpret_cast<void (*)(void*)>(static_cast<std::intptr_t>(-1));
     sqlite3* db_;
     sqlite3_stmt* statement_ = nullptr;
     int next_ = 1;
@@ -90,13 +103,17 @@ private:
 };
 
 constexpr char trackColumns[] =
-    "key,server,remote_id,title,artist,album,suffix,mime,duration,pinned,favorite,bytes";
+    "key,server,remote_id,title,artist,album,suffix,mime,duration,pinned,favorite,bytes,"
+    "cover_id,album_id,artist_id,album_artist_id,album_artist,genre,disc_number,track_number,year";
 
 Track getTrack(const Statement& statement) {
     return {statement.integer(0), statement.integer(1), statement.text(2), statement.text(3),
             statement.text(4), statement.text(5), statement.text(6), statement.text(7),
             static_cast<int>(statement.integer(8)), statement.integer(9) != 0,
-            statement.integer(10) != 0, statement.integer(11)};
+            statement.integer(10) != 0, statement.integer(11), statement.text(12), statement.text(13),
+            statement.text(14), statement.text(15), statement.text(16), statement.text(17),
+            static_cast<int>(statement.integer(18)), static_cast<int>(statement.integer(19)),
+            static_cast<int>(statement.integer(20))};
 }
 
 std::string protect(std::string password) {
@@ -163,8 +180,39 @@ Store::Store(const std::filesystem::path& directory) : cache_(directory / L"cach
         Statement(db_, "CREATE TABLE IF NOT EXISTS reports (key INTEGER PRIMARY KEY,"
             "server INTEGER NOT NULL REFERENCES servers(id),remote_id TEXT NOT NULL,time INTEGER NOT NULL)").run();
         Statement(db_, "CREATE INDEX IF NOT EXISTS reports_server ON reports(server,key)").run();
+        Transaction migration(db_);
+        Statement version(db_, "PRAGMA user_version");
+        if (version.row() && version.integer(0) == 0) {
+            version.run();
+            for (const auto* column : {"cover_id", "album_id", "artist_id", "album_artist_id",
+                                      "album_artist", "genre"}) {
+                auto sql = std::string("ALTER TABLE tracks ADD COLUMN ") + column + " TEXT NOT NULL DEFAULT ''";
+                Statement(db_, sql.c_str()).run();
+            }
+            for (const auto* column : {"disc_number", "track_number", "year"}) {
+                auto sql = std::string("ALTER TABLE tracks ADD COLUMN ") + column + " INTEGER NOT NULL DEFAULT 0";
+                Statement(db_, sql.c_str()).run();
+            }
+            Statement(db_, "PRAGMA user_version=1").run();
+        }
+        Statement(db_, "CREATE INDEX IF NOT EXISTS tracks_album ON tracks(server,album_id)").run();
+        Statement(db_, "CREATE INDEX IF NOT EXISTS tracks_artist ON tracks(server,artist_id)").run();
+        Statement(db_, "CREATE INDEX IF NOT EXISTS tracks_album_artist ON tracks(server,album_artist_id)").run();
+        Statement(db_, "CREATE INDEX IF NOT EXISTS tracks_genre ON tracks(server,genre)").run();
+        Statement(db_, "CREATE TABLE IF NOT EXISTS catalog (server INTEGER NOT NULL REFERENCES servers(id),"
+            "parent_kind INTEGER NOT NULL,parent_id TEXT NOT NULL,kind INTEGER NOT NULL,id TEXT NOT NULL,"
+            "slot INTEGER NOT NULL,title TEXT NOT NULL,subtitle TEXT NOT NULL,cover_id TEXT NOT NULL,"
+            "track_key INTEGER NOT NULL,PRIMARY KEY(server,parent_kind,parent_id,kind,id,slot)) WITHOUT ROWID").run();
+        Statement(db_, "CREATE INDEX IF NOT EXISTS catalog_objects ON catalog(server,kind,id)").run();
+        Statement(db_, "CREATE TABLE IF NOT EXISTS artwork (server INTEGER NOT NULL REFERENCES servers(id),"
+            "cover_key TEXT NOT NULL,data BLOB NOT NULL,last_use INTEGER NOT NULL,"
+            "PRIMARY KEY(server,cover_key)) WITHOUT ROWID").run();
+        Statement(db_, "CREATE TABLE IF NOT EXISTS lyrics (track INTEGER PRIMARY KEY REFERENCES tracks(key),"
+            "plain TEXT NOT NULL,structured TEXT NOT NULL,checked INTEGER NOT NULL)").run();
+        migration.commit();
         auto budget = setting("rolling_mib");
         budget_ = (budget.empty() ? defaultBudget : std::stoi(budget)) * MiB;
+        offline_ = setting("offline_mode") == "1";
         reconcile();
         trimUnlocked(0);
     } catch (...) {
@@ -276,6 +324,39 @@ void Store::saveTextCatalog(bool text) {
     setSetting("text_catalog", text ? "1" : "0");
 }
 
+bool Store::offlineMode() {
+    std::scoped_lock lock(mutex_);
+    return offline_;
+}
+
+void Store::setOfflineMode(bool offline) {
+    std::scoped_lock lock(mutex_);
+    setSetting("offline_mode", offline ? "1" : "0");
+    offline_ = offline;
+    if (!offline) retryConnection_.clear();
+}
+
+bool Store::networkAvailable(Id server) {
+    std::scoped_lock lock(mutex_);
+    return !offline_ && retryConnection_.count(server) == 0;
+}
+
+bool Store::connectionRetryDue(Id server) {
+    std::scoped_lock lock(mutex_);
+    auto retry = retryConnection_.find(server);
+    return !offline_ && retry != retryConnection_.end() && retry->second <= std::chrono::steady_clock::now();
+}
+
+void Store::connectionFailed(Id server) {
+    std::scoped_lock lock(mutex_);
+    retryConnection_[server] = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+}
+
+void Store::connectionRestored(Id server) {
+    std::scoped_lock lock(mutex_);
+    retryConnection_.erase(server);
+}
+
 Track Store::loadTrack(Id key) {
     auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE key=?";
     Statement statement(db_, sql.c_str());
@@ -290,12 +371,29 @@ Track Store::track(Id key) {
 
 void Store::rememberUnlocked(std::vector<Track>& tracks) {
     for (auto& track : tracks) {
-        Statement(db_, "INSERT INTO tracks(server,remote_id,title,artist,album,suffix,mime,duration)"
-            " VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(server,remote_id) DO UPDATE SET title=excluded.title,"
-            "artist=excluded.artist,album=excluded.album,suffix=excluded.suffix,duration=excluded.duration,"
+        Statement(db_, "INSERT INTO tracks(server,remote_id,title,artist,album,suffix,mime,duration,"
+            "cover_id,album_id,artist_id,album_artist_id,album_artist,genre,disc_number,track_number,year)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(server,remote_id) DO UPDATE SET"
+            " title=coalesce(nullif(excluded.title,''),tracks.title),"
+            "artist=coalesce(nullif(excluded.artist,''),tracks.artist),"
+            "album=coalesce(nullif(excluded.album,''),tracks.album),"
+            "suffix=CASE WHEN tracks.bytes>0 THEN tracks.suffix ELSE excluded.suffix END,"
+            "duration=coalesce(nullif(excluded.duration,0),tracks.duration),"
+            "cover_id=coalesce(nullif(excluded.cover_id,''),tracks.cover_id),"
+            "album_id=coalesce(nullif(excluded.album_id,''),tracks.album_id),"
+            "artist_id=coalesce(nullif(excluded.artist_id,''),tracks.artist_id),"
+            "album_artist_id=coalesce(nullif(excluded.album_artist_id,''),tracks.album_artist_id),"
+            "album_artist=coalesce(nullif(excluded.album_artist,''),tracks.album_artist),"
+            "genre=coalesce(nullif(excluded.genre,''),tracks.genre),"
+            "disc_number=coalesce(nullif(excluded.disc_number,0),tracks.disc_number),"
+            "track_number=coalesce(nullif(excluded.track_number,0),tracks.track_number),"
+            "year=coalesce(nullif(excluded.year,0),tracks.year),"
             "mime=CASE WHEN tracks.bytes>0 THEN tracks.mime ELSE excluded.mime END")
             .bind(track.server).bind(track.id).bind(track.title).bind(track.artist)
-            .bind(track.album).bind(track.suffix).bind(track.mime).bind(track.duration).run();
+            .bind(track.album).bind(track.suffix).bind(track.mime).bind(track.duration)
+            .bind(track.coverId).bind(track.albumId).bind(track.artistId).bind(track.albumArtistId)
+            .bind(track.albumArtist).bind(track.genre).bind(track.discNumber).bind(track.trackNumber)
+            .bind(track.year).run();
         auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE server=? AND remote_id=?";
         Statement statement(db_, sql.c_str());
         statement.bind(track.server).bind(track.id);
@@ -303,24 +401,210 @@ void Store::rememberUnlocked(std::vector<Track>& tracks) {
     }
 }
 
-void Store::remember(std::vector<Track>& tracks) {
+void Store::rememberPage(Id server, const BrowseLocation& location, bool unfiltered, int offset,
+                         BrowsePage& page) {
     std::scoped_lock lock(mutex_);
     Transaction transaction(db_);
-    rememberUnlocked(tracks);
+    rememberUnlocked(page.relatedTracks);
+    rememberUnlocked(page.tracks);
+    if (location.kind != BrowseKind::tracks) rememberCatalog(server, location, unfiltered, offset, page);
     transaction.commit();
 }
 
-std::vector<Track> Store::cached(Id server, const std::string& query, int offset) {
+void Store::rememberCatalog(Id server, const BrowseLocation& location, bool unfiltered, int offset,
+                            const BrowsePage& page) {
+    auto parent = static_cast<int>(location.kind);
+    if (unfiltered && offset == 0 && !page.more)
+        Statement(db_, "DELETE FROM catalog WHERE server=? AND parent_kind=? AND parent_id=?")
+            .bind(server).bind(parent).bind(location.id).run();
+    auto save = [&](const LibraryItem& item, Id slot, Id key) {
+        Statement(db_, "INSERT INTO catalog VALUES(?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(server,parent_kind,parent_id,kind,id,slot) DO UPDATE SET"
+            " title=excluded.title,subtitle=excluded.subtitle,"
+            "cover_id=coalesce(nullif(excluded.cover_id,''),catalog.cover_id),track_key=excluded.track_key")
+            .bind(server).bind(parent).bind(location.id).bind(static_cast<int>(item.target.kind))
+            .bind(item.target.id).bind(slot).bind(item.target.title).bind(item.subtitle).bind(item.coverId)
+            .bind(key).run();
+    };
+    for (const auto& item : page.items) save(item, 0, 0);
+    if (location.kind == BrowseKind::playlistTracks) {
+        Id position = offset;
+        for (const auto& track : page.tracks)
+            save({{BrowseKind::song, track.id, track.title}, track.artist, track.coverId}, position++, track.key);
+    }
+}
+
+BrowsePage Store::cachedPage(Id server, const BrowseLocation& location, const std::string& query, int offset) {
     std::scoped_lock lock(mutex_);
-    auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE server=?"
-        " AND (bytes>0 OR pinned=1 OR favorite=1) AND (instr(lower(title),lower(?))>0"
-        " OR instr(lower(artist),lower(?))>0 OR instr(lower(album),lower(?))>0)"
-        " ORDER BY artist COLLATE NOCASE,album COLLATE NOCASE,title COLLATE NOCASE,key LIMIT ? OFFSET ?";
-    Statement statement(db_, sql.c_str());
-    statement.bind(server).bind(query).bind(query).bind(query).bind(pageSize).bind(offset);
-    std::vector<Track> result;
-    while (statement.row()) result.push_back(getTrack(statement));
+    const auto kind = location.kind;
+    const auto filter = wide(query);
+    BrowsePage result;
+    auto addTrack = [&](Track track) {
+        if (!track.key || (!matches(track.title, filter) && !matches(track.artist, filter) &&
+                          !matches(track.album, filter))) return;
+        if (offset > 0) --offset;
+        else if (result.tracks.size() == pageSize) result.more = true;
+        else result.tracks.push_back(std::move(track));
+    };
+    if (kind == BrowseKind::playlistTracks) {
+        Statement entries(db_, "SELECT track_key FROM catalog WHERE server=? AND parent_kind=?"
+            " AND parent_id=? AND track_key>0 ORDER BY slot");
+        entries.bind(server).bind(static_cast<int>(kind)).bind(location.id);
+        while (!result.more && entries.row()) addTrack(loadTrack(entries.integer(0)));
+    } else if (trackView(kind)) {
+        auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE server=?";
+        if (kind == BrowseKind::offline) sql += " AND (bytes>0 OR pinned=1 OR favorite=1)";
+        if (kind == BrowseKind::song) sql += " AND remote_id=?";
+        if (kind == BrowseKind::albumTracks)
+            sql += localLocation(location) ?
+                " AND album_id='' AND album||char(31)||coalesce(nullif(album_artist,''),artist)=?" :
+                " AND (album_id=? OR (album_id='' AND album=?))";
+        if (kind == BrowseKind::albumTracks) sql += " ORDER BY disc_number,track_number,title COLLATE NOCASE,key";
+        else sql += " ORDER BY artist COLLATE NOCASE,album COLLATE NOCASE,title COLLATE NOCASE,key";
+        Statement entries(db_, sql.c_str());
+        entries.bind(server);
+        if (kind == BrowseKind::song || kind == BrowseKind::albumTracks)
+            entries.bind(localLocation(location) ? location.id.substr(1) : location.id);
+        if (kind == BrowseKind::albumTracks && !localLocation(location)) entries.bind(location.title);
+        while (!result.more && entries.row()) addTrack(getTrack(entries));
+    } else {
+        std::set<std::pair<BrowseKind, std::string>> seen;
+        auto addItem = [&](LibraryItem item) {
+            if ((!matches(item.target.title, filter) && !matches(item.subtitle, filter)) ||
+                !seen.emplace(item.target.kind, item.target.id).second) return;
+            if (offset > 0) --offset;
+            else if (result.items.size() == pageSize) result.more = true;
+            else result.items.push_back(std::move(item));
+        };
+        auto sql = std::string("SELECT kind,id,title,subtitle,cover_id FROM catalog WHERE server=? AND ");
+        if (kind == BrowseKind::albums) sql += "kind=?";
+        else sql += "parent_kind=? AND parent_id=?";
+        sql += " ORDER BY title COLLATE NOCASE,id,cover_id DESC";
+        Statement entries(db_, sql.c_str());
+        entries.bind(server).bind(static_cast<int>(kind == BrowseKind::albums ? BrowseKind::albumTracks : kind));
+        if (kind != BrowseKind::albums) entries.bind(location.id);
+        std::set<std::pair<std::string, std::string>> names;
+        while (!result.more && entries.row()) {
+            names.emplace(entries.text(2), entries.text(3));
+            addItem({{static_cast<BrowseKind>(entries.integer(0)), entries.text(1), entries.text(2)},
+                entries.text(3), entries.text(4)});
+        }
+        if (result.more) return result;
+        if (kind == BrowseKind::genres) {
+            Statement genres(db_, "SELECT DISTINCT genre FROM tracks WHERE server=? AND genre<>'' ORDER BY genre");
+            genres.bind(server);
+            while (!result.more && genres.row())
+                addItem({{BrowseKind::genreAlbums, genres.text(0), genres.text(0)}, {}, {}});
+        }
+        if (kind == BrowseKind::artists || kind == BrowseKind::albumArtists) {
+            const char* name = kind == BrowseKind::artists ? "artist" : "coalesce(nullif(album_artist,''),artist)";
+            const char* id = kind == BrowseKind::artists ? "artist_id" :
+                "coalesce(nullif(album_artist_id,''),CASE WHEN album_artist='' OR album_artist=artist THEN artist_id ELSE '' END)";
+            auto artistSql = std::string("SELECT ") + id + "," + name +
+                " FROM tracks WHERE server=? GROUP BY 1,2 ORDER BY 2 COLLATE NOCASE,1 DESC";
+            Statement artists(db_, artistSql.c_str());
+            artists.bind(server);
+            std::set<std::string> represented;
+            for (const auto& namePair : names) represented.insert(namePair.first);
+            while (!result.more && artists.row()) {
+                auto artist = artists.text(1);
+                auto artistId = artists.text(0);
+                if (artist.empty() || (artistId.empty() && represented.count(artist))) continue;
+                represented.insert(artist);
+                if (artistId.empty()) artistId = '\x1f' + artist;
+                addItem({{BrowseKind::artistAlbums, std::move(artistId), std::move(artist)}, {}, {}});
+            }
+        }
+        if (kind == BrowseKind::albums || kind == BrowseKind::genreAlbums || kind == BrowseKind::artistAlbums) {
+            auto albumSql = std::string("SELECT album_id,album,min(coalesce(nullif(album_artist,''),artist)),"
+                "max(cover_id) FROM tracks WHERE server=? AND album<>''");
+            if (kind == BrowseKind::genreAlbums) albumSql += " AND genre=?";
+            if (kind == BrowseKind::artistAlbums) albumSql += localLocation(location) ?
+                " AND (artist=? OR album_artist=?)" : " AND (artist_id=? OR album_artist_id=?"
+                " OR (artist_id='' AND artist=?) OR (album_artist_id='' AND album_artist=?))";
+            albumSql += " GROUP BY 1,2,CASE WHEN album_id='' THEN coalesce(nullif(album_artist,''),artist)"
+                " ELSE '' END ORDER BY 2 COLLATE NOCASE,1 DESC";
+            Statement albums(db_, albumSql.c_str());
+            albums.bind(server);
+            if (kind == BrowseKind::genreAlbums) albums.bind(location.id);
+            if (kind == BrowseKind::artistAlbums) {
+                const auto id = localLocation(location) ? location.id.substr(1) : location.id;
+                albums.bind(id).bind(id);
+                if (!localLocation(location)) albums.bind(location.title).bind(location.title);
+            }
+            while (!result.more && albums.row()) {
+                auto album = albums.text(1);
+                auto albumArtist = albums.text(2);
+                auto albumId = albums.text(0);
+                if (albumId.empty() && names.count({album, albumArtist})) continue;
+                names.emplace(album, albumArtist);
+                if (albumId.empty()) albumId = '\x1f' + album + '\x1f' + albumArtist;
+                addItem({{BrowseKind::albumTracks, std::move(albumId), std::move(album)},
+                    std::move(albumArtist), albums.text(3)});
+            }
+        }
+    }
     return result;
+}
+
+std::string Store::albumCover(Id server, const std::string& albumId) {
+    if (albumId.empty()) return {};
+    std::scoped_lock lock(mutex_);
+    Statement cover(db_, "SELECT cover_id FROM catalog WHERE server=? AND kind=? AND id=?"
+        " AND cover_id<>'' LIMIT 1");
+    cover.bind(server).bind(static_cast<int>(BrowseKind::albumTracks)).bind(albumId);
+    return cover.row() ? cover.text(0) : "";
+}
+
+namespace {
+
+std::string artworkKey(const LibraryItem& item) {
+    if (!item.coverId.empty() && item.target.kind != BrowseKind::artistAlbums) return "cover:" + item.coverId;
+    return std::to_string(static_cast<int>(item.target.kind)) + ":" + item.target.id;
+}
+
+} // namespace
+
+std::string Store::artwork(Id server, const LibraryItem& item) {
+    std::scoped_lock lock(mutex_);
+    auto key = artworkKey(item);
+    Statement artwork(db_, "SELECT data FROM artwork WHERE server=? AND cover_key=?");
+    artwork.bind(server).bind(key);
+    if (!artwork.row()) return {};
+    auto data = artwork.blob(0);
+    Statement(db_, "UPDATE artwork SET last_use=? WHERE server=? AND cover_key=?")
+        .bind(nowMs()).bind(server).bind(key).run();
+    return data;
+}
+
+void Store::saveArtwork(Id server, const LibraryItem& item, const std::string& data) {
+    if (data.empty()) return;
+    std::scoped_lock lock(mutex_);
+    Transaction transaction(db_);
+    Statement(db_, "INSERT INTO artwork VALUES(?,?,?,?) ON CONFLICT(server,cover_key) DO UPDATE SET"
+        " data=excluded.data,last_use=excluded.last_use")
+        .bind(server).bind(artworkKey(item)).bindBlob(data).bind(nowMs()).run();
+    Statement(db_, "DELETE FROM artwork WHERE (server,cover_key) IN (SELECT server,cover_key FROM"
+        " (SELECT server,cover_key,sum(length(data)) OVER (ORDER BY last_use DESC,server,cover_key"
+        " ROWS UNBOUNDED PRECEDING) AS bytes FROM artwork) WHERE bytes>?)").bind(128 * MiB).run();
+    transaction.commit();
+}
+
+std::optional<Lyrics> Store::lyrics(Id key, bool fresh) {
+    std::scoped_lock lock(mutex_);
+    Statement lyrics(db_, "SELECT plain,structured,checked FROM lyrics WHERE track=?");
+    lyrics.bind(key);
+    if (!lyrics.row()) return {};
+    Lyrics result{lyrics.text(0), lyrics.text(1)};
+    if (fresh && result.plain.empty() && lyrics.integer(2) < nowMs() - 86'400'000) return {};
+    return result;
+}
+
+void Store::saveLyrics(Id key, const Lyrics& lyrics) {
+    std::scoped_lock lock(mutex_);
+    Statement(db_, "INSERT INTO lyrics VALUES(?,?,?,?) ON CONFLICT(track) DO UPDATE SET"
+        " plain=excluded.plain,structured=excluded.structured,checked=excluded.checked")
+        .bind(key).bind(lyrics.plain).bind(lyrics.structured).bind(nowMs()).run();
 }
 
 void Store::pin(const std::vector<Track>& tracks, bool permanent) {
@@ -331,15 +615,16 @@ void Store::pin(const std::vector<Track>& tracks, bool permanent) {
     transaction.commit();
 }
 
-void Store::syncFavorites(Id server, std::vector<Track>& tracks) {
+void Store::syncFavorites(Id server, BrowsePage& page) {
     std::scoped_lock lock(mutex_);
     Statement enabled(db_, "SELECT id FROM servers WHERE id=? AND cache_favorites=1");
     enabled.bind(server);
     if (!enabled.row()) return;
     Transaction transaction(db_);
-    rememberUnlocked(tracks);
+    rememberUnlocked(page.tracks);
+    rememberCatalog(server, {BrowseKind::favorites, {}, {}}, true, 0, page);
     Statement(db_, "UPDATE tracks SET favorite=0 WHERE server=? AND favorite=1").bind(server).run();
-    for (const auto& track : tracks)
+    for (const auto& track : page.tracks)
         Statement(db_, "UPDATE tracks SET favorite=1 WHERE key=?").bind(track.key).run();
     transaction.commit();
 }

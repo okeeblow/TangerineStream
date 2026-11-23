@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ml_tangerinestream VERSION 0.2.0 LANGUAGES CXX RC)
+project(ml_tangerinestream VERSION 0.3.0 LANGUAGES CXX RC)
 
 set(WINAMP_SDK "" CACHE PATH "Winamp SDK directory override")
 if(WINAMP_SDK STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}/WA5.55_SDK" AND NOT EXISTS "${WINAMP_SDK}")
@@ -23,7 +23,8 @@ endforeach()
 message(STATUS "Using Winamp SDK at ${sdk_directory}")
 
 add_library(ml_tangerinestream SHARED
-    src/plugin.cpp src/server.cpp src/store.cpp src/playback.cpp src/artwork.cpp src/plugin.rc)
+    src/plugin.cpp src/server.cpp src/store.cpp src/playback.cpp src/artwork.cpp
+    src/album_art.cpp src/plugin.rc)
 set_target_properties(ml_tangerinestream PROPERTIES PREFIX "")
 target_compile_features(ml_tangerinestream PRIVATE cxx_std_17)
 target_compile_definitions(ml_tangerinestream PRIVATE

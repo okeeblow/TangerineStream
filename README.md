@@ -35,8 +35,12 @@ With the toolchain environment set up, `cmake --build build-mingw32 --target ins
 
 Add profiles for other servers or accounts and switch between them using the server selector. **Settings** lets you update the profile name, password, browsing mode, and favorite download preference. Each profile keeps its own track IDs, cached music, and pending reports.
 
+Playlist entries use the server's artist and track title. Tangerine Stream supplies track covers and plain lyrics to the player as they become available. Select one track and use **Lyrics...** to read the server's lyrics directly in the Media Library. The cache keeps OpenSubsonic line and word timing for future synchronized display. [OpenSubsonic song lyrics](https://opensubsonic.github.io/docs/endpoints/getlyricsbysongid/)
+
 ## Offline playback and reports
 
+- Turn on **Offline** to browse and search cached albums, genres, artists, folders, playlists, favorites, and tracks with network requests paused. The view also switches to its cache when a server cannot be reached and retries the connection periodically. Pages and relationships are saved as you browse. Open a playlist or folder while connected to make its contents available offline.
+- The track list shows which songs have audio cached, and those songs can play offline. Artwork and lyrics fetched while online remain available in the cache. The artwork cache has a separate 128 MiB limit.
 - The rolling cache is shared by all profiles and defaults to 1,024 MiB. A complete stream is saved locally when it fits. The least recently used rolling entries are evicted as space is needed. A budget of `0` disables rolling storage.
 - Select tracks and use **Keep offline** to download them permanently. **Unpin** returns a track to the rolling cache if it has no automatic favorite pin. **Offline Cache** shows downloaded tracks and pending offline downloads.
 - Enable automatic favorite caching per profile to download starred songs and tracks from starred albums and artists. Favorite downloads stay offline while starred. Permanent and favorite downloads use disk space outside the rolling budget.

@@ -35,8 +35,11 @@ struct Track {
     bool pinned = false;
     bool favorite = false;
     std::int64_t bytes = 0;
+    std::string coverId, albumId, artistId, albumArtistId, albumArtist, genre;
+    int discNumber = 0, trackNumber = 0, year = 0;
 };
 
+// These values are also stored in the catalog database.
 enum class BrowseKind {
     albums, genres, albumArtists, artists, folders, playlists, favorites, tracks, offline,
     genreAlbums, artistAlbums, folderIndex, directory, albumTracks, playlistTracks, song
@@ -48,6 +51,10 @@ struct BrowseLocation {
     std::string title;
 };
 
+inline bool localLocation(const BrowseLocation& location) {
+    return !location.id.empty() && location.id.front() == '\x1f';
+}
+
 struct LibraryItem {
     BrowseLocation target;
     std::string subtitle;
@@ -57,7 +64,14 @@ struct LibraryItem {
 struct BrowsePage {
     std::vector<LibraryItem> items;
     std::vector<Track> tracks;
+    std::vector<Track> relatedTracks;
     bool more = false;
+};
+
+struct Lyrics {
+    std::string plain;
+    // Original OpenSubsonic lyrics response, including offsets and any line or cue timing.
+    std::string structured;
 };
 
 inline bool trackView(BrowseKind kind) {
@@ -77,8 +91,15 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+class ConnectionError : public Error {
+public:
+    using Error::Error;
+};
+
 std::wstring wide(std::string_view value);
 std::string utf8(std::wstring_view value);
+bool matches(const std::string& value, const std::wstring& query);
+std::string playlistTitle(const Track& track);
 std::string randomHex();
 std::int64_t nowMs();
 

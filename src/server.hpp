@@ -37,9 +37,11 @@ private:
 class ServerApi {
 public:
     virtual ~ServerApi() = default;
+    virtual void ping() = 0;
     virtual BrowsePage browse(const BrowseLocation& location, const std::string& query, int offset) = 0;
     virtual std::string cover(const LibraryItem& item, int size) = 0;
-    virtual std::vector<Track> favorites(const std::atomic_bool& stopping) = 0;
+    virtual Lyrics lyrics(const Track& track) = 0;
+    virtual BrowsePage favorites(const std::atomic_bool& stopping) = 0;
     virtual std::unique_ptr<Response> audio(const Track& track, const std::string& range,
                                             bool head) = 0;
     virtual void submit(const std::vector<Report>& reports) = 0;

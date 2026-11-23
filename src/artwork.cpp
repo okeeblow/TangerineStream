@@ -8,6 +8,25 @@
 namespace tangerine {
 namespace {
 
+LibraryItem songArtwork(const Track& track) {
+    return {{BrowseKind::song, track.id, track.title}, track.artist, track.coverId};
+}
+
+LibraryItem albumArtwork(Store& store, const Track& track) {
+    return {{BrowseKind::albumTracks, track.albumId, track.album}, track.artist,
+        store.albumCover(track.server, track.albumId)};
+}
+
+std::string loadArtwork(Store& store, ServerApi& api, Id server, const LibraryItem& item) {
+    auto data = store.artwork(server, item);
+    if (!data.empty()) return data;
+    if (!store.networkAvailable(server) || localLocation(item.target)) return {};
+    data = api.cover(item, 640);
+    if (!artworkExtension(data)) return {};
+    store.saveArtwork(server, item, data);
+    return data;
+}
+
 template<class T> class Com {
 public:
     Com() = default;
@@ -67,7 +86,7 @@ std::vector<std::uint32_t> decode(IWICImagingFactory* factory, std::string& byte
 
 } // namespace
 
-ArtworkLoader::ArtworkLoader(Store& store) : store_(store) {
+ArtworkLoader::ArtworkLoader(Store& store, HWND player) : store_(store), player_(player) {
     try {
         for (int i = 0; i < 3; ++i) workers_.emplace_back([this] { load(); });
     } catch (...) {
@@ -119,32 +138,110 @@ std::vector<Thumbnail> ArtworkLoader::take(Generation generation) {
     return std::exchange(complete_, {});
 }
 
+void ArtworkLoader::requestTrack(Id key, bool priority) {
+    {
+        std::scoped_lock lock(mutex_);
+        if (stopping_ || !key) return;
+        if (pendingTracks_.count(key)) {
+            if (!priority) return;
+            auto queued = std::find(tracks_.begin(), tracks_.end(), key);
+            if (queued == tracks_.end()) return;
+            tracks_.erase(queued);
+        } else {
+            if (tracks_.size() >= 64) {
+                if (!priority) return;
+                pendingTracks_.erase(tracks_.back());
+                tracks_.pop_back();
+            }
+            pendingTracks_.insert(key);
+        }
+        if (priority) tracks_.push_front(key);
+        else tracks_.push_back(key);
+    }
+    ready_.notify_one();
+}
+
+bool ArtworkLoader::trackPending(Id key) {
+    std::scoped_lock lock(mutex_);
+    return pendingTracks_.count(key) != 0;
+}
+
+std::string ArtworkLoader::trackArtwork(const Track& track) {
+    auto data = store_.artwork(track.server, songArtwork(track));
+    if (data.empty() && !track.albumId.empty()) data = store_.artwork(track.server, albumArtwork(store_, track));
+    return data;
+}
+
+void ArtworkLoader::loadTrack(Id key) {
+    auto track = store_.track(key);
+    if (!track.key || !store_.networkAvailable(track.server)) return;
+    bool changed = false;
+    auto connection = connect(store_.server(track.server));
+    try {
+        const auto item = songArtwork(track);
+        if (store_.artwork(track.server, item).empty()) {
+            auto data = loadArtwork(store_, *connection, track.server, item);
+            if (data.empty() && !track.albumId.empty())
+                data = loadArtwork(store_, *connection, track.server, albumArtwork(store_, track));
+            changed = !data.empty();
+        }
+    } catch (const ConnectionError&) {
+        store_.connectionFailed(track.server);
+    } catch (const std::exception&) {}
+    if (!store_.lyrics(key, true) && store_.networkAvailable(track.server)) {
+        try {
+            auto lyrics = connection->lyrics(track);
+            store_.saveLyrics(key, lyrics);
+            changed |= !lyrics.plain.empty();
+        } catch (const ConnectionError&) {
+            store_.connectionFailed(track.server);
+        } catch (const std::exception&) {}
+    }
+    if (changed) {
+        auto bits = static_cast<std::uint64_t>(key);
+        PostMessageW(player_, trackReadyMessage, static_cast<DWORD>(bits),
+                     static_cast<LPARAM>(static_cast<DWORD>(bits >> 32)));
+    }
+}
+
 void ArtworkLoader::load() {
     ComApartment apartment;
     Com<IWICImagingFactory> factory;
     if (apartment) CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
         IID_IWICImagingFactory, reinterpret_cast<void**>(factory.out()));
-    Generation generation = 0;
-    std::unique_ptr<ServerApi> api;
     for (;;) {
         Request request;
+        Id track = 0;
         {
             std::unique_lock lock(mutex_);
-            ready_.wait(lock, [this] { return stopping_ || !requests_.empty(); });
+            ready_.wait(lock, [this] { return stopping_ || !requests_.empty() || !tracks_.empty(); });
             if (stopping_) return;
-            request = std::move(requests_.front());
-            requests_.pop_front();
+            if (!tracks_.empty()) {
+                track = tracks_.front();
+                tracks_.pop_front();
+            } else {
+                request = std::move(requests_.front());
+                requests_.pop_front();
+            }
+        }
+        if (track) {
+            try { loadTrack(track); } catch (const std::exception&) {}
+            std::scoped_lock lock(mutex_);
+            pendingTracks_.erase(track);
+            continue;
         }
         Thumbnail thumbnail{request.row, {}};
         try {
-            if (!api || generation != request.generation) {
-                api = connect(store_.server(request.server));
-                generation = request.generation;
-            }
             if (factory.get()) {
-                auto bytes = api->cover(request.item, request.size * 2);
+                auto bytes = store_.artwork(request.server, request.item);
+                if (bytes.empty() && store_.networkAvailable(request.server) && !localLocation(request.item.target)) {
+                    auto api = connect(store_.server(request.server));
+                    bytes = loadArtwork(store_, *api, request.server, request.item);
+                }
                 thumbnail.pixels = decode(factory.get(), bytes, request.size);
             }
+        } catch (const ConnectionError&) {
+            store_.connectionFailed(request.server);
         } catch (const std::exception&) {
             // A missing or unreachable cover still leaves a usable tile.
         }
@@ -154,6 +251,15 @@ void ArtworkLoader::load() {
             PostMessageW(view_, readyMessage, 0, 0);
         }
     }
+}
+
+const wchar_t* artworkExtension(std::string_view data) {
+    if (data.substr(0, 3) == "\xff\xd8\xff") return L"jpg";
+    if (data.substr(0, 8) == "\x89PNG\r\n\x1a\n") return L"png";
+    if (data.substr(0, 6) == "GIF87a" || data.substr(0, 6) == "GIF89a") return L"gif";
+    if (data.substr(0, 2) == "BM") return L"bmp";
+    if (data.size() >= 12 && data.substr(0, 4) == "RIFF" && data.substr(8, 4) == "WEBP") return L"webp";
+    return nullptr;
 }
 
 HBITMAP thumbnailBitmap(int size, const std::vector<std::uint32_t>& pixels) {

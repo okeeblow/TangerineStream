@@ -84,8 +84,14 @@ Address splitUrl(const std::wstring& url) {
 }
 
 [[noreturn]] void networkError() {
-    throw Error("Server connection failed (Windows error " + std::to_string(GetLastError()) + ").");
+    throw ConnectionError("Server connection failed (Windows error " + std::to_string(GetLastError()) + ").");
 }
+
+class SubsonicError : public Error {
+public:
+    SubsonicError(int code, const std::string& message) : Error(message), code(code) {}
+    int code;
+};
 
 struct Json {
     using Array = std::vector<Json>;
@@ -263,7 +269,19 @@ std::string jsonString(std::string_view value) {
     return result + "\"";
 }
 
+std::string windowsLines(std::string_view text) {
+    std::string result;
+    result.reserve(text.size());
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\n' && (i == 0 || text[i - 1] != '\r')) result += '\r';
+        result += text[i];
+    }
+    return result;
+}
+
 Json readJson(Response& response) {
+    if (response.status == 408 || (response.status >= 500 && response.status <= 599))
+        throw ConnectionError("The server returned HTTP " + std::to_string(response.status) + ".");
     if (response.status != 200)
         throw Error("The server returned HTTP " + std::to_string(response.status) + ".");
     return JsonParser(response.text()).parse();
@@ -278,7 +296,7 @@ std::string trackSuffix(const Json& value) {
 }
 
 bool usableId(const std::string& id) {
-    return !id.empty() && id.size() <= 512 && id.find('\0') == std::string::npos;
+    return !id.empty() && id.size() <= 512 && id.front() != '\x1f' && id.find('\0') == std::string::npos;
 }
 
 void appendTrack(std::vector<Track>& result, Id server, const Json& item) {
@@ -293,19 +311,27 @@ void appendTrack(std::vector<Track>& result, Id server, const Json& item) {
     track.suffix = trackSuffix(item);
     track.mime = item.at("contentType").string();
     track.duration = item.at("duration").seconds();
+    track.coverId = item.at("coverArt").string();
+    track.albumId = item.at("albumId").string();
+    track.artistId = item.at("artistId").string();
+    track.albumArtist = item.at("albumArtist").string();
+    track.albumArtistId = item.at("albumArtistId").string();
+    const auto& albumArtists = item.at("albumArtists").array();
+    if (!albumArtists.empty()) {
+        if (track.albumArtist.empty()) track.albumArtist = albumArtists.front().at("name").string();
+        if (track.albumArtistId.empty() && albumArtists.size() == 1)
+            track.albumArtistId = albumArtists.front().at("id").string();
+    }
+    track.genre = item.at("genre").string();
+    track.discNumber = item.at("discNumber").seconds();
+    track.trackNumber = item.at("track").seconds();
+    if (!track.trackNumber) track.trackNumber = item.at("trackNumber").seconds();
+    track.year = item.at("year").seconds();
     result.push_back(std::move(track));
 }
 
 void appendTracks(std::vector<Track>& result, Id server, const Json& items) {
     for (const auto& item : items.array()) appendTrack(result, server, item);
-}
-
-bool matches(const std::string& value, const std::wstring& query) {
-    if (query.empty()) return true;
-    auto text = wide(value);
-    return !text.empty() && FindNLSStringEx(LOCALE_NAME_INVARIANT,
-        FIND_FROMSTART | NORM_IGNORECASE, text.data(), static_cast<int>(text.size()),
-        query.data(), static_cast<int>(query.size()), nullptr, nullptr, nullptr, 0) >= 0;
 }
 
 std::string itemCount(int count, const char* singular, const char* plural) {
@@ -342,6 +368,8 @@ void appendItems(std::vector<LibraryItem>& result, const Json& items, BrowseKind
 class Subsonic : public ServerApi {
 public:
     explicit Subsonic(Server server) : server_(std::move(server)) {}
+    void ping() override { api("ping"); }
+
     BrowsePage browse(const BrowseLocation& location, const std::string& query, int offset) override {
         BrowsePage result;
         auto filter = wide(query);
@@ -393,11 +421,13 @@ public:
             for (const auto& index : indexes.at("index").array())
                 appendItems(result.items, index.at("artist"), BrowseKind::directory, filter);
             appendDirectory(result.items, indexes.at("child"), filter);
+            appendDirectoryTracks(result.relatedTracks, indexes.at("child"));
             break;
         }
         case BrowseKind::directory: {
             auto response = api("getMusicDirectory", {{"id", location.id}});
             appendDirectory(result.items, response.at("directory").at("child"), filter);
+            appendDirectoryTracks(result.relatedTracks, response.at("directory").at("child"));
             break;
         }
         case BrowseKind::playlists: {
@@ -408,9 +438,8 @@ public:
         case BrowseKind::favorites: {
             auto response = api("getStarred2");
             const auto& starred = response.at("starred2");
-            appendItems(result.items, starred.at("album"), BrowseKind::albumTracks, filter);
-            appendItems(result.items, starred.at("artist"), BrowseKind::artistAlbums, filter);
-            appendItems(result.items, starred.at("song"), BrowseKind::song, filter);
+            appendStarred(result.items, starred, filter);
+            appendTracks(result.relatedTracks, server_.id, starred.at("song"));
             break;
         }
         case BrowseKind::tracks:
@@ -420,6 +449,8 @@ public:
         case BrowseKind::albumTracks: {
             auto response = api("getAlbum", {{"id", location.id}});
             appendTracks(result.tracks, server_.id, response.at("album").at("song"));
+            for (auto& track : result.tracks)
+                if (track.albumId.empty()) track.albumId = location.id;
             break;
         }
         case BrowseKind::playlistTracks: {
@@ -447,7 +478,7 @@ public:
 
     std::string cover(const LibraryItem& item, int size) override {
         auto id = item.coverId;
-        if (id.empty() || item.target.kind == BrowseKind::artistAlbums) {
+        if (!usableId(id) || item.target.kind == BrowseKind::artistAlbums) {
             auto representative = representativeCover(item.target);
             if (!representative.empty()) id = std::move(representative);
         }
@@ -460,6 +491,47 @@ public:
         return response.text(8 * MiB);
     }
 
+    Lyrics lyrics(const Track& track) override {
+        Parameters params{{"id", track.id}};
+        Lyrics result;
+        auto structured = [&](bool enhanced) {
+            auto parameters = params;
+            if (enhanced) parameters.emplace_back("enhanced", "true");
+            try {
+                return api("getLyricsBySongId", std::move(parameters), &result.structured);
+            } catch (const SubsonicError& error) {
+                if (error.code != 0 && error.code != 10 && error.code != 70) throw;
+                return Json{};
+            }
+        };
+        auto response = structured(true);
+        if (result.structured.empty()) response = structured(false);
+        const auto& variants = response.at("lyricsList").at("structuredLyrics").array();
+        for (const auto& variant : variants) {
+            auto kind = variant.at("kind").string();
+            if (!kind.empty() && kind != "main") continue;
+            const auto& lines = variant.at("line").array();
+            for (std::size_t i = 0; i < lines.size(); ++i) {
+                if (i) result.plain += "\r\n";
+                result.plain += lines[i].at("value").string();
+            }
+            if (result.plain.find_first_not_of("\r\n\t ") != std::string::npos) {
+                result.plain = windowsLines(result.plain);
+                return result;
+            }
+            result.plain.clear();
+        }
+        if (!track.artist.empty() && !track.title.empty()) {
+            try {
+                result.plain = windowsLines(api("getLyrics", {{"artist", track.artist}, {"title", track.title}})
+                    .at("lyrics").at("value").string());
+            } catch (const SubsonicError& error) {
+                if (error.code != 0 && error.code != 10 && error.code != 70) throw;
+            }
+        }
+        return result;
+    }
+
     virtual std::vector<Track> songs(const std::string& query, int offset) {
         auto response = api("search3", {{"query", query}, {"artistCount", "0"}, {"albumCount", "0"},
             {"songCount", std::to_string(pageSize)}, {"songOffset", std::to_string(offset)}});
@@ -468,13 +540,14 @@ public:
         return result;
     }
 
-    std::vector<Track> favorites(const std::atomic_bool& stopping) override {
+    BrowsePage favorites(const std::atomic_bool& stopping) override {
         auto response = api("getStarred2");
         const auto& starred = response.at("starred2");
         if (!std::holds_alternative<Json::Object>(starred.value))
             throw Error("The server returned an unexpected favorites response.");
-        std::vector<Track> result;
-        appendTracks(result, server_.id, starred.at("song"));
+        BrowsePage result;
+        appendStarred(result.items, starred, {});
+        appendTracks(result.tracks, server_.id, starred.at("song"));
         std::set<std::string> albums;
         for (const auto& entry : starred.at("album").array()) albums.insert(entry.at("id").string());
         for (const auto& entry : starred.at("artist").array()) {
@@ -487,7 +560,10 @@ public:
             if (stopping) throw Error("Favorite sync interrupted.");
             if (id.empty()) continue;
             auto album = api("getAlbum", {{"id", id}});
-            appendTracks(result, server_.id, album.at("album").at("song"));
+            auto first = result.tracks.size();
+            appendTracks(result.tracks, server_.id, album.at("album").at("song"));
+            for (; first < result.tracks.size(); ++first)
+                if (result.tracks[first].albumId.empty()) result.tracks[first].albumId = id;
         }
         return result;
     }
@@ -512,6 +588,20 @@ protected:
     Server server_;
 
 private:
+    static void appendStarred(std::vector<LibraryItem>& items, const Json& starred,
+                              const std::wstring& query) {
+        appendItems(items, starred.at("album"), BrowseKind::albumTracks, query);
+        appendItems(items, starred.at("artist"), BrowseKind::artistAlbums, query);
+        appendItems(items, starred.at("song"), BrowseKind::song, query);
+    }
+
+    void appendDirectoryTracks(std::vector<Track>& result, const Json& items) {
+        for (const auto& node : items.array()) {
+            auto directory = std::get_if<bool>(&node.at("isDir").value);
+            if (!directory || !*directory) appendTrack(result, server_.id, node);
+        }
+    }
+
     static void appendDirectory(std::vector<LibraryItem>& result, const Json& items,
                                 const std::wstring& query) {
         for (const auto& node : items.array()) {
@@ -570,6 +660,12 @@ private:
             response = api("getMusicDirectory", {{"id", location.id}});
             entries = &response.at("directory").at("child");
             break;
+        case BrowseKind::song:
+            return api("getSong", {{"id", location.id}}).at("song").at("coverArt").string();
+        case BrowseKind::albumTracks:
+            if (!location.id.empty())
+                return api("getAlbum", {{"id", location.id}}).at("album").at("coverArt").string();
+            return {};
         default:
             return {};
         }
@@ -587,14 +683,21 @@ private:
             {"c", "ml_tangerinestream"}, {"f", "json"}});
         return server_.url + "/rest/" + endpoint + ".view" + queryString(parameters);
     }
-    Json api(const std::string& endpoint, Parameters parameters = {}) {
+    Json api(const std::string& endpoint, Parameters parameters = {}, std::string* original = nullptr) {
         Response response(url(endpoint, std::move(parameters)), L"GET", L"");
-        auto envelope = readJson(response);
+        if (response.status == 404 || response.status == 501)
+            throw SubsonicError(70, "The server does not provide this resource.");
+        std::string payload;
+        if (original && response.status == 200) payload = response.text(2 * MiB);
+        auto envelope = payload.empty() ? readJson(response) : JsonParser(payload).parse();
         const auto& result = envelope.at("subsonic-response");
         if (result.at("status").string() != "ok") {
-            auto reason = result.at("error").at("message").string();
-            throw Error(reason.empty() ? "The Subsonic request failed." : reason.substr(0, 300));
+            const auto& error = result.at("error");
+            auto reason = error.at("message").string();
+            throw SubsonicError(error.at("code").seconds(),
+                reason.empty() ? "The Subsonic request failed." : reason.substr(0, 300));
         }
+        if (original) *original = std::move(payload);
         return result;
     }
 };
@@ -647,6 +750,19 @@ private:
 };
 
 } // namespace
+
+bool matches(const std::string& value, const std::wstring& query) {
+    if (query.empty()) return true;
+    auto text = wide(value);
+    return !text.empty() && FindNLSStringEx(LOCALE_NAME_INVARIANT,
+        FIND_FROMSTART | NORM_IGNORECASE, text.data(), static_cast<int>(text.size()),
+        query.data(), static_cast<int>(query.size()), nullptr, nullptr, nullptr, 0) >= 0;
+}
+
+std::string playlistTitle(const Track& track) {
+    auto title = track.title.empty() ? track.id : track.title;
+    return track.artist.empty() ? title : track.artist + " - " + title;
+}
 
 std::wstring wide(std::string_view value) {
     if (value.empty()) return {};

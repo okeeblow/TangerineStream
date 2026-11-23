@@ -2,9 +2,11 @@
 
 #include "model.hpp"
 #include <windows.h>
+#include <chrono>
 #include <filesystem>
 #include <map>
 #include <mutex>
+#include <optional>
 
 struct sqlite3;
 
@@ -26,12 +28,24 @@ public:
     void savePlaybackPort(int port);
     bool textCatalog();
     void saveTextCatalog(bool text);
+    bool offlineMode();
+    void setOfflineMode(bool offline);
+    bool networkAvailable(Id server);
+    bool connectionRetryDue(Id server);
+    void connectionFailed(Id server);
+    void connectionRestored(Id server);
 
-    void remember(std::vector<Track>& tracks);
-    std::vector<Track> cached(Id server, const std::string& query, int offset);
+    void rememberPage(Id server, const BrowseLocation& location, bool unfiltered,
+                      int offset, BrowsePage& page);
+    BrowsePage cachedPage(Id server, const BrowseLocation& location, const std::string& query, int offset);
     Track track(Id key);
+    std::string albumCover(Id server, const std::string& albumId);
+    std::string artwork(Id server, const LibraryItem& item);
+    void saveArtwork(Id server, const LibraryItem& item, const std::string& data);
+    std::optional<Lyrics> lyrics(Id key, bool fresh = false);
+    void saveLyrics(Id key, const Lyrics& lyrics);
     void pin(const std::vector<Track>& tracks, bool permanent);
-    void syncFavorites(Id server, std::vector<Track>& tracks);
+    void syncFavorites(Id server, BrowsePage& page);
     std::vector<Track> pendingPins(Id server);
     void postponePin(Id key);
 
@@ -50,6 +64,8 @@ public:
 
 private:
     void rememberUnlocked(std::vector<Track>& tracks);
+    void rememberCatalog(Id server, const BrowseLocation& location, bool unfiltered,
+                         int offset, const BrowsePage& page);
     std::string setting(const char* key);
     void setSetting(const char* key, const std::string& value);
     Server loadServer(Id id);
@@ -62,7 +78,9 @@ private:
     sqlite3* db_ = nullptr;
     std::mutex mutex_;
     std::map<Id, std::int64_t> downloads_;
+    std::map<Id, std::chrono::steady_clock::time_point> retryConnection_;
     std::int64_t budget_ = 0;
+    bool offline_ = false;
 };
 
 } // namespace tangerine

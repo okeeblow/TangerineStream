@@ -48,9 +48,11 @@ if not defined ts_ninja (
 )
 set "ts_build=build-mingw32"
 set "ts_parallel=--parallel"
+set "ts_mingw_cmake=%ts_mingw:\=/%"
+set "ts_ninja_cmake=%ts_ninja:\=/%"
 cmake.exe -S . -B "%ts_build%" -G Ninja -DCMAKE_BUILD_TYPE=Release ^
-    "-DCMAKE_CXX_COMPILER=%ts_mingw%\g++.exe" "-DCMAKE_RC_COMPILER=%ts_mingw%\windres.exe" ^
-    "-DCMAKE_MAKE_PROGRAM=%ts_ninja%"
+    "-DCMAKE_CXX_COMPILER=%ts_mingw_cmake%/g++.exe" "-DCMAKE_RC_COMPILER=%ts_mingw_cmake%/windres.exe" ^
+    "-DCMAKE_MAKE_PROGRAM=%ts_ninja_cmake%"
 goto build
 
 :setup_vs

@@ -1,5 +1,6 @@
 #include "playback.hpp"
 #include "artwork.hpp"
+#include "album_art.hpp"
 #include "resources.h"
 
 #include <commctrl.h>
@@ -39,7 +40,7 @@ int init();
 void quit();
 INT_PTR message(int type, INT_PTR a, INT_PTR b, INT_PTR c);
 
-char description[] = "Tangerine Stream v0.2.0";
+char description[] = "Tangerine Stream v0.3.0 by COOLTRAINER";
 winampMediaLibraryPlugin plugin = [] {
     winampMediaLibraryPlugin descriptor{};
 #ifdef MLHDR_VER_OLD
@@ -111,6 +112,7 @@ struct Search {
     BrowseLocation location;
     std::string query;
     int offset;
+    bool cached;
 };
 
 struct SearchResult {
@@ -118,6 +120,8 @@ struct SearchResult {
     std::uint64_t serial;
     BrowsePage page;
     std::string error;
+    bool cached = false;
+    bool restart = false;
 };
 
 struct Playing {
@@ -137,7 +141,9 @@ struct ServiceStatus {
 
 class App {
 public:
-    explicit App(const std::filesystem::path& profile) : store(profile), playback(store), artwork(store) {
+    explicit App(const std::filesystem::path& profile)
+        : store(profile), playback(store), artwork(store, plugin.hwndWinampParent),
+          albumArt(reinterpret_cast<void*>(player(IPC_GET_API_SERVICE)), store, playback, artwork) {
         try {
             browser = std::thread([this] { browse(); });
             maintenance = std::thread([this] { maintain(); });
@@ -149,10 +155,10 @@ public:
     }
     ~App() { stop(); }
 
-    void search(HWND view, Id server, const BrowseLocation& location, std::string query, int offset) {
+    void search(HWND view, Id server, const BrowseLocation& location, std::string query, int offset, bool cached) {
         {
             std::scoped_lock lock(searchMutex);
-            request = Search{view, ++serial, server, location, std::move(query), offset};
+            request = Search{view, ++serial, server, location, std::move(query), offset, cached};
             result.reset();
         }
         searchReady.notify_one();
@@ -201,6 +207,7 @@ public:
     Store store;
     Playback playback;
     ArtworkLoader artwork;
+    AlbumArtRegistration albumArt;
     HWND activeView = nullptr;
     Id selectedServer = 0;
     UINT_PTR treeId = 0;
@@ -256,18 +263,39 @@ void App::browse() {
         }
         SearchResult ready{search.view, search.serial, {}, {}};
         try {
-            if (search.location.kind == BrowseKind::offline) {
-                ready.page.tracks = store.cached(search.server, search.query, search.offset);
-                ready.page.more = ready.page.tracks.size() == pageSize;
-            } else {
-                auto profile = store.server(search.server);
-                if (!api || profile.id != current.id || profile.native != current.native ||
-                    profile.password != current.password) {
-                    api = connect(profile);
-                    current = std::move(profile);
+            ready.cached = search.cached || search.location.kind == BrowseKind::offline ||
+                localLocation(search.location) || !store.networkAvailable(search.server);
+            if (!ready.cached) {
+                try {
+                    auto profile = store.server(search.server);
+                    if (!api || profile.id != current.id || profile.native != current.native ||
+                        profile.password != current.password) {
+                        api = connect(profile);
+                        current = std::move(profile);
+                    }
+                    const bool filterPlaylist = search.location.kind == BrowseKind::playlistTracks &&
+                        !search.query.empty();
+                    const auto remoteQuery = filterPlaylist ? std::string{} : search.query;
+                    ready.page = api->browse(search.location, remoteQuery, search.offset);
+                    store.rememberPage(search.server, search.location, remoteQuery.empty(), search.offset, ready.page);
+                    if (filterPlaylist) {
+                        auto filter = wide(search.query);
+                        auto& tracks = ready.page.tracks;
+                        tracks.erase(std::remove_if(tracks.begin(), tracks.end(), [&](const Track& track) {
+                            return !matches(track.title, filter) && !matches(track.artist, filter) &&
+                                !matches(track.album, filter);
+                        }), tracks.end());
+                    }
+                } catch (const ConnectionError&) {
+                    store.connectionFailed(search.server);
+                    api.reset();
+                    ready.cached = true;
                 }
-                ready.page = api->browse(search.location, search.query, search.offset);
-                if (!ready.page.tracks.empty()) store.remember(ready.page.tracks);
+            }
+            if (ready.cached) {
+                ready.restart = !search.cached && search.offset != 0;
+                ready.page = store.cachedPage(search.server, search.location, search.query,
+                                              ready.restart ? 0 : search.offset);
             }
         } catch (const std::exception& error) {
             ready.error = error.what();
@@ -304,6 +332,18 @@ void App::maintain() {
                 if (!api) api = connect(store.server(profile.id));
                 return *api;
             };
+            if (store.connectionRetryDue(profile.id)) {
+                try {
+                    connection().ping();
+                    store.connectionRestored(profile.id);
+                } catch (const ConnectionError&) {
+                    store.connectionFailed(profile.id);
+                } catch (const std::exception&) {
+                    // A reachable server can reject the profile and let the browser surface the error.
+                    store.connectionRestored(profile.id);
+                }
+            }
+            if (!store.networkAvailable(profile.id)) continue;
             if (Clock::now() >= nextFavorites[profile.id] || !profile.cacheFavorites) {
                 std::string failure;
                 if (profile.cacheFavorites) {
@@ -312,6 +352,7 @@ void App::maintain() {
                         auto favorites = connection().favorites(stopping);
                         store.syncFavorites(profile.id, favorites);
                     } catch (const std::exception& error) {
+                        if (dynamic_cast<const ConnectionError*>(&error)) store.connectionFailed(profile.id);
                         failure = std::string("Favorite sync: ") + error.what();
                         nextFavorites[profile.id] = Clock::now() + seconds(30);
                     }
@@ -323,9 +364,12 @@ void App::maintain() {
             try {
                 for (const auto& track : store.pendingPins(profile.id)) {
                     if (stopping) return;
+                    if (!store.networkAvailable(profile.id)) break;
                     try {
                         downloadPinned(store, track, connection(), stopping);
+                        artwork.requestTrack(track.key);
                     } catch (const std::exception& error) {
+                        if (dynamic_cast<const ConnectionError*>(&error)) store.connectionFailed(profile.id);
                         store.postponePin(track.key);
                         failure = std::string("Cache download: ") + error.what();
                         break;
@@ -355,12 +399,14 @@ void App::report() {
         try { profiles = store.servers(); } catch (...) {}
         for (const auto& profile : profiles) {
             if (stopping) return;
+            if (!store.networkAvailable(profile.id)) continue;
             if (Clock::now() < retryAfter[profile.id]) continue;
             std::string failure;
             try {
                 std::unique_ptr<ServerApi> api;
                 // Bound each round so one backlog cannot monopolize reporting.
                 for (int i = 0; i < 4 && !stopping; ++i) {
+                    if (!store.networkAvailable(profile.id)) break;
                     auto batch = store.reports(profile.id);
                     if (batch.empty()) break;
                     if (!api) api = connect(store.server(profile.id));
@@ -368,6 +414,7 @@ void App::report() {
                     store.acknowledge(batch);
                 }
             } catch (const std::exception& error) {
+                if (dynamic_cast<const ConnectionError*>(&error)) store.connectionFailed(profile.id);
                 failure = std::string("Report delivery: ") + error.what();
                 retryAfter[profile.id] = Clock::now() + seconds(30);
             }
@@ -416,6 +463,7 @@ void App::sample(Id startedKey) {
     if (changed || repeated) {
         playing = {};
         playing.track = store.track(key);
+        artwork.requestTrack(key, true);
         playing.playlistPosition = index;
         playing.started = nowMs() - std::max(0, output);
     } else if (playing.state == 1 && output >= 0 && delta > 0 && delta <= elapsed + 750) {
@@ -434,7 +482,114 @@ void App::sample(Id startedKey) {
     }
 }
 
+std::optional<std::string> metadata(const Track& track, const wchar_t* field) {
+    if (!field) return {};
+    auto is = [&](const wchar_t* name) { return _wcsicmp(field, name) == 0; };
+    if (is(L"title")) return track.title.empty() ? track.id : track.title;
+    if (is(L"artist")) return track.artist;
+    if (is(L"album")) return track.album;
+    if (is(L"albumartist") || is(L"album artist")) return track.albumArtist;
+    if (is(L"genre")) return track.genre;
+    if (is(L"year") && track.year) return std::to_string(track.year);
+    if (is(L"track") && track.trackNumber) return std::to_string(track.trackNumber);
+    if ((is(L"disc") || is(L"discnumber")) && track.discNumber) return std::to_string(track.discNumber);
+    if (is(L"length") && track.duration) return std::to_string(Id(track.duration) * 1000);
+    if (is(L"length_seconds") && track.duration) return std::to_string(track.duration);
+    if (is(L"lyrics") || is(L"unsyncedlyrics") || is(L"unsynced lyrics")) {
+        const auto lyrics = app->store.lyrics(track.key);
+        if (lyrics && !lyrics->plain.empty()) return lyrics->plain;
+        if (!lyrics && app->store.networkAvailable(track.server)) app->artwork.requestTrack(track.key, true);
+    }
+    return {};
+}
+
+Track hostTrack(const wchar_t* url) {
+    auto key = url ? app->playback.key(url) : 0;
+    return key ? app->store.track(key) : Track{};
+}
+
+void copyMetadata(wchar_t* output, size_t capacity, const std::string& value) {
+    if (output && capacity) lstrcpynW(output, wide(value).c_str(),
+                                       static_cast<int>(std::min<size_t>(capacity, INT_MAX)));
+}
+
+void copyMetadata(char* output, size_t capacity, const std::string& value) {
+    if (!output || !capacity) return;
+    const auto text = wide(value);
+    const auto bytes = WideCharToMultiByte(CP_ACP, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) { *output = 0; return; }
+    std::string local(bytes, '\0');
+    WideCharToMultiByte(CP_ACP, 0, text.c_str(), -1, local.data(), bytes, nullptr, nullptr);
+    lstrcpynA(output, local.c_str(), static_cast<int>(std::min<size_t>(capacity, INT_MAX)));
+}
+
+bool supplyMetadata(LPARAM command, WPARAM data) {
+    if (data <= 1) return false;
+    if (command == IPC_HOOK_TITLESW || command == IPC_HOOK_TITLES) {
+        if (command == IPC_HOOK_TITLESW) {
+            auto& info = *reinterpret_cast<waHookTitleStructW*>(data);
+            auto track = hostTrack(info.filename);
+            if (!track.key) return false;
+            copyMetadata(info.title, 2048, playlistTitle(track));
+            info.length = track.duration ? track.duration : -1;
+        } else {
+            auto& info = *reinterpret_cast<waHookTitleStruct*>(data);
+            auto track = hostTrack(info.filename ? wide(info.filename).c_str() : nullptr);
+            if (!track.key) return false;
+            copyMetadata(info.title, 2048, playlistTitle(track));
+            info.length = track.duration ? track.duration : -1;
+        }
+        return true;
+    }
+    if (command == IPC_GET_BASIC_FILE_INFOW) {
+        auto& info = *reinterpret_cast<basicFileInfoStructW*>(data);
+        auto track = hostTrack(info.filename);
+        if (!track.key) return false;
+        if (info.titlelen > 0) copyMetadata(info.title, info.titlelen, playlistTitle(track));
+        info.length = track.duration ? track.duration : -1;
+        return true;
+    }
+    if (command == IPC_GET_EXTENDED_FILE_INFOW || command == IPC_GET_EXTENDED_FILE_INFOW_HOOKABLE) {
+        const auto& info = *reinterpret_cast<const extendedFileInfoStructW*>(data);
+        auto track = hostTrack(info.filename);
+        if (track.key) {
+            if (auto value = metadata(track, info.metadata)) {
+                copyMetadata(info.ret, info.retlen, *value);
+                return true;
+            }
+        }
+    }
+    if (command == IPC_GET_EXTENDED_FILE_INFO || command == IPC_GET_EXTENDED_FILE_INFO_HOOKABLE) {
+        const auto& info = *reinterpret_cast<const extendedFileInfoStruct*>(data);
+        auto track = hostTrack(info.filename ? wide(info.filename).c_str() : nullptr);
+        if (track.key) {
+            auto field = info.metadata ? wide(info.metadata) : std::wstring{};
+            if (auto value = metadata(track, field.c_str())) {
+                copyMetadata(info.ret, info.retlen, *value);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 LRESULT CALLBACK playerProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+    if (app && msg == WM_WA_IPC) {
+        try { if (supplyMetadata(l, w)) return TRUE; } catch (const std::exception&) {}
+    }
+    if (app && msg == ArtworkLoader::trackReadyMessage) {
+        try {
+            auto key = static_cast<Id>((std::uint64_t(static_cast<DWORD>(l)) << 32) | static_cast<DWORD>(w));
+            auto index = static_cast<int>(player(IPC_GETLISTPOS));
+            auto filename = index < 0 ? nullptr :
+                reinterpret_cast<const wchar_t*>(player(IPC_GETPLAYLISTFILEW, index));
+            if (reinterpret_cast<UINT_PTR>(filename) > 1 && app->playback.key(filename) == key) {
+                std::wstring current = filename;
+                player(IPC_FILE_TAG_MAY_HAVE_UPDATEDW, reinterpret_cast<WPARAM>(current.c_str()));
+            }
+        } catch (const std::exception&) {}
+        return 0;
+    }
     if (app && ((msg == WM_TIMER && w == playbackTimer) ||
                 (msg == WM_WA_IPC && l == IPC_PLAYING_FILEW && w > 1))) {
         try {
@@ -512,6 +667,48 @@ void configure(HWND hwnd, const Server& profile = {}) {
     }
 }
 
+INT_PTR CALLBACK lyricsProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_COMMAND && (LOWORD(w) == IDCANCEL || LOWORD(w) == IDOK)) {
+        EndDialog(hwnd, 0);
+        return TRUE;
+    }
+    if (msg != WM_INITDIALOG && msg != WM_TIMER) return FALSE;
+    if (!app) return FALSE;
+    try {
+        if (msg == WM_INITDIALOG) {
+            SetWindowLongPtrW(hwnd, DWLP_USER, l);
+            skinWindow(hwnd, SKINNEDWND_TYPE_DIALOG);
+            skinWindow(GetDlgItem(hwnd, IDC_LYRIC_TEXT), SKINNEDWND_TYPE_EDIT);
+            skinWindow(GetDlgItem(hwnd, IDCANCEL), SKINNEDWND_TYPE_BUTTON);
+            auto icon = LoadImageW(plugin.hDllInstance, MAKEINTRESOURCEW(IDI_TANGERINE),
+                                   IMAGE_ICON, 16, 16, LR_SHARED);
+            if (icon) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon));
+            SetTimer(hwnd, viewTimer, 250, nullptr);
+        }
+        const auto& track = *reinterpret_cast<const Track*>(GetWindowLongPtrW(hwnd, DWLP_USER));
+        if (msg == WM_INITDIALOG) SetWindowTextW(hwnd, (L"Lyrics – " + wide(playlistTitle(track))).c_str());
+        auto lyrics = app->store.lyrics(track.key, app->store.networkAvailable(track.server));
+        if (lyrics) {
+            KillTimer(hwnd, viewTimer);
+            SetDlgItemTextW(hwnd, IDC_LYRIC_TEXT,
+                            lyrics->plain.empty() ? L"No lyrics found." : wide(lyrics->plain).c_str());
+        } else if (!app->store.networkAvailable(track.server)) {
+            KillTimer(hwnd, viewTimer);
+            SetDlgItemTextW(hwnd, IDC_LYRIC_TEXT, L"Lyrics are unavailable offline.");
+        } else if (msg == WM_INITDIALOG) {
+            SetDlgItemTextW(hwnd, IDC_LYRIC_TEXT, L"Loading lyrics...");
+            app->artwork.requestTrack(track.key, true);
+        } else if (!app->artwork.trackPending(track.key)) {
+            KillTimer(hwnd, viewTimer);
+            SetDlgItemTextW(hwnd, IDC_LYRIC_TEXT, L"Lyrics are unavailable.");
+        }
+    } catch (const std::exception& error) {
+        KillTimer(hwnd, viewTimer);
+        SetDlgItemTextW(hwnd, IDC_LYRIC_TEXT, wide(error.what()).c_str());
+    }
+    return TRUE;
+}
+
 class View {
 public:
     View(HWND window, BrowseKind category)
@@ -534,13 +731,14 @@ public:
         for (int id : {IDC_LOCATION, IDC_STATUS})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_STATIC);
         for (int id : {IDC_ADD_SERVER, IDC_SETTINGS, IDC_BACK, IDC_SEARCH, IDC_TEXT_LIST,
-                       IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_KEEP_OFFLINE, IDC_UNPIN})
+                       IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_KEEP_OFFLINE, IDC_UNPIN, IDC_OFFLINE, IDC_LYRICS})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_BUTTON);
         ListView_SetTextBkColor(list, CLR_NONE);
         tileSize = std::clamp(MulDiv(128, GetDpiForWindow(hwnd), 96), 96, 256);
         SetTimer(hwnd, viewTimer, 2000, nullptr);
         SendDlgItemMessageW(hwnd, IDC_QUERY, EM_SETLIMITTEXT, 256, 0);
         CheckDlgButton(hwnd, IDC_TEXT_LIST, app->store.textCatalog() ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hwnd, IDC_OFFLINE, app->store.offlineMode() ? BST_CHECKED : BST_UNCHECKED);
     }
     ~View() {
         KillTimer(hwnd, viewTimer);
@@ -571,6 +769,7 @@ private:
         int nextOffset;
         int focused;
         bool more;
+        bool cached;
     };
     struct ImageSlot {
         int row;
@@ -588,6 +787,7 @@ private:
     std::set<Id> knownTracks;
     int nextOffset = 0;
     bool loading = false, more = false, morePosted = false;
+    bool cached = false;
     std::string message;
     LRESULT legacySkin = 0;
     Id currentServer = 0;
@@ -651,6 +851,7 @@ void View::resetLocation() {
 void View::resetContent() {
     app->cancelSearch(hwnd);
     loading = more = morePosted = false;
+    cached = false;
     nextOffset = 0;
     message.clear();
     ListView_SetItemCount(list, 0);
@@ -680,7 +881,7 @@ void View::fetchMore() {
     loading = true;
     updateButtons();
     updateStatus();
-    app->search(hwnd, currentServer, location, query, nextOffset);
+    app->search(hwnd, currentServer, location, query, nextOffset, cached);
 }
 
 void View::scheduleMore() {
@@ -696,7 +897,9 @@ void View::updateRowCount() {
 }
 
 void View::receive(SearchResult result) {
+    if (result.restart) resetContent();
     loading = false;
+    cached = result.cached;
     message = std::move(result.error);
     if (!message.empty()) {
         more = false;
@@ -722,6 +925,11 @@ void View::receive(SearchResult result) {
 }
 
 void View::refresh() {
+    if (cached && !loading && currentServer && location.kind != BrowseKind::offline &&
+        !localLocation(location) && app->store.networkAvailable(currentServer)) {
+        startSearch();
+        return;
+    }
     const int first = std::max(0, ListView_GetTopIndex(list));
     const int last = std::min(static_cast<int>(tracks.size()), first + ListView_GetCountPerPage(list) + 1);
     for (int i = first; i < last; ++i) {
@@ -876,7 +1084,7 @@ void View::changePresentation() {
     SetDlgItemTextW(hwnd, IDC_LOCATION, breadcrumb.c_str());
     SendDlgItemMessageW(hwnd, IDC_QUERY, EM_SETCUEBANNER, FALSE,
         reinterpret_cast<LPARAM>(showTracks() ? L"Search tracks" : L"Search this view"));
-    for (int id : {IDC_PLAY, IDC_ENQUEUE, IDC_KEEP_OFFLINE, IDC_UNPIN})
+    for (int id : {IDC_PLAY, IDC_ENQUEUE, IDC_KEEP_OFFLINE, IDC_UNPIN, IDC_LYRICS})
         ShowWindow(GetDlgItem(hwnd, id), showTracks() ? SW_SHOWNA : SW_HIDE);
     ShowWindow(GetDlgItem(hwnd, IDC_OPEN), showTracks() ? SW_HIDE : SW_SHOWNA);
     ShowWindow(GetDlgItem(hwnd, IDC_TEXT_LIST), showTracks() ? SW_HIDE : SW_SHOWNA);
@@ -902,7 +1110,7 @@ void View::activate(int index) {
         return;
     }
     auto target = items[index].target;
-    history.push_back({location, query, std::move(items), nextOffset, index, more});
+    history.push_back({location, query, std::move(items), nextOffset, index, more, cached});
     location = std::move(target);
     SetDlgItemTextW(hwnd, IDC_QUERY, L"");
     startSearch();
@@ -917,9 +1125,16 @@ void View::back() {
     query = std::move(outer.query);
     SetDlgItemTextW(hwnd, IDC_QUERY, wide(query).c_str());
     resetContent();
+    const bool useCache = currentServer && (localLocation(location) || !app->store.networkAvailable(currentServer));
+    if (useCache != outer.cached) {
+        startSearch();
+        SetFocus(list);
+        return;
+    }
     items = std::move(outer.items);
     nextOffset = outer.nextOffset;
     more = outer.more;
+    cached = outer.cached;
     for (const auto& item : items) knownItems.emplace(item.target.kind, item.target.id);
     updateRowCount();
     if (outer.focused >= 0 && outer.focused < rowCount()) {
@@ -945,6 +1160,9 @@ void View::updateStatus() {
         auto error = app->maintenanceError(server->id);
         if (!error.empty()) status += L"  |  " + wide(error);
     }
+    const bool manualOffline = app->store.offlineMode();
+    if (server && (manualOffline || (cached && location.kind != BrowseKind::offline && !localLocation(location))))
+        status = (manualOffline ? L"Offline  |  " : L"Server offline  |  ") + status;
     SetDlgItemTextW(hwnd, IDC_STATUS, status.c_str());
 }
 
@@ -955,6 +1173,7 @@ void View::updateButtons() {
         EnableWindow(GetDlgItem(hwnd, id), haveServer);
     for (int id : {IDC_PLAY, IDC_ENQUEUE, IDC_KEEP_OFFLINE, IDC_UNPIN})
         EnableWindow(GetDlgItem(hwnd, id), haveRows);
+    EnableWindow(GetDlgItem(hwnd, IDC_LYRICS), ListView_GetSelectedCount(list) == 1);
     EnableWindow(GetDlgItem(hwnd, IDC_OPEN), haveRows);
 }
 
@@ -970,11 +1189,23 @@ std::vector<Track> View::selection() {
 void View::play(bool enqueue) {
     auto items = selection();
     if (items.empty()) return;
+    if (!app->store.networkAvailable(currentServer)) {
+        items.erase(std::remove_if(items.begin(), items.end(),
+            [](const Track& track) { return app->store.track(track.key).bytes <= 0; }), items.end());
+        if (items.empty()) {
+            message = "No selected tracks are downloaded.";
+            updateStatus();
+            return;
+        }
+    }
+    message.clear();
+    updateStatus();
     if (!enqueue) player(IPC_DELETE);
     for (const auto& track : items) {
         auto url = app->playback.url(track);
-        auto title = wide(track.artist.empty() ? track.title : track.artist + " - " + track.title);
+        auto title = wide(playlistTitle(track));
         enqueueFileWithMetaStructW item{url.c_str(), title.c_str(), track.duration ? track.duration : -1};
+        app->artwork.requestTrack(track.key);
         player(IPC_ENQUEUEFILEW, reinterpret_cast<WPARAM>(&item));
     }
     if (!enqueue) player(IPC_STARTPLAY);
@@ -994,6 +1225,11 @@ void View::command(int id, int notification) {
     case IDC_SETTINGS: if (auto server = selected()) configure(hwnd, *server); break;
     case IDC_SERVERS: if (notification == CBN_SELCHANGE) resetLocation(); break;
     case IDC_SEARCH: startSearch(); break;
+    case IDC_OFFLINE:
+        app->store.setOfflineMode(IsDlgButtonChecked(hwnd, IDC_OFFLINE) == BST_CHECKED);
+        app->wakeMaintenance(true);
+        startSearch();
+        break;
     case IDC_BACK: back(); break;
     case IDC_OPEN: activate(ListView_GetNextItem(list, -1, LVNI_SELECTED)); break;
     case IDC_TEXT_LIST:
@@ -1004,6 +1240,13 @@ void View::command(int id, int notification) {
     case IDC_ENQUEUE: play(true); break;
     case IDC_KEEP_OFFLINE: cache(true); break;
     case IDC_UNPIN: cache(false); break;
+    case IDC_LYRICS: {
+        auto selectedTracks = selection();
+        if (selectedTracks.size() == 1)
+            DialogBoxParamW(plugin.hDllInstance, MAKEINTRESOURCEW(IDD_LYRICS), hwnd, lyricsProc,
+                            reinterpret_cast<LPARAM>(&selectedTracks.front()));
+        break;
+    }
     }
 }
 
@@ -1021,11 +1264,12 @@ void View::layout(int width, int height) {
     move(IDC_ADD_SERVER, w - x(154), y(4), x(72), y(15));
     move(IDC_SETTINGS, w - x(78), y(4), x(74), y(15));
     const int queryLeft = history.empty() ? 4 : 48;
-    const int searchRight = showTracks() ? 57 : 129;
+    const int searchRight = showTracks() ? 112 : 182;
     move(IDC_BACK, x(4), y(23), x(40), y(15));
     move(IDC_QUERY, x(queryLeft), y(23), w - x(queryLeft + searchRight + 4), y(15));
     move(IDC_SEARCH, w - x(searchRight), y(23), x(52), y(15));
-    move(IDC_TEXT_LIST, w - x(73), y(23), x(69), y(15));
+    move(IDC_TEXT_LIST, w - x(126), y(23), x(66), y(15));
+    move(IDC_OFFLINE, w - x(57), y(23), x(53), y(15));
     move(IDC_LOCATION, x(4), y(42), w - x(8), y(12));
     move(IDC_TRACKS, x(4), y(55), w - x(8), h - y(96));
     move(IDC_OPEN, x(4), h - y(37), x(36), y(15));
@@ -1033,6 +1277,7 @@ void View::layout(int width, int height) {
     move(IDC_ENQUEUE, x(44), h - y(37), x(49), y(15));
     move(IDC_KEEP_OFFLINE, x(97), h - y(37), x(60), y(15));
     move(IDC_UNPIN, x(161), h - y(37), x(39), y(15));
+    move(IDC_LYRICS, x(204), h - y(37), x(50), y(15));
     move(IDC_STATUS, x(4), h - y(18), w - x(8), y(14));
     resizeColumns();
 }
