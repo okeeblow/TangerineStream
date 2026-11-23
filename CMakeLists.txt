@@ -82,6 +82,8 @@ function(add_wacup_plugin target)
     endif()
 endfunction()
 
+set_property(SOURCE src/input.rc src/plugin.rc APPEND PROPERTY OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tangerine.ico")
 add_wacup_plugin(in_tangerinestream src/input.cpp src/input.rc)
 target_compile_definitions(in_tangerinestream PRIVATE UNICODE_INPUT_PLUGIN)
 target_link_libraries(in_tangerinestream PRIVATE user32)
