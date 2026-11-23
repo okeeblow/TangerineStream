@@ -1,5 +1,6 @@
 #include "playback.hpp"
 #include "artwork.hpp"
+#include "browse_sort.hpp"
 #include "host_metadata.hpp"
 #include "resources.h"
 #include "input_bridge.hpp"
@@ -474,8 +475,8 @@ void App::finishAlbums() {
 }
 
 void App::browse() {
-    Server current;
-    std::unique_ptr<ServerApi> api;
+    struct Session { Server profile; std::unique_ptr<ServerApi> api; };
+    std::map<Id, Session> sessions;
     for (;;) {
         Search search;
         {
@@ -493,15 +494,16 @@ void App::browse() {
             if (!ready.cached) {
                 try {
                     auto profile = store.server(search.server);
-                    if (!api || profile.id != current.id || profile.native != current.native ||
-                        profile.password != current.password) {
-                        api = connect(profile);
-                        current = std::move(profile);
+                    auto& session = sessions[profile.id];
+                    if (!session.api || profile.native != session.profile.native ||
+                        profile.password != session.profile.password) {
+                        session.api = connect(profile);
+                        session.profile = std::move(profile);
                     }
                     const bool filterPlaylist = search.location.kind == BrowseKind::playlistTracks &&
                         !search.query.empty();
                     const auto remoteQuery = filterPlaylist ? std::string{} : search.query;
-                    ready.page = api->browse(search.location, remoteQuery, search.offset);
+                    ready.page = session.api->browse(search.location, remoteQuery, search.offset);
                     store.rememberPage(search.server, search.location, remoteQuery.empty(), search.offset, ready.page);
                     if (filterPlaylist) {
                         auto filter = wide(search.query);
@@ -513,7 +515,7 @@ void App::browse() {
                     }
                 } catch (const ConnectionError&) {
                     store.connectionFailed(search.server);
-                    api.reset();
+                    sessions.erase(search.server);
                     ready.cached = true;
                 }
             }
@@ -791,6 +793,8 @@ bool supplyMetadata(LPARAM command, WPARAM data) {
 void refreshNavigation();
 void selectCategory(BrowseKind category, Id server);
 constexpr UINT allServersCommand = 2000;
+constexpr int sortCommand = 1500;
+constexpr int directionCommand = 1499;
 
 LRESULT CALLBACK playerProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
     if (app && msg && msg == app->navigationChanged) {
@@ -1115,6 +1119,7 @@ private:
         std::vector<Source> sources;
         size_t nextSource;
         int focused;
+        std::string order;
     };
     struct ImageSlot {
         int row;
@@ -1125,6 +1130,11 @@ private:
     BrowseLocation location;
     std::vector<BrowseLocation> draggedAlbums;
     std::string query;
+    SortChoice order = defaultSort(BrowseKind::albums);
+    bool descending = false;
+    std::string savedOrder() const { return std::string(descending ? "-" : "+") + order.key; }
+    void applyOrder();
+    void chooseOrder(SortChoice choice, bool reverse);
     std::vector<History> history;
     std::vector<Server> servers;
     std::vector<LibraryItem> items;
@@ -1220,6 +1230,16 @@ void View::resetContent() {
     knownItems.clear();
     knownTracks.clear();
     resetImages();
+    order = defaultSort(location.kind);
+    descending = order.descending;
+    auto saved = app->store.browseOrder(location.kind);
+    for (const auto& choice : sortChoices(location.kind)) {
+        if (!saved.empty() && saved.compare(1, saved.npos, choice.key) == 0) {
+            order = choice;
+            descending = saved.front() == '-';
+            break;
+        }
+    }
     const Id scope = location.server ? location.server : (treeServer ? treeServer : app->filterServer);
     if (scope) currentServer = scope;
     else if (!servers.empty()) currentServer = servers.front().id;
@@ -1288,9 +1308,55 @@ void View::receive(SearchResult result) {
         const auto i = (nextSource + step) % sources.size();
         if (sources[i].more) { nextSource = i; more = true; break; }
     }
-    updateRowCount();
-    if (!oldCount) prefetchTrack(0);
+    // A single live album list already comes from the server in alphabetical order.
+    // Other global orders need every source page before exposing their row indices.
+    const bool streamOrder = std::string_view(order.key) == "sequence" ||
+        (sources.size() == 1 && !source.cached && location.kind == BrowseKind::albums &&
+         query.empty() && std::string_view(order.key) == "name" && !descending);
+    if (!streamOrder && more) {
+        updateStatus();
+        scheduleMore();
+        return;
+    }
+    if (!streamOrder) applyOrder();
+    else updateRowCount();
+    if (!oldCount || !streamOrder) prefetchTrack(0);
     if (emptyPage || rowCount() < 12 || (more && sources[nextSource].offset == 0)) scheduleMore();
+}
+
+void View::chooseOrder(SortChoice choice, bool reverse) {
+    const auto previous = savedOrder();
+    order = choice;
+    descending = reverse;
+    if (previous == savedOrder() && std::string_view(order.key) != "random") return;
+    app->store.saveBrowseOrder(location.kind, savedOrder());
+    if (loading || more || std::string_view(order.key) == "sequence") startSearch();
+    else applyOrder();
+}
+
+void View::applyOrder() {
+    const int displayed = ListView_GetItemCount(list);
+    const int focused = ListView_GetNextItem(list, -1, LVNI_FOCUSED);
+    std::set<int> selectedRows;
+    for (int row = ListView_GetNextItem(list, -1, LVNI_SELECTED); row >= 0;
+         row = ListView_GetNextItem(list, row, LVNI_SELECTED)) selectedRows.insert(row);
+    const auto indices = showTracks() ? sortRows(tracks, order, descending) : sortRows(items, order, descending);
+    if (displayed && !indices.empty()) {
+        ListView_SetItemState(list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+        resetImages();
+    }
+    changePresentation();
+    updateRowCount();
+    if (displayed) {
+        for (size_t row = 0; row < indices.size(); ++row) {
+            const int old = static_cast<int>(indices[row]);
+            const auto state = (old == focused ? LVIS_FOCUSED : 0) |
+                               (selectedRows.count(old) ? LVIS_SELECTED : 0);
+            if (state) ListView_SetItemState(list, static_cast<int>(row), state, state);
+            if (old == focused) ListView_EnsureVisible(list, static_cast<int>(row), FALSE);
+        }
+        updateSelection();
+    }
 }
 
 void View::refresh() {
@@ -1413,6 +1479,7 @@ void View::receiveArtwork() {
 }
 
 void View::changePresentation() {
+    SetDlgItemTextW(hwnd, IDC_VIEW_MENU, order.label);
     const Id filter = treeServer ? treeServer : app->filterServer;
     const auto source = std::find_if(servers.begin(), servers.end(),
         [filter](const Server& profile) { return profile.id == filter; });
@@ -1498,7 +1565,7 @@ void View::activate(int index) {
         return;
     }
     auto target = items[index].target;
-    history.push_back({location, query, std::move(items), std::move(sources), nextSource, index});
+    history.push_back({location, query, std::move(items), std::move(sources), nextSource, index, savedOrder()});
     location = std::move(target);
     SetDlgItemTextW(hwnd, IDC_QUERY, L"");
     startSearch();
@@ -1514,6 +1581,7 @@ void View::back() {
     SetDlgItemTextW(hwnd, IDC_QUERY, wide(query).c_str());
     KillTimer(hwnd, searchTimer);
     resetContent();
+    if (savedOrder() != outer.order) { startSearch(); return; }
     for (const auto& source : outer.sources) {
         const bool useCache = location.kind == BrowseKind::offline || localLocation(location) ||
                               !app->store.networkAvailable(source.server);
@@ -1583,7 +1651,8 @@ void View::updateStatus() {
     auto server = selected();
     std::wstring status;
     if (!server) status = L"Add a Navidrome or OpenSubsonic server to get started.";
-    else if (loading && rowCount() == 0) status = L"Loading...";
+    else if ((loading || more) && !ListView_GetItemCount(list))
+        status = rowCount() ? L"Loading... " + std::to_wstring(rowCount()) : L"Loading...";
     else if (!message.empty()) status = wide(message);
     else if (!app->reportError.empty()) status = wide(app->reportError);
     else {
@@ -1725,6 +1794,14 @@ void View::popup(int button) {
         AppendMenuW(menu, MF_STRING, IDC_KEEP_OFFLINE, L"Keep offline");
         AppendMenuW(menu, MF_STRING, IDC_UNPIN, L"Unpin");
     } else if (button == IDC_VIEW_MENU) {
+        const auto& choices = sortChoices(location.kind);
+        for (size_t i = 0; i < choices.size(); ++i) {
+            const bool active = std::string_view(choices[i].key) == order.key;
+            AppendMenuW(menu, MF_STRING | (active ? MF_CHECKED : 0), sortCommand + i, choices[i].label);
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        if (std::string_view(order.key) != "sequence" && std::string_view(order.key) != "random")
+            AppendMenuW(menu, MF_STRING | (descending ? MF_CHECKED : 0), directionCommand, L"Descending");
         if (!showTracks()) {
             AppendMenuW(menu, MF_STRING | (textList ? MF_CHECKED : 0), IDC_TEXT_LIST, L"Text list");
         }
@@ -1762,7 +1839,14 @@ void View::command(int id, int notification) {
         if (index <= servers.size()) selectCategory(category, index ? servers[index - 1].id : 0);
         return;
     }
+    const auto& choices = sortChoices(location.kind);
+    if (id >= sortCommand && static_cast<size_t>(id - sortCommand) < choices.size()) {
+        const auto& choice = choices[id - sortCommand];
+        chooseOrder(choice, choice.descending);
+        return;
+    }
     switch (id) {
+    case directionCommand: chooseOrder(order, !descending); break;
     case IDC_ADD_SERVER: configure(hwnd, currentServer, true); break;
     case IDC_VIEW_MENU: case IDC_SOURCE_MENU: case IDC_CACHE_MENU: popup(id); break;
     case IDC_QUERY:

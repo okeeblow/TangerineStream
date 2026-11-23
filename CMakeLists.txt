@@ -89,7 +89,7 @@ target_compile_definitions(in_tangerinestream PRIVATE UNICODE_INPUT_PLUGIN)
 target_link_libraries(in_tangerinestream PRIVATE user32)
 
 add_wacup_plugin(ml_tangerinestream
-    src/plugin.cpp src/server.cpp src/store.cpp src/playback.cpp src/artwork.cpp
+    src/plugin.cpp src/server.cpp src/store.cpp src/playback.cpp src/artwork.cpp src/browse_sort.cpp
     src/host_metadata.cpp src/plugin.rc)
 target_compile_definitions(ml_tangerinestream PRIVATE _WIN32_WINNT=0x0A00)
 # The 5.666 package omits the Wasabi art and metadata service headers.
