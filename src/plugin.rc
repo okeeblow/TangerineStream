@@ -64,7 +64,7 @@ BEGIN
     EDITTEXT IDC_USERNAME, 204, 47, 205, 15, ES_AUTOHSCROLL
     LTEXT "Password", -1, 124, 70, 80, 12
     EDITTEXT IDC_PASSWORD, 204, 67, 205, 15, ES_PASSWORD | ES_AUTOHSCROLL
-    CONTROL "Use Navidrome's native song browser", IDC_NATIVE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 124, 92, 285, 13
+    CONTROL "Use Navidrome's native library browser", IDC_NATIVE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 124, 92, 285, 13
     CONTROL "Automatically keep server favorites offline", IDC_FAVORITES, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 124, 109, 285, 13
     LTEXT "Rolling cache across all servers (MiB)", -1, 124, 148, 177, 12
     EDITTEXT IDC_BUDGET, 304, 145, 65, 15, ES_NUMBER | ES_AUTOHSCROLL

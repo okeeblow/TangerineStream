@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -22,6 +23,10 @@ struct Server {
     bool cacheFavorites = false;
 };
 
+using SortTags = std::map<std::string, std::string, std::less<>>;
+std::string encodeSortTags(const SortTags& tags);
+SortTags decodeSortTags(const std::string& text);
+
 struct Track {
     Id key = 0;
     Id server = 0;
@@ -37,6 +42,7 @@ struct Track {
     std::int64_t bytes = 0;
     std::string coverId, albumId, artistId, albumArtistId, albumArtist, genre;
     int discNumber = 0, trackNumber = 0, year = 0;
+    SortTags sortTags{};
 };
 
 // These values are also stored in the catalog database.
@@ -62,6 +68,7 @@ struct LibraryItem {
     std::string coverId;
     int songCount = -1;
     std::int64_t duration = 0;
+    SortTags sortTags{};
 };
 
 struct BrowsePage {

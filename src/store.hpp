@@ -28,6 +28,8 @@ public:
     int playbackPort();
     bool textCatalog();
     void saveTextCatalog(bool text);
+    std::string browseOrder(BrowseKind kind);
+    void saveBrowseOrder(BrowseKind kind, const std::string& value);
     bool offlineMode();
     void setOfflineMode(bool offline);
     bool networkAvailable(Id server);

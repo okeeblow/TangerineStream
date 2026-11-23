@@ -299,6 +299,58 @@ bool usableId(const std::string& id) {
     return !id.empty() && id.size() <= 512 && id.front() != '\x1f' && id.find('\0') == std::string::npos;
 }
 
+SortTags sortTags(const Json& node) {
+    SortTags tags;
+    auto value = [](const Json& v) -> std::string {
+        if (const auto* number = std::get_if<double>(&v.value)) {
+            if (*number >= 0 && *number <= INT_MAX) return std::to_string(static_cast<int>(*number));
+        }
+        if (const auto* flag = std::get_if<bool>(&v.value)) return *flag ? "1" : "0";
+        return v.string();
+    };
+    auto field = [&](const char* key, std::initializer_list<const char*> aliases) {
+        for (auto alias : aliases) {
+            auto text = value(node.at(alias));
+            if (!text.empty()) { tags.emplace(key, std::move(text)); return; }
+        }
+    };
+    field("created", {"importedAt", "created", "createdAt"});
+    field("played", {"played", "playDate"});
+    field("starred", {"starredAt", "starred"});
+    if (tags.count("starred") && tags.at("starred") == "0") tags.erase("starred");
+    field("rating", {"userRating", "rating"});
+    field("playCount", {"playCount"});
+    field("albumCount", {"albumCount"});
+    field("channels", {"channelCount", "channels"});
+    field("bpm", {"bpm"});
+    field("comment", {"comment"});
+    field("owner", {"owner", "ownerName"});
+    field("public", {"public"});
+    field("updated", {"changed", "updatedAt"});
+    field("sortName", {"sortName", "sortTitle", "orderTitle"});
+    field("album", {"album"});
+    field("artist", {"artist"});
+    field("albumArtist", {"albumArtist"});
+    field("genre", {"genre"});
+    field("year", {"year", "maxYear"});
+    field("releaseYear", {"releaseYear"});
+    if (!tags.count("releaseYear")) {
+        auto year = value(node.at("releaseDate").at("year"));
+        if (!year.empty()) tags.emplace("releaseYear", year);
+    }
+    for (const auto& credit : {std::pair{"artist", "artists"}, std::pair{"albumArtist", "albumArtists"}}) {
+        std::string names;
+        for (const auto& artist : node.at(credit.second).array()) {
+            const auto name = artist.at("name").string();
+            if (name.empty()) continue;
+            if (!names.empty()) names += ", ";
+            names += name;
+        }
+        if (!names.empty()) tags.insert_or_assign(credit.first, std::move(names));
+    }
+    return tags;
+}
+
 void appendTrack(std::vector<Track>& result, Id server, const Json& item) {
     auto id = item.at("id").string();
     if (!usableId(id)) return;
@@ -327,6 +379,7 @@ void appendTrack(std::vector<Track>& result, Id server, const Json& item) {
     track.trackNumber = item.at("track").seconds();
     if (!track.trackNumber) track.trackNumber = item.at("trackNumber").seconds();
     track.year = item.at("year").seconds();
+    track.sortTags = sortTags(item);
     result.push_back(std::move(track));
 }
 
@@ -364,7 +417,7 @@ void appendItems(std::vector<LibraryItem>& result, const Json& items, BrowseKind
         result.push_back({{kind, std::move(id), std::move(name)}, std::move(subtitle),
                           node.at("coverArt").string(), kind == BrowseKind::song ? 1 :
                           (std::holds_alternative<double>(count.value) ? count.seconds() : -1),
-                          node.at("duration").seconds()});
+                          node.at("duration").seconds(), sortTags(node)});
     }
 }
 
@@ -621,7 +674,7 @@ private:
             auto kind = isDirectory && *isDirectory ? BrowseKind::directory : BrowseKind::song;
             result.push_back({{kind, std::move(id), std::move(title)}, std::move(artist),
                               node.at("coverArt").string(), kind == BrowseKind::song ? 1 : -1,
-                              node.at("duration").seconds()});
+                              node.at("duration").seconds(), sortTags(node)});
         }
     }
 
@@ -713,11 +766,51 @@ private:
 class Navidrome final : public Subsonic {
 public:
     using Subsonic::Subsonic;
+
+    BrowsePage browse(const BrowseLocation& location, const std::string& query, int offset) override {
+        const char* endpoint = nullptr;
+        const char* artPrefix = nullptr;
+        BrowseKind target;
+        Parameters filters;
+        switch (location.kind) {
+        case BrowseKind::albums:
+            endpoint = "album"; target = BrowseKind::albumTracks; artPrefix = "al-"; break;
+        case BrowseKind::albumArtists:
+        case BrowseKind::artists:
+            endpoint = "artist"; target = BrowseKind::artistAlbums; artPrefix = "ar-";
+            if (location.kind == BrowseKind::albumArtists) filters.emplace_back("role", "albumartist");
+            break;
+        case BrowseKind::playlists:
+            endpoint = "playlist"; target = BrowseKind::playlistTracks; artPrefix = "pl-"; break;
+        default:
+            return Subsonic::browse(location, query, offset);
+        }
+        if (!query.empty()) filters.emplace_back(location.kind == BrowseKind::playlists ? "q" : "name", query);
+        auto nodes = list(endpoint, offset, "name", std::move(filters));
+        BrowsePage page;
+        page.more = nodes.array().size() == pageSize;
+        appendItems(page.items, nodes, target);
+        for (auto& item : page.items)
+            if (item.coverId.empty()) item.coverId = artPrefix + item.target.id;
+        return page;
+    }
+
     std::vector<Track> songs(const std::string& query, int offset) override {
-        Parameters parameters{{"_start", std::to_string(offset)}, {"_end", std::to_string(offset + pageSize)},
-            {"_sort", "title"}, {"_order", "ASC"}};
+        Parameters parameters;
         if (!query.empty()) parameters.emplace_back("title", query);
-        auto url = server_.url + "/api/song" + queryString(parameters);
+        auto items = list("song", offset, "title", std::move(parameters));
+        std::vector<Track> result;
+        appendTracks(result, server_.id, items);
+        return result;
+    }
+
+private:
+    std::string token_;
+
+    Json list(const char* endpoint, int offset, const char* order, Parameters parameters) {
+        parameters.insert(parameters.end(), {{"_start", std::to_string(offset)},
+            {"_end", std::to_string(offset + pageSize)}, {"_sort", order}, {"_order", "ASC"}});
+        auto url = server_.url + "/api/" + endpoint + queryString(parameters);
         auto response = authorizedGet(url);
         if (response->status == 401) {
             token_.clear();
@@ -727,14 +820,9 @@ public:
         if (validToken(renewed)) token_ = std::move(renewed);
         auto items = readJson(*response);
         if (!std::holds_alternative<Json::Array>(items.value))
-            throw Error("Navidrome returned an unexpected song list.");
-        std::vector<Track> result;
-        appendTracks(result, server_.id, items);
-        return result;
+            throw Error("Navidrome returned an unexpected library response.");
+        return items;
     }
-
-private:
-    std::string token_;
 
     static bool validToken(const std::string& token) {
         return !token.empty() && token.find_first_not_of(
@@ -758,6 +846,25 @@ private:
 };
 
 } // namespace
+
+std::string encodeSortTags(const SortTags& tags) {
+    if (tags.empty()) return {};
+    std::string text = "{";
+    for (const auto& [key, value] : tags) {
+        if (text.size() > 1) text += ',';
+        text += jsonString(key) + ":" + jsonString(value);
+    }
+    return text + "}";
+}
+
+SortTags decodeSortTags(const std::string& text) {
+    if (text.empty()) return {};
+    auto parsed = JsonParser(text).parse();
+    SortTags tags;
+    if (auto object = std::get_if<Json::Object>(&parsed.value))
+        for (const auto& [key, value] : *object) tags.emplace(key, value.string());
+    return tags;
+}
 
 bool matches(const std::string& value, const std::wstring& query) {
     if (query.empty()) return true;
