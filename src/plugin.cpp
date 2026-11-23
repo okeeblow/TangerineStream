@@ -871,6 +871,26 @@ void configure(HWND hwnd, const Server& profile = {}) {
     }
 }
 
+constexpr wchar_t listSkinProc[] = L"Tangerine Stream.ListSkinProc";
+
+LRESULT CALLBACK libraryListProc(HWND list, UINT msg, WPARAM w, LPARAM l) {
+    auto skinProc = reinterpret_cast<WNDPROC>(GetPropW(list, listSkinProc));
+    if (msg == WM_LBUTTONDOWN) {
+        LVHITTESTINFO hit{};
+        hit.pt = {static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l))};
+        if (ListView_HitTest(list, &hit) < 0) {
+            // The skin consumes empty-space clicks. Let SysListView32 track its own marquee.
+            auto nativeProc = reinterpret_cast<WNDPROC>(GetClassLongPtrW(list, GCLP_WNDPROC));
+            return CallWindowProcW(nativeProc, list, msg, w, l);
+        }
+    } else if (msg == WM_NCDESTROY) {
+        if (reinterpret_cast<WNDPROC>(GetWindowLongPtrW(list, GWLP_WNDPROC)) == libraryListProc)
+            SetWindowLongPtrW(list, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(skinProc));
+        RemovePropW(list, listSkinProc);
+    }
+    return CallWindowProcW(skinProc, list, msg, w, l);
+}
+
 class View {
 public:
     View(HWND window, BrowseKind category)
@@ -885,15 +905,19 @@ public:
         ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_HEADERINALLVIEWS);
         ListView_SetUnicodeFormat(list, TRUE);
         skinWindow(hwnd, SKINNEDWND_TYPE_DIALOG);
-        if (!skinWindow(list, SKINNEDWND_TYPE_LISTVIEW, SWLVS_DOUBLEBUFFER)) {
+        if (!skinWindow(list, SKINNEDWND_TYPE_LISTVIEW, SWLVS_DOUBLEBUFFER | SWLVS_SELALWAYS)) {
             legacySkin = library(ML_IPC_SKIN_LISTVIEW, reinterpret_cast<WPARAM>(list));
         }
+        // WACUP installs its window procedure above the common-controls subclass chain.
+        auto proc = GetWindowLongPtrW(list, GWLP_WNDPROC);
+        if (SetPropW(list, listSkinProc, reinterpret_cast<HANDLE>(proc)) &&
+            !SetWindowLongPtrW(list, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(libraryListProc)))
+            RemovePropW(list, listSkinProc);
         skinWindow(GetDlgItem(hwnd, IDC_QUERY), SKINNEDWND_TYPE_EDIT, SWES_VCENTER);
         for (int id : {IDC_SEARCH_LABEL, IDC_STATUS})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_STATIC);
         for (int id : {IDC_VIEW_MENU, IDC_ADD_SERVER, IDC_BACK, IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_CACHE_MENU})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_BUTTON);
-        ListView_SetTextBkColor(list, CLR_NONE);
         tileSize = std::clamp(MulDiv(160, GetDpiForWindow(hwnd), 96), 96, 384);
         SetTimer(hwnd, viewTimer, 2000, nullptr);
         SendDlgItemMessageW(hwnd, IDC_QUERY, EM_SETLIMITTEXT, 256, 0);
@@ -945,7 +969,7 @@ private:
 
     BrowseKind category;
     BrowseLocation location;
-    std::optional<BrowseLocation> draggedAlbum;
+    std::vector<BrowseLocation> draggedAlbums;
     std::string query;
     std::vector<History> history;
     std::vector<Server> servers;
@@ -999,6 +1023,7 @@ private:
     void updateStatus();
     std::wstring trackCell(const Track& track, int column) const;
     std::vector<Track> selection();
+    std::vector<BrowseLocation> selectedAlbums() const;
     const Server* selected() const;
 };
 
@@ -1247,12 +1272,15 @@ void View::changePresentation() {
             ListView_SetImageList(list, images, LVSIL_NORMAL);
         }
     }
-    if (ListView_SetView(list, tiles ? LV_VIEW_ICON : LV_VIEW_DETAILS) != 1) {
-        auto style = GetWindowLongPtrW(list, GWL_STYLE);
-        SetWindowLongPtrW(list, GWL_STYLE, (style & ~LVS_TYPEMASK) | (tiles ? LVS_ICON : LVS_REPORT));
+    auto style = GetWindowLongPtrW(list, GWL_STYLE);
+    const auto type = tiles ? LVS_ICON : LVS_REPORT;
+    if ((style & LVS_TYPEMASK) != type) {
+        SetWindowLongPtrW(list, GWL_STYLE, (style & ~LVS_TYPEMASK) | type);
         SetWindowPos(list, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
+    ListView_SetView(list, tiles ? LV_VIEW_ICON : LV_VIEW_DETAILS);
+    ListView_SetExtendedListViewStyleEx(list, LVS_EX_FULLROWSELECT, tiles ? 0 : LVS_EX_FULLROWSELECT);
     if (tiles && images) {
         const auto font = reinterpret_cast<HFONT>(SendMessageW(list, WM_GETFONT, 0, 0));
         HDC dc = GetDC(list);
@@ -1383,7 +1411,9 @@ std::vector<Track> View::selection() {
 void View::beginDrag(const NMLISTVIEW& notification) {
     const auto* album = albumAt(notification.iItem);
     if (!album) return;
-    draggedAlbum = *album;
+    draggedAlbums = ListView_GetItemState(list, notification.iItem, LVIS_SELECTED) ?
+        selectedAlbums() : std::vector<BrowseLocation>{*album};
+    if (draggedAlbums.empty()) return;
     SetCapture(hwnd);
     POINT point = notification.ptAction;
     MapWindowPoints(list, hwnd, &point, 1);
@@ -1391,34 +1421,39 @@ void View::beginDrag(const NMLISTVIEW& notification) {
 }
 
 void View::cancelDrag() {
-    draggedAlbum.reset();
+    draggedAlbums.clear();
     if (GetCapture() == hwnd) ReleaseCapture();
 }
 
 void View::drag(POINT point, bool released) {
-    if (!draggedAlbum) return;
+    if (draggedAlbums.empty()) return;
     mlDropItemStruct drop{};
     drop.type = ML_TYPE_ITEMRECORDLISTW;
     drop.p = point;
     if (!ClientToScreen(hwnd, &drop.p)) { cancelDrag(); return; }
     drop.flags = released ? ML_HANDLEDRAG_FLAG_NOCURSOR : 0;
     library(ML_IPC_HANDLEDRAG, reinterpret_cast<WPARAM>(&drop));
-    if (released && draggedAlbum) {
-        auto album = std::move(*draggedAlbum);
+    if (released && !draggedAlbums.empty()) {
+        auto albums = std::move(draggedAlbums);
         cancelDrag();
-        if (drop.result > 0) app->sendAlbums(currentServer, {std::move(album)}, AlbumAction::drop, drop);
+        if (drop.result > 0) app->sendAlbums(currentServer, std::move(albums), AlbumAction::drop, drop);
     }
+}
+
+std::vector<BrowseLocation> View::selectedAlbums() const {
+    std::vector<BrowseLocation> albums;
+    for (int i = ListView_GetNextItem(list, -1, LVNI_SELECTED); i >= 0;
+         i = ListView_GetNextItem(list, i, LVNI_SELECTED)) {
+        auto* album = albumAt(i);
+        if (!album) return {};
+        albums.push_back(*album);
+    }
+    return albums;
 }
 
 void View::play(bool enqueue) {
     if (!showTracks()) {
-        std::vector<BrowseLocation> albums;
-        for (int i = ListView_GetNextItem(list, -1, LVNI_SELECTED); i >= 0;
-             i = ListView_GetNextItem(list, i, LVNI_SELECTED)) {
-            auto* album = albumAt(i);
-            if (!album) return;
-            albums.push_back(*album);
-        }
+        auto albums = selectedAlbums();
         if (!albums.empty()) app->sendAlbums(currentServer, std::move(albums),
                                              enqueue ? AlbumAction::enqueue : AlbumAction::play);
         return;
