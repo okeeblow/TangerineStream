@@ -37,6 +37,35 @@ struct Track {
     std::int64_t bytes = 0;
 };
 
+enum class BrowseKind {
+    albums, genres, albumArtists, artists, folders, playlists, favorites, tracks, offline,
+    genreAlbums, artistAlbums, folderIndex, directory, albumTracks, playlistTracks, song
+};
+
+struct BrowseLocation {
+    BrowseKind kind;
+    std::string id;
+    std::string title;
+};
+
+struct LibraryItem {
+    BrowseLocation target;
+    std::string subtitle;
+    std::string coverId;
+};
+
+struct BrowsePage {
+    std::vector<LibraryItem> items;
+    std::vector<Track> tracks;
+    bool more = false;
+};
+
+inline bool trackView(BrowseKind kind) {
+    return kind == BrowseKind::tracks || kind == BrowseKind::offline ||
+        kind == BrowseKind::albumTracks || kind == BrowseKind::playlistTracks ||
+        kind == BrowseKind::song;
+}
+
 struct Report {
     Id key;
     std::string id;

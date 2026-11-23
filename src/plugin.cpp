@@ -1,4 +1,5 @@
 #include "playback.hpp"
+#include "artwork.hpp"
 #include "resources.h"
 
 #include <commctrl.h>
@@ -6,6 +7,7 @@
 #include <chrono>
 #include <climits>
 #include <optional>
+#include <set>
 
 // The SDK checks an undefined _MSC_VER as zero and supplies its own intptr_t.
 #ifndef _MSC_VER
@@ -13,6 +15,7 @@
 #define RESTORE_MINGW_MACROS
 #endif
 #include "gen_ml/ml.h"
+#include "gen_ml/ml_ipc_0313.h"
 #include "Winamp/wa_ipc.h"
 #ifdef RESTORE_MINGW_MACROS
 #undef _MSC_VER
@@ -25,6 +28,7 @@ namespace {
 constexpr wchar_t pluginName[] = L"Tangerine Stream";
 constexpr auto viewReady = WM_APP + 1;
 constexpr auto profilesChanged = WM_APP + 2;
+constexpr auto moreRequested = WM_APP + 4;
 constexpr UINT_PTR playbackTimer = 0x7151;
 constexpr UINT_PTR viewTimer = 1;
 constexpr UINT_PTR playerSubclass = 0x7151;
@@ -35,7 +39,7 @@ int init();
 void quit();
 INT_PTR message(int type, INT_PTR a, INT_PTR b, INT_PTR c);
 
-char description[] = "Tangerine Stream v0.1.0";
+char description[] = "Tangerine Stream v0.2.0";
 winampMediaLibraryPlugin plugin{MLHDR_VER, description, init, quit, message, nullptr, nullptr, nullptr};
 
 LRESULT player(UINT command, WPARAM value = 0) {
@@ -44,6 +48,34 @@ LRESULT player(UINT command, WPARAM value = 0) {
 
 LRESULT library(UINT command, WPARAM value = 0) {
     return SendMessageW(plugin.hwndLibraryParent, WM_ML_IPC, value, command);
+}
+
+bool skinWindow(HWND hwnd, UINT type, UINT style = 0) {
+    MLSKINWINDOW window{hwnd, type, style | SWS_USESKINFONT | SWS_USESKINCOLORS | SWS_USESKINCURSORS};
+    return library(ML_IPC_SKINWINDOW, reinterpret_cast<WPARAM>(&window)) != 0;
+}
+
+struct Category {
+    BrowseKind kind;
+    const wchar_t* name;
+};
+
+constexpr Category categories[] = {
+    {BrowseKind::albums, L"Albums"},
+    {BrowseKind::genres, L"Genres"},
+    {BrowseKind::albumArtists, L"Album Artists"},
+    {BrowseKind::artists, L"Artists"},
+    {BrowseKind::tracks, L"Tracks"},
+    {BrowseKind::folders, L"Folders"},
+    {BrowseKind::playlists, L"Playlists"},
+    {BrowseKind::favorites, L"Favorites"},
+    {BrowseKind::offline, L"Offline Cache"},
+};
+
+BrowseLocation categoryLocation(BrowseKind kind) {
+    for (const auto& category : categories)
+        if (category.kind == kind) return {kind, {}, utf8(category.name)};
+    return {BrowseKind::albums, {}, "Albums"};
 }
 
 void showError(HWND window, const std::exception& error) {
@@ -63,15 +95,15 @@ struct Search {
     HWND view;
     std::uint64_t serial;
     Id server;
+    BrowseLocation location;
     std::string query;
     int offset;
-    bool cached;
 };
 
 struct SearchResult {
     HWND view;
     std::uint64_t serial;
-    std::vector<Track> tracks;
+    BrowsePage page;
     std::string error;
 };
 
@@ -92,7 +124,7 @@ struct ServiceStatus {
 
 class App {
 public:
-    explicit App(const std::filesystem::path& profile) : store(profile), playback(store) {
+    explicit App(const std::filesystem::path& profile) : store(profile), playback(store), artwork(store) {
         try {
             browser = std::thread([this] { browse(); });
             maintenance = std::thread([this] { maintain(); });
@@ -104,10 +136,10 @@ public:
     }
     ~App() { stop(); }
 
-    void search(HWND view, Id server, std::string query, int offset, bool cached) {
+    void search(HWND view, Id server, const BrowseLocation& location, std::string query, int offset) {
         {
             std::scoped_lock lock(searchMutex);
-            request = Search{view, ++serial, server, std::move(query), offset, cached};
+            request = Search{view, ++serial, server, location, std::move(query), offset};
             result.reset();
         }
         searchReady.notify_one();
@@ -118,6 +150,13 @@ public:
         auto ready = std::move(result);
         result.reset();
         return ready;
+    }
+    void cancelSearch(HWND view) {
+        std::scoped_lock lock(searchMutex);
+        if (activeView != view) return;
+        ++serial;
+        request.reset();
+        result.reset();
     }
     void forgetView(HWND view) {
         std::scoped_lock lock(searchMutex);
@@ -148,9 +187,11 @@ public:
 
     Store store;
     Playback playback;
+    ArtworkLoader artwork;
     HWND activeView = nullptr;
     Id selectedServer = 0;
     UINT_PTR treeId = 0;
+    std::map<UINT_PTR, BrowseKind> navigation;
     bool attached = false;
     std::string reportError;
 
@@ -202,8 +243,9 @@ void App::browse() {
         }
         SearchResult ready{search.view, search.serial, {}, {}};
         try {
-            if (search.cached) {
-                ready.tracks = store.cached(search.server, search.query, search.offset);
+            if (search.location.kind == BrowseKind::offline) {
+                ready.page.tracks = store.cached(search.server, search.query, search.offset);
+                ready.page.more = ready.page.tracks.size() == pageSize;
             } else {
                 auto profile = store.server(search.server);
                 if (!api || profile.id != current.id || profile.native != current.native ||
@@ -211,8 +253,8 @@ void App::browse() {
                     api = connect(profile);
                     current = std::move(profile);
                 }
-                ready.tracks = api->songs(search.query, search.offset);
-                store.remember(ready.tracks);
+                ready.page = api->browse(search.location, search.query, search.offset);
+                if (!ready.page.tracks.empty()) store.remember(ready.page.tracks);
             }
         } catch (const std::exception& error) {
             ready.error = error.what();
@@ -459,46 +501,111 @@ void configure(HWND hwnd, const Server& profile = {}) {
 
 class View {
 public:
-    explicit View(HWND window) : hwnd(window), list(GetDlgItem(hwnd, IDC_TRACKS)) {
+    View(HWND window, BrowseKind category)
+        : hwnd(window), list(GetDlgItem(hwnd, IDC_TRACKS)), category(category), location(categoryLocation(category)) {
         LVCOLUMNW column{};
         column.mask = LVCF_TEXT | LVCF_WIDTH;
-        const wchar_t* names[] = {L"Title", L"Artist", L"Album", L"Time", L"Cache"};
-        int widths[] = {180, 120, 140, 60, 125};
+        const wchar_t* names[] = {L"Name", L"Details", L"Album", L"Time", L"Cache"};
         for (int i = 0; i < 5; ++i) {
             column.pszText = const_cast<wchar_t*>(names[i]);
-            column.cx = widths[i];
             ListView_InsertColumn(list, i, &column);
         }
         ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-        skin = library(ML_IPC_SKIN_LISTVIEW, reinterpret_cast<WPARAM>(list));
+        ListView_SetUnicodeFormat(list, TRUE);
+        skinWindow(hwnd, SKINNEDWND_TYPE_DIALOG);
+        if (!skinWindow(list, SKINNEDWND_TYPE_LISTVIEW, SWLVS_DOUBLEBUFFER)) {
+            legacySkin = library(ML_IPC_SKIN_LISTVIEW, reinterpret_cast<WPARAM>(list));
+        }
+        skinWindow(GetDlgItem(hwnd, IDC_SERVERS), SKINNEDWND_TYPE_COMBOBOX);
+        skinWindow(GetDlgItem(hwnd, IDC_QUERY), SKINNEDWND_TYPE_EDIT, SWES_VCENTER);
+        for (int id : {IDC_LOCATION, IDC_STATUS})
+            skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_STATIC);
+        for (int id : {IDC_ADD_SERVER, IDC_SETTINGS, IDC_BACK, IDC_SEARCH, IDC_TEXT_LIST,
+                       IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_KEEP_OFFLINE, IDC_UNPIN})
+            skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_BUTTON);
+        ListView_SetTextBkColor(list, CLR_NONE);
+        tileSize = std::clamp(MulDiv(128, GetDpiForWindow(hwnd), 96), 96, 256);
         SetTimer(hwnd, viewTimer, 2000, nullptr);
         SendDlgItemMessageW(hwnd, IDC_QUERY, EM_SETLIMITTEXT, 256, 0);
-        SendDlgItemMessageW(hwnd, IDC_QUERY, EM_SETCUEBANNER, FALSE,
-                            reinterpret_cast<LPARAM>(L"Search tracks"));
+        CheckDlgButton(hwnd, IDC_TEXT_LIST, app->store.textCatalog() ? BST_CHECKED : BST_UNCHECKED);
     }
     ~View() {
         KillTimer(hwnd, viewTimer);
-        if (skin) library(ML_IPC_UNSKIN_LISTVIEW, skin);
+        if (app) app->artwork.cancel(artGeneration);
+        if (legacySkin) library(ML_IPC_UNSKIN_LISTVIEW, legacySkin);
+        if (images) {
+            ListView_SetImageList(list, nullptr, LVSIL_NORMAL);
+            ImageList_Destroy(images);
+        }
     }
     void populateServers();
-    void load(int nextOffset);
     void receive(SearchResult result);
+    void receiveArtwork();
+    void fetchMore();
+    void display(NMLVDISPINFOW& display);
+    void activate(int index);
     void command(int id, int notification);
-    void refresh(bool force = false);
+    void refresh();
     void updateButtons();
     void layout(int width, int height);
     HWND hwnd, list;
 
 private:
+    struct History {
+        BrowseLocation location;
+        std::string query;
+        std::vector<LibraryItem> items;
+        int nextOffset;
+        int focused;
+        bool more;
+    };
+    struct ImageSlot {
+        int row;
+        std::uint64_t read;
+    };
+
+    BrowseKind category;
+    BrowseLocation location;
+    std::string query;
+    std::vector<History> history;
     std::vector<Server> servers;
+    std::vector<LibraryItem> items;
     std::vector<Track> tracks;
-    int offset = 0;
-    bool loading = false;
+    std::set<std::pair<BrowseKind, std::string>> knownItems;
+    std::set<Id> knownTracks;
+    int nextOffset = 0;
+    bool loading = false, more = false, morePosted = false;
     std::string message;
-    LRESULT skin = 0;
+    LRESULT legacySkin = 0;
+    Id currentServer = 0;
+    int tileSize = 128;
+    HIMAGELIST images = nullptr;
+    ArtworkLoader::Generation artGeneration = 0;
+    std::vector<ImageSlot> slots;
+    std::map<int, int> slotForRow;
+    std::set<int> pendingArt, missingArt;
+    std::uint64_t artRead = 0;
+    bool artQueueFull = false;
+
+    bool showTracks() const { return trackView(location.kind); }
+    bool showTiles() const {
+        return !showTracks() && IsDlgButtonChecked(hwnd, IDC_TEXT_LIST) != BST_CHECKED;
+    }
+    int rowCount() const { return static_cast<int>(showTracks() ? tracks.size() : items.size()); }
+    void startSearch();
+    void resetContent();
+    void resetLocation();
+    void changePresentation();
+    void resizeColumns();
+    void updateRowCount();
+    void scheduleMore();
+    void resetImages();
+    int imageFor(int row);
+    void back();
     void play(bool enqueue);
     void cache(bool pin);
     void updateStatus();
+    std::wstring trackCell(const Track& track, int column) const;
     std::vector<Track> selection();
     const Server* selected() const;
 };
@@ -518,80 +625,308 @@ void View::populateServers() {
         if (servers[i].id == app->selectedServer) selectedIndex = static_cast<int>(i);
     }
     SendDlgItemMessageW(hwnd, IDC_SERVERS, CB_SETCURSEL, selectedIndex, 0);
-    load(0);
+    resetLocation();
 }
 
-void View::load(int nextOffset) {
-    offset = nextOffset;
-    tracks.clear();
-    ListView_DeleteAllItems(list);
-    auto server = selected();
-    loading = server != nullptr;
+void View::resetLocation() {
+    if (!history.empty()) SetDlgItemTextW(hwnd, IDC_QUERY, L"");
+    history.clear();
+    location = categoryLocation(category);
+    startSearch();
+}
+
+void View::resetContent() {
+    app->cancelSearch(hwnd);
+    loading = more = morePosted = false;
+    nextOffset = 0;
     message.clear();
+    ListView_SetItemCount(list, 0);
+    items.clear();
+    tracks.clear();
+    knownItems.clear();
+    knownTracks.clear();
+    resetImages();
+    auto server = selected();
+    currentServer = server ? server->id : 0;
+    if (server) app->selectedServer = server->id;
+    changePresentation();
     updateButtons();
     updateStatus();
-    if (!server) return;
-    app->selectedServer = server->id;
-    app->search(hwnd, server->id, getText(hwnd, IDC_QUERY), offset,
-                IsDlgButtonChecked(hwnd, IDC_CACHED) == BST_CHECKED);
 }
 
-void setCell(HWND list, int row, int column, std::wstring text) {
-    ListView_SetItemText(list, row, column, text.data());
+void View::startSearch() {
+    query = getText(hwnd, IDC_QUERY);
+    resetContent();
+    more = currentServer != 0;
+    fetchMore();
+}
+
+void View::fetchMore() {
+    morePosted = false;
+    if (!more || loading || !currentServer) return;
+    loading = true;
+    updateButtons();
+    updateStatus();
+    app->search(hwnd, currentServer, location, query, nextOffset);
+}
+
+void View::scheduleMore() {
+    if (!more || loading || morePosted) return;
+    morePosted = PostMessageW(hwnd, moreRequested, 0, 0) != 0;
+}
+
+void View::updateRowCount() {
+    ListView_SetItemCountEx(list, rowCount(), LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
+    InvalidateRect(list, nullptr, FALSE);
+    updateStatus();
+    updateButtons();
 }
 
 void View::receive(SearchResult result) {
     loading = false;
     message = std::move(result.error);
-    if (!message.empty() && IsDlgButtonChecked(hwnd, IDC_CACHED) != BST_CHECKED)
-        message += " Select Cache view to browse your offline tracks.";
-    tracks = std::move(result.tracks);
-    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
-    for (int i = 0; i < static_cast<int>(tracks.size()); ++i) {
-        auto& track = tracks[i];
-        auto title = wide(track.title.empty() ? track.id : track.title);
-        LVITEMW item{};
-        item.mask = LVIF_TEXT;
-        item.iItem = i;
-        item.pszText = title.data();
-        ListView_InsertItem(list, &item);
-        setCell(list, i, 1, wide(track.artist));
-        setCell(list, i, 2, wide(track.album));
-        auto seconds = track.duration % 60;
-        if (track.duration) setCell(list, i, 3, std::to_wstring(track.duration / 60) + L":" +
-            (seconds < 10 ? L"0" : L"") + std::to_wstring(seconds));
+    if (!message.empty()) {
+        more = false;
+        updateStatus();
+        updateButtons();
+        return;
     }
-    refresh(true);
-    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(list, nullptr, TRUE);
-    updateButtons();
+    const auto oldCount = rowCount();
+    const bool emptyPage = result.page.items.empty() && result.page.tracks.empty();
+    for (auto& item : result.page.items) {
+        if (knownItems.emplace(item.target.kind, item.target.id).second)
+            items.push_back(std::move(item));
+    }
+    const bool pagedTracks = location.kind == BrowseKind::tracks || location.kind == BrowseKind::offline;
+    for (auto& track : result.page.tracks) {
+        if (!pagedTracks || knownTracks.insert(track.key).second) tracks.push_back(std::move(track));
+    }
+    // A repeated server page must not get stuck in an endless scroll loop.
+    more = result.page.more && nextOffset < INT_MAX - pageSize && (emptyPage || rowCount() != oldCount);
+    nextOffset += pageSize;
+    updateRowCount();
+    if (emptyPage || rowCount() < 12) scheduleMore();
 }
 
-void View::refresh(bool force) {
-    for (int i = 0; i < static_cast<int>(tracks.size()); ++i) {
+void View::refresh() {
+    const int first = std::max(0, ListView_GetTopIndex(list));
+    const int last = std::min(static_cast<int>(tracks.size()), first + ListView_GetCountPerPage(list) + 1);
+    for (int i = first; i < last; ++i) {
         auto updated = app->store.track(tracks[i].key);
         const auto& track = tracks[i];
-        if (!force && track.bytes == updated.bytes && track.favorite == updated.favorite &&
+        if (track.bytes == updated.bytes && track.favorite == updated.favorite &&
             track.pinned == updated.pinned) continue;
         tracks[i] = std::move(updated);
-        const auto& current = tracks[i];
-        setCell(list, i, 4, current.pinned ? (current.bytes ? L"Permanent" : L"Pin pending") :
-            current.favorite ? (current.bytes ? L"Favorite" : L"Favorite pending") :
-            current.bytes ? L"Rolling" : L"");
+        ListView_RedrawItems(list, i, i);
     }
     updateStatus();
+}
+
+std::wstring View::trackCell(const Track& track, int column) const {
+    switch (column) {
+    case 0: return wide(track.title.empty() ? track.id : track.title);
+    case 1: return wide(track.artist);
+    case 2: return wide(track.album);
+    case 3:
+        if (track.duration) {
+            auto seconds = track.duration % 60;
+            return std::to_wstring(track.duration / 60) + L":" + (seconds < 10 ? L"0" : L"") +
+                std::to_wstring(seconds);
+        }
+        return {};
+    case 4:
+        if (track.pinned) return track.bytes ? L"Permanent" : L"Pin pending";
+        if (track.favorite) return track.bytes ? L"Favorite" : L"Favorite pending";
+        return track.bytes ? L"Rolling" : L"";
+    default: return {};
+    }
+}
+
+void View::display(NMLVDISPINFOW& display) {
+    auto& item = display.item;
+    const auto row = item.iItem;
+    if (row < 0 || row >= rowCount()) return;
+    if (item.mask & LVIF_TEXT) {
+        std::wstring text;
+        if (showTracks()) text = trackCell(tracks[row], item.iSubItem);
+        else if (item.iSubItem == 0) text = wide(items[row].target.title);
+        else if (item.iSubItem == 1) text = wide(items[row].subtitle);
+        if (item.pszText && item.cchTextMax > 0) lstrcpynW(item.pszText, text.c_str(), item.cchTextMax);
+    }
+    if (item.mask & LVIF_IMAGE) item.iImage = showTiles() ? imageFor(row) : I_IMAGENONE;
+    if (row >= rowCount() - 12) scheduleMore();
+}
+
+void View::resetImages() {
+    artGeneration = app->artwork.reset(hwnd);
+    pendingArt.clear();
+    missingArt.clear();
+    slots.clear();
+    slotForRow.clear();
+    artQueueFull = false;
+    artRead = 0;
+    if (images) {
+        ListView_SetImageList(list, nullptr, LVSIL_NORMAL);
+        ImageList_Destroy(images);
+        images = nullptr;
+    }
+}
+
+int View::imageFor(int row) {
+    if (!images) return I_IMAGENONE;
+    auto existing = slotForRow.find(row);
+    if (existing != slotForRow.end()) {
+        slots[existing->second - 1].read = ++artRead;
+        return existing->second;
+    }
+    if (!pendingArt.count(row) && !missingArt.count(row)) {
+        if (app->artwork.request(artGeneration, currentServer, row, tileSize, items[row]))
+            pendingArt.insert(row);
+        else artQueueFull = true;
+    }
+    return 0;
+}
+
+void View::receiveArtwork() {
+    constexpr std::size_t maxImages = 192;
+    for (const auto& thumbnail : app->artwork.take(artGeneration)) {
+        pendingArt.erase(thumbnail.row);
+        if (!images) continue;
+        auto bitmap = thumbnailBitmap(tileSize, thumbnail.pixels);
+        if (!bitmap) {
+            missingArt.insert(thumbnail.row);
+            continue;
+        }
+        int index = -1;
+        if (slots.size() < maxImages) {
+            index = ImageList_Add(images, bitmap, nullptr);
+            if (index > 0) slots.push_back({thumbnail.row, ++artRead});
+        } else {
+            auto oldest = std::min_element(slots.begin(), slots.end(),
+                [](const ImageSlot& a, const ImageSlot& b) { return a.read < b.read; });
+            int candidate = static_cast<int>(oldest - slots.begin()) + 1;
+            if (ImageList_Replace(images, candidate, bitmap, nullptr)) {
+                slotForRow.erase(oldest->row);
+                *oldest = {thumbnail.row, ++artRead};
+                index = candidate;
+            }
+        }
+        DeleteObject(bitmap);
+        if (index > 0) {
+            slotForRow[thumbnail.row] = index;
+            if (showTiles()) ListView_RedrawItems(list, thumbnail.row, thumbnail.row);
+        } else {
+            missingArt.insert(thumbnail.row);
+        }
+    }
+    if (std::exchange(artQueueFull, false) && showTiles()) InvalidateRect(list, nullptr, FALSE);
+}
+
+void View::changePresentation() {
+    const bool tiles = showTiles();
+    if (tiles && !images) {
+        images = ImageList_Create(tileSize, tileSize, ILC_COLOR32, 1, 8);
+        if (images) {
+            auto color = ListView_GetBkColor(list);
+            if (color == CLR_NONE) color = GetSysColor(COLOR_WINDOW);
+            auto ink = ListView_GetTextColor(list);
+            auto tone = [](unsigned base, unsigned text) { return (base * 7 + text) / 8; };
+            const std::uint32_t fill = 0xff000000u | (tone(GetRValue(color), GetRValue(ink)) << 16) |
+                (tone(GetGValue(color), GetGValue(ink)) << 8) | tone(GetBValue(color), GetBValue(ink));
+            auto placeholder = thumbnailBitmap(tileSize,
+                std::vector<std::uint32_t>(static_cast<std::size_t>(tileSize) * tileSize, fill));
+            if (placeholder) {
+                ImageList_Add(images, placeholder, nullptr);
+                DeleteObject(placeholder);
+            }
+            if (ImageList_GetImageCount(images) != 1) {
+                ImageList_Destroy(images);
+                images = nullptr;
+            }
+        }
+        if (images) {
+            ImageList_SetBkColor(images, CLR_NONE);
+            ListView_SetImageList(list, images, LVSIL_NORMAL);
+        }
+    }
+    if (ListView_SetView(list, tiles ? LV_VIEW_ICON : LV_VIEW_DETAILS) != 1) {
+        auto style = GetWindowLongPtrW(list, GWL_STYLE);
+        SetWindowLongPtrW(list, GWL_STYLE, (style & ~LVS_TYPEMASK) | (tiles ? LVS_ICON : LVS_REPORT));
+        SetWindowPos(list, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+    if (tiles && images) ListView_SetIconSpacing(list, tileSize + tileSize / 5, tileSize + tileSize / 3);
+    auto breadcrumb = wide(categoryLocation(category).title);
+    for (std::size_t i = 1; i < history.size(); ++i)
+        breadcrumb += L"  \u203a  " + wide(history[i].location.title);
+    if (!history.empty()) breadcrumb += L"  \u203a  " + wide(location.title);
+    SetDlgItemTextW(hwnd, IDC_LOCATION, breadcrumb.c_str());
+    SendDlgItemMessageW(hwnd, IDC_QUERY, EM_SETCUEBANNER, FALSE,
+        reinterpret_cast<LPARAM>(showTracks() ? L"Search tracks" : L"Search this view"));
+    for (int id : {IDC_PLAY, IDC_ENQUEUE, IDC_KEEP_OFFLINE, IDC_UNPIN})
+        ShowWindow(GetDlgItem(hwnd, id), showTracks() ? SW_SHOWNA : SW_HIDE);
+    ShowWindow(GetDlgItem(hwnd, IDC_OPEN), showTracks() ? SW_HIDE : SW_SHOWNA);
+    ShowWindow(GetDlgItem(hwnd, IDC_TEXT_LIST), showTracks() ? SW_HIDE : SW_SHOWNA);
+    ShowWindow(GetDlgItem(hwnd, IDC_BACK), history.empty() ? SW_HIDE : SW_SHOWNA);
+    auto title = showTracks() ? L"Title" : L"Name";
+    auto details = showTracks() ? L"Artist" : L"Details";
+    LVCOLUMNW column{};
+    column.mask = LVCF_TEXT;
+    column.pszText = const_cast<wchar_t*>(title);
+    ListView_SetColumn(list, 0, &column);
+    column.pszText = const_cast<wchar_t*>(details);
+    ListView_SetColumn(list, 1, &column);
+    RECT bounds{};
+    GetClientRect(hwnd, &bounds);
+    layout(bounds.right, bounds.bottom);
+    InvalidateRect(list, nullptr, FALSE);
+}
+
+void View::activate(int index) {
+    if (index < 0 || index >= rowCount()) return;
+    if (showTracks()) {
+        play(false);
+        return;
+    }
+    auto target = items[index].target;
+    history.push_back({location, query, std::move(items), nextOffset, index, more});
+    location = std::move(target);
+    SetDlgItemTextW(hwnd, IDC_QUERY, L"");
+    startSearch();
+    SetFocus(list);
+}
+
+void View::back() {
+    if (history.empty()) return;
+    auto outer = std::move(history.back());
+    history.pop_back();
+    location = std::move(outer.location);
+    query = std::move(outer.query);
+    SetDlgItemTextW(hwnd, IDC_QUERY, wide(query).c_str());
+    resetContent();
+    items = std::move(outer.items);
+    nextOffset = outer.nextOffset;
+    more = outer.more;
+    for (const auto& item : items) knownItems.emplace(item.target.kind, item.target.id);
+    updateRowCount();
+    if (outer.focused >= 0 && outer.focused < rowCount()) {
+        ListView_SetItemState(list, outer.focused, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(list, outer.focused, FALSE);
+    }
+    SetFocus(list);
 }
 
 void View::updateStatus() {
     auto server = selected();
     std::wstring status;
     if (!server) status = L"Add a Navidrome or OpenSubsonic server to get started.";
-    else if (loading) status = L"Loading tracks...";
+    else if (loading && rowCount() == 0) status = L"Loading...";
     else if (!message.empty()) status = wide(message);
     else if (!app->reportError.empty()) status = wide(app->reportError);
     else {
-        status = tracks.empty() ? L"No tracks" : L"Tracks " + std::to_wstring(offset + 1) +
-            L"\u2013" + std::to_wstring(offset + tracks.size());
+        if (rowCount() == 0) status = showTracks() ? L"No tracks" : L"No results";
+        else status = std::to_wstring(rowCount()) + (showTracks() ? L" tracks" : L" items");
+        if (loading) status += L"  |  Loading more...";
         auto count = app->store.reportCount(server->id);
         if (count) status += L"  |  " + std::to_wstring(count) + L" play reports queued";
         auto error = app->maintenanceError(server->id);
@@ -603,13 +938,11 @@ void View::updateStatus() {
 void View::updateButtons() {
     const bool haveServer = selected() != nullptr;
     const bool haveRows = ListView_GetSelectedCount(list) > 0;
-    for (int id : {IDC_SEARCH, IDC_SETTINGS, IDC_QUERY, IDC_CACHED})
+    for (int id : {IDC_SEARCH, IDC_SETTINGS, IDC_QUERY, IDC_TEXT_LIST})
         EnableWindow(GetDlgItem(hwnd, id), haveServer);
     for (int id : {IDC_PLAY, IDC_ENQUEUE, IDC_KEEP_OFFLINE, IDC_UNPIN})
         EnableWindow(GetDlgItem(hwnd, id), haveRows);
-    EnableWindow(GetDlgItem(hwnd, IDC_PREVIOUS), haveServer && !loading && offset >= pageSize);
-    EnableWindow(GetDlgItem(hwnd, IDC_NEXT), haveServer && !loading &&
-                 tracks.size() == pageSize && offset < INT_MAX - 2 * pageSize);
+    EnableWindow(GetDlgItem(hwnd, IDC_OPEN), haveRows);
 }
 
 std::vector<Track> View::selection() {
@@ -646,11 +979,14 @@ void View::command(int id, int notification) {
     switch (id) {
     case IDC_ADD_SERVER: configure(hwnd); break;
     case IDC_SETTINGS: if (auto server = selected()) configure(hwnd, *server); break;
-    case IDC_SERVERS: if (notification == CBN_SELCHANGE) load(0); break;
-    case IDC_SEARCH:
-    case IDC_CACHED: load(0); break;
-    case IDC_PREVIOUS: load(std::max(0, offset - pageSize)); break;
-    case IDC_NEXT: load(offset + pageSize); break;
+    case IDC_SERVERS: if (notification == CBN_SELCHANGE) resetLocation(); break;
+    case IDC_SEARCH: startSearch(); break;
+    case IDC_BACK: back(); break;
+    case IDC_OPEN: activate(ListView_GetNextItem(list, -1, LVNI_SELECTED)); break;
+    case IDC_TEXT_LIST:
+        app->store.saveTextCatalog(!showTiles());
+        changePresentation();
+        break;
     case IDC_PLAY: play(false); break;
     case IDC_ENQUEUE: play(true); break;
     case IDC_KEEP_OFFLINE: cache(true); break;
@@ -664,24 +1000,43 @@ void View::layout(int width, int height) {
     auto x = [&](int dlu) { return MulDiv(dlu, unit.right, 400); };
     auto y = [&](int dlu) { return MulDiv(dlu, unit.bottom, 8); };
     const int w = std::max(width, x(315));
-    const int h = std::max(height, y(111));
+    const int h = std::max(height, y(120));
     auto move = [&](int id, int left, int top, int controlWidth, int controlHeight) {
         MoveWindow(GetDlgItem(hwnd, id), left, top, controlWidth, controlHeight, TRUE);
     };
     move(IDC_SERVERS, x(4), y(4), w - x(162), y(100));
     move(IDC_ADD_SERVER, w - x(154), y(4), x(72), y(15));
     move(IDC_SETTINGS, w - x(78), y(4), x(74), y(15));
-    move(IDC_QUERY, x(4), y(23), w - x(145), y(15));
-    move(IDC_SEARCH, w - x(137), y(23), x(52), y(15));
-    move(IDC_CACHED, w - x(81), y(23), x(77), y(15));
-    move(IDC_TRACKS, x(4), y(42), w - x(8), h - y(83));
+    const int queryLeft = history.empty() ? 4 : 48;
+    const int searchRight = showTracks() ? 57 : 129;
+    move(IDC_BACK, x(4), y(23), x(40), y(15));
+    move(IDC_QUERY, x(queryLeft), y(23), w - x(queryLeft + searchRight + 4), y(15));
+    move(IDC_SEARCH, w - x(searchRight), y(23), x(52), y(15));
+    move(IDC_TEXT_LIST, w - x(73), y(23), x(69), y(15));
+    move(IDC_LOCATION, x(4), y(42), w - x(8), y(12));
+    move(IDC_TRACKS, x(4), y(55), w - x(8), h - y(96));
+    move(IDC_OPEN, x(4), h - y(37), x(36), y(15));
     move(IDC_PLAY, x(4), h - y(37), x(36), y(15));
     move(IDC_ENQUEUE, x(44), h - y(37), x(49), y(15));
     move(IDC_KEEP_OFFLINE, x(97), h - y(37), x(60), y(15));
     move(IDC_UNPIN, x(161), h - y(37), x(39), y(15));
-    move(IDC_PREVIOUS, w - x(104), h - y(37), x(48), y(15));
-    move(IDC_NEXT, w - x(52), h - y(37), x(48), y(15));
     move(IDC_STATUS, x(4), h - y(18), w - x(8), y(14));
+    resizeColumns();
+}
+
+void View::resizeColumns() {
+    if (showTiles()) return;
+    RECT bounds{};
+    GetClientRect(list, &bounds);
+    const auto width = std::max(320L, bounds.right - GetSystemMetrics(SM_CXVSCROLL) - 4);
+    if (showTracks()) {
+        const int weights[] = {33, 20, 24, 8, 15};
+        for (int i = 0; i < 5; ++i) ListView_SetColumnWidth(list, i, MulDiv(width, weights[i], 100));
+    } else {
+        ListView_SetColumnWidth(list, 0, MulDiv(width, 2, 3));
+        ListView_SetColumnWidth(list, 1, MulDiv(width, 1, 3));
+        for (int i = 2; i < 5; ++i) ListView_SetColumnWidth(list, i, 0);
+    }
 }
 
 LRESULT CALLBACK searchProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR view) {
@@ -698,7 +1053,7 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     auto view = reinterpret_cast<View*>(GetWindowLongPtrW(hwnd, DWLP_USER));
     try {
         if (msg == WM_INITDIALOG && app) {
-            view = new View(hwnd);
+            view = new View(hwnd, static_cast<BrowseKind>(l));
             SetWindowLongPtrW(hwnd, DWLP_USER, reinterpret_cast<LONG_PTR>(view));
             app->activeView = hwnd;
             SetWindowSubclass(GetDlgItem(hwnd, IDC_QUERY), searchProc, 1, reinterpret_cast<DWORD_PTR>(hwnd));
@@ -711,9 +1066,16 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         case WM_COMMAND: view->command(LOWORD(w), HIWORD(w)); return TRUE;
         case WM_NOTIFY: {
             auto notification = reinterpret_cast<NMHDR*>(l);
-            if (notification->idFrom == IDC_TRACKS && notification->code == NM_DBLCLK)
-                view->command(IDC_PLAY, 0);
-            if (notification->idFrom == IDC_TRACKS && notification->code == LVN_ITEMCHANGED)
+            if (notification->idFrom != IDC_TRACKS) break;
+            if (notification->code == LVN_GETDISPINFOW) {
+                view->display(*reinterpret_cast<NMLVDISPINFOW*>(l));
+                return TRUE;
+            }
+            if (notification->code == NM_DBLCLK)
+                view->activate(reinterpret_cast<NMITEMACTIVATE*>(l)->iItem);
+            if (notification->code == LVN_KEYDOWN && reinterpret_cast<NMLVKEYDOWN*>(l)->wVKey == VK_RETURN)
+                view->activate(ListView_GetNextItem(view->list, -1, LVNI_SELECTED));
+            if (notification->code == LVN_ITEMCHANGED || notification->code == LVN_ODSTATECHANGED)
                 view->updateButtons();
             break;
         }
@@ -722,6 +1084,8 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         case viewReady:
             if (auto result = app->takeResult(hwnd)) view->receive(std::move(*result));
             return TRUE;
+        case ArtworkLoader::readyMessage: view->receiveArtwork(); return TRUE;
+        case moreRequested: view->fetchMore(); return TRUE;
         case WM_DESTROY:
             if (app) app->forgetView(hwnd);
             SetWindowLongPtrW(hwnd, DWLP_USER, 0);
@@ -752,6 +1116,15 @@ std::filesystem::path profileDirectory() {
     throw Error("WACUP did not provide its profile directory.");
 }
 
+UINT_PTR addTreeItem(const wchar_t* title, UINT_PTR parent, bool branch) {
+    std::wstring label = title;
+    MLTREEITEMW item{sizeof(item), 0, parent, label.data(), 0, branch,
+                    branch ? MLTREEIMAGE_BRANCH : MLTREEIMAGE_DEFAULT};
+    library(ML_IPC_TREEITEM_ADDW, reinterpret_cast<WPARAM>(&item));
+    if (!item.id) throw Error("Tangerine Stream could not add its Media Library entry.");
+    return item.id;
+}
+
 int init() {
     try {
         INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
@@ -762,11 +1135,10 @@ int init() {
         app->attached = true;
         if (!SetTimer(plugin.hwndWinampParent, playbackTimer, 350, nullptr))
             throw Error("WACUP playback tracking could not start.");
-        std::wstring label = pluginName;
-        MLTREEITEMW item{sizeof(item), 0, 0, label.data(), 0, FALSE, MLTREEIMAGE_DEFAULT};
-        library(ML_IPC_TREEITEM_ADDW, reinterpret_cast<WPARAM>(&item));
-        if (!item.id) throw Error("Tangerine Stream could not add its Media Library entry.");
-        app->treeId = item.id;
+        app->treeId = addTreeItem(pluginName, 0, true);
+        app->navigation.emplace(app->treeId, BrowseKind::albums);
+        for (const auto& category : categories)
+            app->navigation.emplace(addTreeItem(category.name, app->treeId, false), category.kind);
         return 0;
     } catch (const std::exception& error) {
         quit();
@@ -792,9 +1164,13 @@ void quit() {
 INT_PTR message(int type, INT_PTR a, INT_PTR b, INT_PTR) {
     if (!app) return 0;
     try {
-        if (type == ML_MSG_TREE_ONCREATEVIEW && static_cast<UINT_PTR>(a) == app->treeId)
-            return reinterpret_cast<INT_PTR>(CreateDialogParamW(plugin.hDllInstance,
-                MAKEINTRESOURCEW(IDD_LIBRARY), reinterpret_cast<HWND>(b), viewProc, 0));
+        if (type == ML_MSG_TREE_ONCREATEVIEW) {
+            auto entry = app->navigation.find(static_cast<UINT_PTR>(a));
+            if (entry != app->navigation.end())
+                return reinterpret_cast<INT_PTR>(CreateDialogParamW(plugin.hDllInstance,
+                    MAKEINTRESOURCEW(IDD_LIBRARY), reinterpret_cast<HWND>(b), viewProc,
+                    static_cast<LPARAM>(entry->second)));
+        }
         if (type == ML_MSG_CONFIG) {
             auto servers = app->store.servers();
             auto selected = std::find_if(servers.begin(), servers.end(),

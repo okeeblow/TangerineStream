@@ -24,6 +24,8 @@ public:
     std::string playbackSecret();
     int playbackPort();
     void savePlaybackPort(int port);
+    bool textCatalog();
+    void saveTextCatalog(bool text);
 
     void remember(std::vector<Track>& tracks);
     std::vector<Track> cached(Id server, const std::string& query, int offset);

@@ -24,7 +24,7 @@ public:
     std::string header(DWORD id) const;
     std::string header(const wchar_t* name) const;
     DWORD read(void* buffer, DWORD size);
-    std::string text();
+    std::string text(std::size_t limit = 32 * MiB);
     DWORD status = 0;
 
 private:
@@ -37,7 +37,8 @@ private:
 class ServerApi {
 public:
     virtual ~ServerApi() = default;
-    virtual std::vector<Track> songs(const std::string& query, int offset) = 0;
+    virtual BrowsePage browse(const BrowseLocation& location, const std::string& query, int offset) = 0;
+    virtual std::string cover(const LibraryItem& item, int size) = 0;
     virtual std::vector<Track> favorites(const std::atomic_bool& stopping) = 0;
     virtual std::unique_ptr<Response> audio(const Track& track, const std::string& range,
                                             bool head) = 0;

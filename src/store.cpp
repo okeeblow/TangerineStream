@@ -266,6 +266,16 @@ void Store::savePlaybackPort(int port) {
     setSetting("playback_port", std::to_string(port));
 }
 
+bool Store::textCatalog() {
+    std::scoped_lock lock(mutex_);
+    return setting("text_catalog") == "1";
+}
+
+void Store::saveTextCatalog(bool text) {
+    std::scoped_lock lock(mutex_);
+    setSetting("text_catalog", text ? "1" : "0");
+}
+
 Track Store::loadTrack(Id key) {
     auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE key=?";
     Statement statement(db_, sql.c_str());

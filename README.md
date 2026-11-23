@@ -1,6 +1,6 @@
 # Tangerine Stream
 
-Tangerine Stream adds a Navidrome and OpenSubsonic song browser to the WACUP Media Library. It supports multiple saved server profiles, playback and enqueueing, offline music, and durable play reports. The plugin targets 32-bit WACUP on Windows 10 or later.
+Tangerine Stream adds Navidrome and OpenSubsonic browsing to the WACUP Media Library. It supports cover-art browsing, multiple server profiles, playback and enqueueing, offline music, and durable play reports. The plugin targets 32-bit WACUP on Windows 10 or later.
 
 ## Build and install
 
@@ -20,14 +20,15 @@ Close WACUP, copy `build/ml_tangerinestream.dll` into its `Plugins` directory, t
 
 1. Select **Add server…** and enter the server base URL, including its installation subpath if it has one, plus the account username and password. Use the HTTPS URL when the server provides one.
 2. Use the default OpenSubsonic browser for Navidrome or another compatible server. Enable **Use Navidrome’s native song browser** to use Navidrome’s native login and song list with OpenSubsonic playback, favorites, and reporting. [Navidrome compatibility](https://www.navidrome.org/docs/developers/subsonic-api/) · [Feishin’s Navidrome controller](https://github.com/jeffvli/feishin/blob/development/src/renderer/api/navidrome/navidrome-controller.ts)
-3. Search or page through the tracks. Double-click a track to play it, or select several tracks and use **Play** or **Enqueue**.
+3. Expand **Tangerine Stream** and choose **Albums**, **Genres**, **Album Artists**, **Artists**, **Tracks**, **Folders**, **Playlists**, **Favorites**, or **Offline Cache**. Album browsing uses the WACUP Media Library's skinned list-view and loads server artwork as you scroll.
+4. Double-click a tile to open it and use **Back** to return to your previous selection. Use **Text list** to browse the same results in rows. Double-click a track to play it, or select several tracks and use **Play** or **Enqueue**.
 
 Add profiles for other servers or accounts and switch between them using the server selector. **Settings** lets you update the profile name, password, browsing mode, and favorite download preference. Each profile keeps its own track IDs, cached music, and pending reports.
 
 ## Offline playback and reports
 
 - The rolling cache is shared by all profiles and defaults to 1,024 MiB. A complete stream is saved locally when it fits. The least recently used rolling entries are evicted as space is needed. A budget of `0` disables rolling storage.
-- Select tracks and use **Keep offline** to download them permanently. **Unpin** returns a track to the rolling cache if it has no automatic favorite pin. **Cache view** shows downloaded tracks and pending offline downloads.
+- Select tracks and use **Keep offline** to download them permanently. **Unpin** returns a track to the rolling cache if it has no automatic favorite pin. **Offline Cache** shows downloaded tracks and pending offline downloads.
 - Enable automatic favorite caching per profile to download starred songs and tracks from starred albums and artists. Favorite downloads stay offline while starred. Permanent and favorite downloads use disk space outside the rolling budget.
 - A play report is saved after listening to half a track or four minutes, whichever comes first. The plugin retries queued batches after connection failures and across WACUP restarts. If a server processes a batch and the acknowledgement is lost, it may receive the batch again. [OpenSubsonic scrobble](https://opensubsonic.github.io/docs/endpoints/scrobble/)
 
