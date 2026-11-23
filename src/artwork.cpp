@@ -172,18 +172,22 @@ std::string ArtworkLoader::trackArtwork(const Track& track) {
 void ArtworkLoader::loadTrack(Id key) {
     auto track = store_.track(key);
     if (!track.key || !store_.networkAvailable(track.server)) return;
-    bool changed = false;
+    auto notifyPlayer = [&] {
+        const auto bits = static_cast<std::uint64_t>(key);
+        if (trackReadyMessage)
+            PostMessageW(player_, trackReadyMessage, static_cast<DWORD>(bits),
+                         static_cast<LPARAM>(static_cast<DWORD>(bits >> 32)));
+    };
     auto connection = connect(store_.server(track.server));
     try {
         const auto item = songArtwork(track);
         if (store_.artwork(track.server, item).empty()) {
             auto data = loadArtwork(store_, *connection, track.server, item);
-            changed = !data.empty();
-            if (!changed && !track.albumId.empty()) {
+            if (data.empty() && !track.albumId.empty()) {
                 auto album = albumArtwork(store_, track);
-                if (store_.artwork(track.server, album).empty())
-                    changed = !loadArtwork(store_, *connection, track.server, album).empty();
+                data = loadArtwork(store_, *connection, track.server, album);
             }
+            if (!data.empty()) notifyPlayer();
         }
     } catch (const ConnectionError&) {
         store_.connectionFailed(track.server);
@@ -192,15 +196,10 @@ void ArtworkLoader::loadTrack(Id key) {
         try {
             auto lyrics = connection->lyrics(track);
             store_.saveLyrics(key, lyrics);
-            changed |= !lyrics.plain.empty();
+            if (!lyrics.plain.empty()) notifyPlayer();
         } catch (const ConnectionError&) {
             store_.connectionFailed(track.server);
         } catch (const std::exception&) {}
-    }
-    if (changed && trackReadyMessage) {
-        auto bits = static_cast<std::uint64_t>(key);
-        PostMessageW(player_, trackReadyMessage, static_cast<DWORD>(bits),
-                     static_cast<LPARAM>(static_cast<DWORD>(bits >> 32)));
     }
 }
 

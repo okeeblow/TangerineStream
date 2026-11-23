@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ml_tangerinestream VERSION 0.4.0 LANGUAGES CXX RC)
+project(ml_tangerinestream VERSION 0.4.1 LANGUAGES CXX RC)
 
 # Early releases cached the bundled SDK as a default. Discard that entry if
 # the SDK moved, while still diagnosing a missing user-supplied override.
