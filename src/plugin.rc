@@ -4,8 +4,8 @@
 IDI_TANGERINE ICON "tangerine.ico"
 
 1 VERSIONINFO
-FILEVERSION 0,5,0,0
-PRODUCTVERSION 0,5,0,0
+FILEVERSION 0,6,0,0
+PRODUCTVERSION 0,6,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_DLL
 BEGIN
@@ -15,11 +15,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "COOLTRAINER"
             VALUE "FileDescription", "Tangerine Stream Media Library Plugin"
-            VALUE "FileVersion", "0.5.0"
+            VALUE "FileVersion", "0.6.0"
             VALUE "InternalName", "ml_tangerinestream"
             VALUE "OriginalFilename", "ml_tangerinestream.dll"
             VALUE "ProductName", "Tangerine Stream"
-            VALUE "ProductVersion", "0.5.0"
+            VALUE "ProductVersion", "0.6.0"
             VALUE "Comments", "By COOLTRAINER"
         END
     END
