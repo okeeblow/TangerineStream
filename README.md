@@ -54,9 +54,11 @@ In **Configure**, select a server and choose a format and maximum bitrate for ea
 | Unmetered | Automatic, 0 kbps | Let the server choose direct play or transcoding with no client bitrate ceiling. |
 | Metered | MP3, 192 kbps | Request MP3 at up to 192 kbps. Skip the separate rolling-cache download. |
 
-Choose **Original** for the server's original file, or select MP3, Opus, AAC, Vorbis, or FLAC. A bitrate of **0** leaves the rate to the server. In Automatic or codec-specific mode, the plug-in sends its playback capabilities and bitrate ceiling to servers advertising the OpenSubsonic transcoding extension. If the server declines the requested quality, playback reports the failure in the library. Older servers receive Subsonic stream parameters and determine which encoder settings they can honor. For those servers, Automatic requests the original file with no ceiling and MP3 with a ceiling. [OpenSubsonic transcoding](https://opensubsonic.github.io/docs/extensions/transcoding/)
+The format menu follows the file types registered by WACUP?s enabled input plug-ins. **Original** prefers the source file. If WACUP lacks an input for it or its input rejects playback at startup, Tangerine Stream requests a playable transcode, preferring FLAC when available. A saved codec preference stays on the profile if its input is disabled. Playback can then use another enabled format within the connection?s bitrate ceiling. A bitrate of **0** leaves the rate to the server.
 
-Permanent downloads use the active connection's quality. With automatic favorite caching enabled, **Upgrade offline favorites to original quality on unmetered connections** can replace a transcoded favorite with its server original. The existing copy stays playable until the replacement finishes. A failed or interrupted upgrade keeps the existing copy for the next attempt.
+Tangerine Stream sends the eligible formats to servers advertising the OpenSubsonic transcoding extension. Older servers receive Subsonic stream parameters. If an input rejects a cached copy, the plug-in can request a replacement stream while online. Offline playback requires a cached file that an enabled input can decode. [OpenSubsonic transcoding](https://opensubsonic.github.io/docs/extensions/transcoding/)
+
+Permanent downloads use the active connection's quality. With automatic favorite caching enabled, **Upgrade offline favorites to original quality on unmetered connections** can replace a transcoded favorite with its server original when WACUP has an input for the source format. The existing copy stays playable until the replacement finishes. A failed or interrupted upgrade keeps the existing copy for the next attempt.
 
 ## Offline playback and reports
 

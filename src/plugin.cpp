@@ -918,7 +918,7 @@ LRESULT CALLBACK playerProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, D
 struct FormatChoice { const char* key; const wchar_t* label; };
 constexpr FormatChoice formats[] = {
     {"auto", L"Automatic"}, {"raw", L"Original"}, {"mp3", L"MP3"}, {"opus", L"Opus"},
-    {"aac", L"AAC"}, {"vorbis", L"Vorbis"}, {"flac", L"FLAC"}
+    {"aac", L"AAC"}, {"vorbis", L"Vorbis"}, {"flac", L"FLAC"}, {"wav", L"WAV"}
 };
 
 struct Settings {
@@ -926,17 +926,28 @@ struct Settings {
     size_t selected;
     int budget;
     bool unified;
+    InputExtensions inputs;
     bool loadingForm = false;
 
-    static void displayQuality(HWND hwnd, int format, int rate, const StreamQuality& quality) {
-        const auto choice = std::find_if(std::begin(formats), std::end(formats),
-            [&](const FormatChoice& f) { return quality.format == f.key; });
-        SendDlgItemMessageW(hwnd, format, CB_SETCURSEL, choice == std::end(formats) ? 0 : choice - formats, 0);
+    void displayQuality(HWND hwnd, int format, int rate, const StreamQuality& quality) const {
+        auto box = GetDlgItem(hwnd, format);
+        SendMessageW(box, CB_RESETCONTENT, 0, 0);
+        for (const auto& f : formats) {
+            const bool available = !strcmp(f.key, "auto") || !strcmp(f.key, "raw") || acceptsCodec(inputs, f.key);
+            if (!available && quality.format != f.key) continue;
+            std::wstring label = f.label;
+            if (!available) label += L" (unavailable)";
+            const auto index = SendMessageW(box, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+            if (index < 0) continue;
+            SendMessageW(box, CB_SETITEMDATA, index, &f - formats);
+            if (quality.format == f.key) SendMessageW(box, CB_SETCURSEL, index, 0);
+        }
         SetDlgItemInt(hwnd, rate, quality.kbps, FALSE);
     }
 
     static StreamQuality readQuality(HWND hwnd, int format, int rate) {
-        const auto index = SendDlgItemMessageW(hwnd, format, CB_GETCURSEL, 0, 0);
+        const auto selected = SendDlgItemMessageW(hwnd, format, CB_GETCURSEL, 0, 0);
+        const auto index = SendDlgItemMessageW(hwnd, format, CB_GETITEMDATA, selected, 0);
         return {formats[index >= 0 && static_cast<size_t>(index) < std::size(formats) ? index : 0].key,
                 static_cast<int>(GetDlgItemInt(hwnd, rate, nullptr, FALSE))};
     }
@@ -1029,8 +1040,6 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             }
             case IDC_METERED_FORMAT: case IDC_UNMETERED_FORMAT:
                 skinWindow(control, SKINNEDWND_TYPE_COMBOBOX);
-                for (const auto& f : formats)
-                    SendMessageW(control, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(f.label));
                 break;
             case IDC_METERED_RATE: case IDC_UNMETERED_RATE:
                 SendMessageW(control, EM_SETLIMITTEXT, 5, 0);
@@ -1146,7 +1155,8 @@ INT_PTR CALLBACK settingsProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 }
 
 void configure(HWND hwnd, Id preferred, bool add = false) {
-    Settings settings{app->store.servers(), 0, app->store.rollingMiB(), app->store.unifiedTree()};
+    app->refreshInputs();
+    Settings settings{app->store.servers(), 0, app->store.rollingMiB(), app->store.unifiedTree(), app->inputs()};
     if (add || settings.profiles.empty()) {
         settings.selected = settings.profiles.size();
         settings.profiles.emplace_back();
