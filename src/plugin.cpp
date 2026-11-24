@@ -1,4 +1,5 @@
 #include "playback.hpp"
+#include "list_scroll.hpp"
 #include "artwork.hpp"
 #include "browse_sort.hpp"
 #include "host_metadata.hpp"
@@ -21,20 +22,7 @@
 #include <thread>
 #include <tuple>
 
-#include "sdk_services.hpp"
-
-// The SDK checks an undefined _MSC_VER as zero and supplies its own intptr_t.
-#ifndef _MSC_VER
-#define _MSC_VER 1900
-#define RESTORE_MINGW_MACROS
-#endif
-#include "gen_ml/ml.h"
-#include "gen_ml/ml_ipc_0313.h"
-#include "Winamp/wa_ipc.h"
-#ifdef RESTORE_MINGW_MACROS
-#undef _MSC_VER
-#undef RESTORE_MINGW_MACROS
-#endif
+#include "ml_sdk.hpp"
 
 namespace tangerine {
 namespace {
@@ -1001,7 +989,7 @@ struct Settings {
             if (row.iItem == ListView_GetItemCount(list)) ListView_InsertItem(list, &row);
             else ListView_SetItemText(list, row.iItem, 0, row.pszText);
         }
-        ListView_SetColumnWidth(list, 0, LVSCW_AUTOSIZE_USEHEADER);
+        ListView_SetColumnWidth(list, 0, listViewportWidth(list));
         ListView_SetItemState(list, static_cast<int>(index), LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
         ListView_EnsureVisible(list, static_cast<int>(index), FALSE);
         const auto& s = profiles.at(index);
@@ -1034,6 +1022,7 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             switch (GetDlgCtrlID(control)) {
             case IDC_SERVERS: {
                 skinWindow(control, SKINNEDWND_TYPE_LISTVIEW, SWLVS_FULLROWSELECT | SWLVS_SELALWAYS | SWLVS_DOUBLEBUFFER);
+                attachListScrollbars(control, plugin.hwndWinampParent);
                 LVCOLUMNW column{};
                 ListView_InsertColumn(control, 0, &column);
                 break;
@@ -1214,6 +1203,7 @@ public:
         if (SetPropW(list, listSkinProc, reinterpret_cast<HANDLE>(proc)) &&
             !SetWindowLongPtrW(list, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(libraryListProc)))
             RemovePropW(list, listSkinProc);
+        attachListScrollbars(list, plugin.hwndWinampParent);
         skinWindow(GetDlgItem(hwnd, IDC_QUERY), SKINNEDWND_TYPE_EDIT, SWES_VCENTER);
         for (int id : {IDC_SEARCH_LABEL, IDC_STATUS})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_STATIC);
@@ -1430,7 +1420,9 @@ void View::scheduleMore() {
 }
 
 void View::updateRowCount() {
+    const int previousWidth = listViewportWidth(list);
     ListView_SetItemCountEx(list, rowCount(), LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
+    if (listViewportWidth(list) != previousWidth) resizeColumns();
     InvalidateRect(list, nullptr, FALSE);
     updateSelection();
 }
@@ -2094,18 +2086,22 @@ void View::layout(int width, int height) {
 }
 
 void View::resizeColumns() {
-    RECT bounds{};
-    GetClientRect(list, &bounds);
-    const auto width = std::max(0L, bounds.right - 2);
+    const int width = listViewportWidth(list);
     if (showTiles()) {
         ListView_SetColumnWidth(list, 0, width);
         for (int i = 1; i < 5; ++i) ListView_SetColumnWidth(list, i, 0);
     } else if (showTracks()) {
         const int weights[] = {33, 20, 24, 8, 15};
-        for (int i = 0; i < 5; ++i) ListView_SetColumnWidth(list, i, MulDiv(width, weights[i], 100));
+        int percent = 0, left = 0;
+        for (int i = 0; i < 5; ++i) {
+            percent += weights[i];
+            const int right = MulDiv(width, percent, 100);
+            ListView_SetColumnWidth(list, i, right - left);
+            left = right;
+        }
     } else {
         ListView_SetColumnWidth(list, 0, MulDiv(width, 2, 3));
-        ListView_SetColumnWidth(list, 1, MulDiv(width, 1, 3));
+        ListView_SetColumnWidth(list, 1, width - MulDiv(width, 2, 3));
         for (int i = 2; i < 5; ++i) ListView_SetColumnWidth(list, i, 0);
     }
 }
