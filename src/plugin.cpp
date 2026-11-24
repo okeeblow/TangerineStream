@@ -852,12 +852,39 @@ LRESULT CALLBACK playerProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, D
     return DefSubclassProc(hwnd, msg, w, l);
 }
 
+struct FormatChoice { const char* key; const wchar_t* label; };
+constexpr FormatChoice formats[] = {
+    {"auto", L"Automatic"}, {"raw", L"Original"}, {"mp3", L"MP3"}, {"opus", L"Opus"},
+    {"aac", L"AAC"}, {"vorbis", L"Vorbis"}, {"flac", L"FLAC"}
+};
+
 struct Settings {
     std::vector<Server> profiles;
     size_t selected;
     int budget;
     bool unified;
     bool loadingForm = false;
+
+    static void displayQuality(HWND hwnd, int format, int rate, const StreamQuality& quality) {
+        const auto choice = std::find_if(std::begin(formats), std::end(formats),
+            [&](const FormatChoice& f) { return quality.format == f.key; });
+        SendDlgItemMessageW(hwnd, format, CB_SETCURSEL, choice == std::end(formats) ? 0 : choice - formats, 0);
+        SetDlgItemInt(hwnd, rate, quality.kbps, FALSE);
+    }
+
+    static StreamQuality readQuality(HWND hwnd, int format, int rate) {
+        const auto index = SendDlgItemMessageW(hwnd, format, CB_GETCURSEL, 0, 0);
+        return {formats[index >= 0 && static_cast<size_t>(index) < std::size(formats) ? index : 0].key,
+                static_cast<int>(GetDlgItemInt(hwnd, rate, nullptr, FALSE))};
+    }
+
+    static void enableQualityFields(HWND hwnd) {
+        EnableWindow(GetDlgItem(hwnd, IDC_UNMETERED_RATE),
+                     readQuality(hwnd, IDC_UNMETERED_FORMAT, IDC_UNMETERED_RATE).format != "raw");
+        EnableWindow(GetDlgItem(hwnd, IDC_METERED_RATE),
+                     readQuality(hwnd, IDC_METERED_FORMAT, IDC_METERED_RATE).format != "raw");
+        EnableWindow(GetDlgItem(hwnd, IDC_UPGRADE_FAVORITES), IsDlgButtonChecked(hwnd, IDC_FAVORITES) == BST_CHECKED);
+    }
 
     void updateTreeOption(HWND hwnd) const {
         size_t defined = 0;
@@ -881,6 +908,9 @@ struct Settings {
         s.password = getText(hwnd, IDC_PASSWORD);
         s.native = IsDlgButtonChecked(hwnd, IDC_NATIVE) == BST_CHECKED;
         s.cacheFavorites = IsDlgButtonChecked(hwnd, IDC_FAVORITES) == BST_CHECKED;
+        s.upgradeFavorites = IsDlgButtonChecked(hwnd, IDC_UPGRADE_FAVORITES) == BST_CHECKED;
+        s.unmetered = readQuality(hwnd, IDC_UNMETERED_FORMAT, IDC_UNMETERED_RATE);
+        s.metered = readQuality(hwnd, IDC_METERED_FORMAT, IDC_METERED_RATE);
     }
 
     void select(HWND hwnd, size_t index) {
@@ -911,6 +941,10 @@ struct Settings {
             reinterpret_cast<LPARAM>(s.id ? L"Leave blank to keep saved password" : L""));
         CheckDlgButton(hwnd, IDC_NATIVE, s.native ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hwnd, IDC_FAVORITES, s.cacheFavorites ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hwnd, IDC_UPGRADE_FAVORITES, s.upgradeFavorites ? BST_CHECKED : BST_UNCHECKED);
+        displayQuality(hwnd, IDC_UNMETERED_FORMAT, IDC_UNMETERED_RATE, s.unmetered);
+        displayQuality(hwnd, IDC_METERED_FORMAT, IDC_METERED_RATE, s.metered);
+        enableQualityFields(hwnd);
         loadingForm = false;
         updateTreeOption(hwnd);
     }
@@ -930,9 +964,18 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                 ListView_InsertColumn(control, 0, &column);
                 break;
             }
+            case IDC_METERED_FORMAT: case IDC_UNMETERED_FORMAT:
+                skinWindow(control, SKINNEDWND_TYPE_COMBOBOX);
+                for (const auto& f : formats)
+                    SendMessageW(control, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(f.label));
+                break;
+            case IDC_METERED_RATE: case IDC_UNMETERED_RATE:
+                SendMessageW(control, EM_SETLIMITTEXT, 5, 0);
+                [[fallthrough]];
             case IDC_NAME: case IDC_URL: case IDC_USERNAME: case IDC_PASSWORD: case IDC_BUDGET:
                 skinWindow(control, SKINNEDWND_TYPE_EDIT, SWES_VCENTER);
                 break;
+            case IDC_UPGRADE_FAVORITES:
             case IDC_UNIFIED: case IDC_NATIVE: case IDC_FAVORITES: case IDC_ADD_SERVER: case IDOK: case IDCANCEL:
                 skinWindow(control, SKINNEDWND_TYPE_BUTTON);
                 break;
@@ -966,6 +1009,11 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         return TRUE;
     }
     try {
+        if ((HIWORD(w) == CBN_SELCHANGE && (LOWORD(w) == IDC_METERED_FORMAT || LOWORD(w) == IDC_UNMETERED_FORMAT)) ||
+            (HIWORD(w) == BN_CLICKED && LOWORD(w) == IDC_FAVORITES)) {
+            settings->enableQualityFields(hwnd);
+            return TRUE;
+        }
         if (LOWORD(w) == IDC_UNIFIED && HIWORD(w) == BN_CLICKED) {
             settings->unified = IsDlgButtonChecked(hwnd, IDC_UNIFIED) == BST_CHECKED;
             return TRUE;

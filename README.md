@@ -45,6 +45,19 @@ The adjacent button shows the current sort, such as **Name** or **Recently added
 
 Playlist entries use the server's artist and track title. Use WACUP's **Album Art** and **Lyrics** windows for track covers and lyrics. Tangerine Stream supplies cover images through the player's album art service and plain lyrics through track metadata. The cache keeps OpenSubsonic line and word timing for future synchronized display. [OpenSubsonic song lyrics](https://opensubsonic.github.io/docs/endpoints/getlyricsbysongid/)
 
+## Streaming quality
+
+In **Configure**, select a server and choose a format and maximum bitrate for each connection. Windows supplies the cost of the preferred Internet connection. Roaming, a data-limit warning, and unknown cost all use the metered setting. A connection change takes effect on the next track. An already cached track plays from disk on either connection.
+
+| Connection | Default | Behavior |
+| --- | --- | --- |
+| Unmetered | Automatic, 0 kbps | Let the server choose direct play or transcoding with no client bitrate ceiling. |
+| Metered | MP3, 128 kbps | Request MP3 at up to 128 kbps. Skip the separate rolling-cache download. |
+
+Choose **Original** for the server's original file, or select MP3, Opus, AAC, Vorbis, or FLAC. A bitrate of **0** leaves the rate to the server. In Automatic or codec-specific mode, the plug-in sends its playback capabilities and bitrate ceiling to servers advertising the OpenSubsonic transcoding extension. If the server declines the requested quality, playback reports the failure in the library. Older servers receive Subsonic stream parameters and determine which encoder settings they can honor. For those servers, Automatic requests the original file with no ceiling and MP3 with a ceiling. [OpenSubsonic transcoding](https://opensubsonic.github.io/docs/extensions/transcoding/)
+
+Permanent downloads use the active connection's quality. With automatic favorite caching enabled, **Upgrade offline favorites to original quality on unmetered connections** can replace a transcoded favorite with its server original. The existing copy stays playable until the replacement finishes. A failed or interrupted upgrade keeps the existing copy for the next attempt.
+
 ## Offline playback and reports
 
 - Choose **Work offline** from the sort menu to browse and search cached albums, genres, artists, folders, playlists, favorites, and tracks with network requests paused. The view also switches to its cache when a server cannot be reached and retries the connection periodically. Pages and relationships are saved as you browse. Open a playlist or folder while connected to make its contents available offline.
@@ -56,6 +69,6 @@ Playlist entries use the server's artist and track title. Use WACUP's **Album Ar
 
 The database and audio cache live under `Plugins/Tangerine Stream` in the WACUP settings directory. Saved passwords use Windows DPAPI for the current user. Each new playlist entry points to a small local `.tstream` reference in that profile. The input plug-in supplies the title, duration and lyrics for that reference, then uses the SDK's `IPC_CANPLAY` to select WACUP's installed input for the cached file or a freshly authenticated server stream. WACUP's selected output plug-in plays the decoded audio. Server credentials stay out of the playlist. The plug-ins communicate inside the WACUP process without a localhost listener.
 
-With rolling caching enabled, playing an uncached track also schedules a separate original-file download. Setting the rolling budget to zero disables that download. Previous releases' downloaded audio is migrated in place. For saved playlists containing old localhost links, re-enqueue the tracks if WACUP routes those links to its HTTP input plug-in.
+With rolling caching enabled, playing an uncached track on an unmetered connection also schedules a separate download using that connection?s quality settings. Setting the rolling budget to zero disables that download. Previous releases' downloaded audio is migrated in place. For saved playlists containing old localhost links, re-enqueue the tracks if WACUP routes those links to its HTTP input plug-in.
 
 Provider integrations implement the interface in [src/server.hpp](src/server.hpp). Playback, caching, and report storage use provider-independent track and profile IDs.
