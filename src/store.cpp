@@ -216,7 +216,7 @@ Store::Store(const std::filesystem::path& directory) : cache_(directory / L"cach
             Statement(db_, "ALTER TABLE servers ADD COLUMN unmetered_format TEXT NOT NULL DEFAULT 'auto'").run();
             Statement(db_, "ALTER TABLE servers ADD COLUMN unmetered_kbps INTEGER NOT NULL DEFAULT 0").run();
             Statement(db_, "ALTER TABLE servers ADD COLUMN metered_format TEXT NOT NULL DEFAULT 'mp3'").run();
-            Statement(db_, "ALTER TABLE servers ADD COLUMN metered_kbps INTEGER NOT NULL DEFAULT 128").run();
+            Statement(db_, "ALTER TABLE servers ADD COLUMN metered_kbps INTEGER NOT NULL DEFAULT 192").run();
             Statement(db_, "ALTER TABLE servers ADD COLUMN upgrade_favorites INTEGER NOT NULL DEFAULT 0").run();
             Statement(db_, "PRAGMA user_version=3").run();
         }

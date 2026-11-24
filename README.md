@@ -52,7 +52,7 @@ In **Configure**, select a server and choose a format and maximum bitrate for ea
 | Connection | Default | Behavior |
 | --- | --- | --- |
 | Unmetered | Automatic, 0 kbps | Let the server choose direct play or transcoding with no client bitrate ceiling. |
-| Metered | MP3, 128 kbps | Request MP3 at up to 128 kbps. Skip the separate rolling-cache download. |
+| Metered | MP3, 192 kbps | Request MP3 at up to 192 kbps. Skip the separate rolling-cache download. |
 
 Choose **Original** for the server's original file, or select MP3, Opus, AAC, Vorbis, or FLAC. A bitrate of **0** leaves the rate to the server. In Automatic or codec-specific mode, the plug-in sends its playback capabilities and bitrate ceiling to servers advertising the OpenSubsonic transcoding extension. If the server declines the requested quality, playback reports the failure in the library. Older servers receive Subsonic stream parameters and determine which encoder settings they can honor. For those servers, Automatic requests the original file with no ceiling and MP3 with a ceiling. [OpenSubsonic transcoding](https://opensubsonic.github.io/docs/extensions/transcoding/)
 

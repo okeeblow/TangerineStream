@@ -27,7 +27,7 @@ struct Server {
     bool native = false;
     bool cacheFavorites = false;
     StreamQuality unmetered{};
-    StreamQuality metered{"mp3", 128};
+    StreamQuality metered{"mp3", 192};
     bool upgradeFavorites = false;
 };
 
