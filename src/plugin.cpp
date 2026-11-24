@@ -896,7 +896,7 @@ struct Settings {
     }
 };
 
-INT_PTR CALLBACK settingsProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
+INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     auto settings = reinterpret_cast<Settings*>(GetWindowLongPtrW(hwnd, DWLP_USER));
     if (msg == WM_INITDIALOG) {
         settings = reinterpret_cast<Settings*>(l);
@@ -946,7 +946,7 @@ INT_PTR CALLBACK settingsProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     }
     if (msg != WM_COMMAND) return FALSE;
     if (LOWORD(w) == IDCANCEL) {
-        EndDialog(hwnd, IDCANCEL);
+        EndDialog(GetParent(hwnd), IDCANCEL);
         return TRUE;
     }
     try {
@@ -996,9 +996,26 @@ INT_PTR CALLBACK settingsProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         app->store.saveProfiles(updated, static_cast<int>(budget), settings->unified);
         settings->profiles = std::move(updated);
         settings->selected = selection;
-        EndDialog(hwnd, IDOK);
-    } catch (const std::exception& error) { showError(hwnd, error); }
+        EndDialog(GetParent(hwnd), IDOK);
+    } catch (const std::exception& error) { showError(GetParent(hwnd), error); }
     return TRUE;
+}
+
+INT_PTR CALLBACK settingsProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
+    // The ML dialog skin draws control borders relative to a borderless library view.
+    // Keep the modal caption on the outer window and skin its child form.
+    if (msg == WM_INITDIALOG) {
+        HWND form = CreateDialogParamW(plugin.hDllInstance, MAKEINTRESOURCEW(IDD_SERVER_FORM),
+                                       hwnd, settingsFormProc, l);
+        if (!form) { EndDialog(hwnd, -1); return TRUE; }
+        SetWindowLongPtrW(hwnd, DWLP_USER, reinterpret_cast<LONG_PTR>(form));
+        return TRUE;
+    }
+    if (msg == WM_COMMAND && (LOWORD(w) == IDOK || LOWORD(w) == IDCANCEL)) {
+        auto form = reinterpret_cast<HWND>(GetWindowLongPtrW(hwnd, DWLP_USER));
+        if (form) return SendMessageW(form, msg, w, l);
+    }
+    return FALSE;
 }
 
 void configure(HWND hwnd, Id preferred, bool add = false) {
