@@ -1902,7 +1902,19 @@ void View::layout(int width, int height) {
     visible(IDC_BACK, !history.empty());
     if (!history.empty()) place(IDC_BACK, gap, 8);
     place(IDC_SEARCH_LABEL, gap, 0);
-    const int menuWidth = controlWidth(IDC_VIEW_MENU, 9);
+    const HWND sortButton = GetDlgItem(hwnd, IDC_VIEW_MENU);
+    auto buttonFont = reinterpret_cast<HFONT>(SendMessageW(sortButton, WM_GETFONT, 0, 0));
+    auto oldFont = buttonFont ? SelectObject(dc, buttonFont) : nullptr;
+    int menuWidth = 0;
+    // WACUP's skinned button reports the ideal size of its current caption.
+    // Measure the whole set in the button font so the toolbar stays still.
+    for (const auto& choice : sortChoices(location.kind)) {
+        RECT text{};
+        DrawTextW(dc, choice.label, -1, &text, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        menuWidth = std::max(menuWidth, static_cast<int>(text.right));
+    }
+    if (oldFont) SelectObject(dc, oldFont);
+    menuWidth += MulDiv(24, dpi, 96);
     const int menuLeft = std::max(0, width - gap - menuWidth);
     const int sourceWidth = std::min(controlWidth(IDC_SOURCE_MENU, 12), width / 3);
     const int sourceLeft = std::max(0, menuLeft - gap - sourceWidth);
