@@ -5,7 +5,14 @@
 // The input DLL borrows the library's open profile. All buffers and the cache
 // file handle are owned by the caller. No C++ objects cross the DLL boundary.
 namespace tangerine {
-enum class InputRequest { recognize, metadata, source, ended };
+enum class InputRequest { recognize, metadata, source, ended, started };
+struct SourceAttempts {
+    // The library marks each returned stream before the input tries it.
+    unsigned excluded = 0;
+    bool triedCache = false;
+    bool rolling = false;
+};
+
 using InputQuery = int (__cdecl *)(InputRequest, const wchar_t*, const wchar_t*,
-                                  wchar_t*, size_t, HANDLE*);
+                                  wchar_t*, size_t, HANDLE*, SourceAttempts*);
 }

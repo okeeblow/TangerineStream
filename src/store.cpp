@@ -788,13 +788,17 @@ void Store::syncFavorites(Id server, BrowsePage& page) {
     transaction.commit();
 }
 
-std::vector<Track> Store::pendingPins(Id server, bool upgradeFavorites) {
+std::vector<Track> Store::pendingPins(Id server, bool upgradeFavorites, const InputExtensions& inputs) {
+    std::string playable = "|";
+    if (upgradeFavorites) {
+        for (const auto& extension : inputs) playable += extension + "|";
+    }
     std::scoped_lock lock(mutex_);
     auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE server=?"
-        " AND (bytes=0 OR (? AND favorite=1 AND cached_format<>''))"
+        " AND (bytes=0 OR (favorite=1 AND cached_format<>'' AND instr(?, '|' || lower(suffix) || '|')>0))"
         " AND (pinned=1 OR favorite=1) AND retry_at<=? ORDER BY pinned DESC,key LIMIT 4";
     Statement statement(db_, sql.c_str());
-    statement.bind(server).bind(upgradeFavorites).bind(nowMs());
+    statement.bind(server).bind(playable).bind(nowMs());
     std::vector<Track> result;
     while (statement.row()) result.push_back(getTrack(statement));
     return result;

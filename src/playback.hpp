@@ -20,6 +20,7 @@ private:
 
 bool meteredInternet();
 void downloadAudio(Store& store, const Track& track, const Server& profile, ServerApi& api,
-                   bool metered, const std::atomic_bool& stopping, bool (*currentCost)() = meteredInternet);
+                   bool metered, const std::atomic_bool& stopping, const InputExtensions& inputs,
+                   unsigned excluded = 0, bool (*currentCost)() = meteredInternet);
 
 } // namespace tangerine

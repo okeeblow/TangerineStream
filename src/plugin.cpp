@@ -10,6 +10,7 @@
 #include <commctrl.h>
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <climits>
 #include <condition_variable>
 #include <deque>
@@ -72,6 +73,27 @@ winampMediaLibraryPlugin plugin = [] {
 
 LRESULT player(UINT command, WPARAM value = 0) {
     return SendMessageW(plugin.hwndWinampParent, WM_WA_IPC, value, command);
+}
+
+InputExtensions enabledExtensions() {
+    // Mode 0 is the host's double-NUL list of extensions from loaded input modules.
+    const auto raw = player(IPC_GET_EXTLISTW);
+    if (static_cast<UINT_PTR>(raw) <= 1) return {};
+    std::unique_ptr<void, decltype(&GlobalFree)> memory(reinterpret_cast<void*>(raw), GlobalFree);
+    InputExtensions result;
+    for (auto entry = static_cast<const wchar_t*>(memory.get()); *entry; entry += wcslen(entry) + 1) {
+        const std::wstring_view group(entry);
+        size_t pos = 0;
+        while ((pos = group.find_first_not_of(L" ;*.\t", pos)) != group.npos) {
+            auto end = group.find_first_of(L" ;\t", pos);
+            auto suffix = utf8(group.substr(pos, end - pos));
+            std::transform(suffix.begin(), suffix.end(), suffix.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            result.insert(std::move(suffix));
+            if (end == group.npos) break;
+            pos = end + 1;
+        }
+    }
+    return result;
 }
 
 LRESULT library(UINT command, WPARAM value = 0) {
@@ -175,6 +197,7 @@ public:
         : store(profile), playback(store, profile), artwork(store, plugin.hwndWinampParent),
           hostMetadata(reinterpret_cast<void*>(player(IPC_GET_API_SERVICE)), store, playback, artwork) {
         try {
+            refreshInputs();
             browser = std::thread([this] { browse(); });
             maintenance = std::thread([this] { maintain(); });
             reporter = std::thread([this] { report(); });
@@ -240,7 +263,18 @@ public:
     void sample(Id startedKey = 0);
     void sendAlbums(std::vector<BrowseLocation> albums, AlbumAction action, mlDropItemStruct drop = {});
     void finishAlbums();
-    void preparePlayback(const Track& track, const wchar_t* filename, bool cacheAudio);
+    void preparePlayback(const Track& track, const wchar_t* filename);
+    void cachePlaying(Id key, unsigned excluded);
+    void refreshInputs() {
+        auto inputs = enabledExtensions();
+        std::scoped_lock lock(maintenanceMutex);
+        extensions = std::move(inputs);
+    }
+    InputExtensions inputs() {
+        std::scoped_lock lock(maintenanceMutex);
+        return extensions;
+    }
+    Clock::time_point nextInputRefresh{};
     void finishPlayback();
     void updateLyrics(Id key);
     std::wstring playlistFile(const Track& track) {
@@ -286,7 +320,9 @@ private:
     std::optional<SearchResult> result;
     bool pendingMaintenance = false, refreshFavorites = false, refreshReports = false;
     std::map<Id, ServiceStatus> serviceStatus;
-    Id rollingRequest = 0;
+    struct RollingRequest { Id key = 0; unsigned excluded = 0; };
+    RollingRequest rollingRequest;
+    InputExtensions extensions;
     std::mutex sidecarMutex;
     Id sidecarKey = 0;
     std::filesystem::path sidecarReference;
@@ -329,7 +365,7 @@ void App::finishPlayback() {
     store.activeCover(0);
 }
 
-void App::preparePlayback(const Track& track, const wchar_t* filename, bool cacheAudio) {
+void App::preparePlayback(const Track& track, const wchar_t* filename) {
     finishPlayback();
     if (std::wstring_view(filename).find(L"://") == std::wstring_view::npos) {
         std::scoped_lock lock(sidecarMutex);
@@ -340,10 +376,13 @@ void App::preparePlayback(const Track& track, const wchar_t* filename, bool cach
     artwork.stageCover(track);
     updateLyrics(track.key);
     artwork.requestTrack(track.key, true);
-    if (cacheAudio && store.rollingMiB() > 0) {
+}
+
+void App::cachePlaying(Id key, unsigned excluded) {
+    if (store.rollingMiB() > 0) {
         {
             std::scoped_lock lock(maintenanceMutex);
-            rollingRequest = track.key;
+            rollingRequest = {key, excluded};
             pendingMaintenance = true;
         }
         maintenanceReady.notify_one();
@@ -368,7 +407,9 @@ void App::updateLyrics(Id key) {
 }
 
 int inputQuery(InputRequest request, const wchar_t* filename, const wchar_t* field,
-               wchar_t* dest, size_t capacity, HANDLE* lease) {
+               wchar_t* dest, size_t capacity, HANDLE* lease, SourceAttempts* attempts) {
+    // IPC can reenter a plug-in. Ask the host before taking the profile lifetime lock.
+    const auto inputs = request == InputRequest::source ? enabledExtensions() : InputExtensions{};
     std::shared_lock lock(inputMutex);
     auto* owner = inputProfile;
     if (!owner || !filename) return 0;
@@ -381,6 +422,7 @@ int inputQuery(InputRequest request, const wchar_t* filename, const wchar_t* fie
         return 1;
     }
     if (request == InputRequest::ended) { owner->finishPlayback(); return 1; }
+    if (request == InputRequest::started && attempts) { owner->cachePlaying(id, attempts->excluded); return 1; }
     if (!dest || !capacity) return 0;
     auto track = owner->store.track(id);
     if (!track.key) return 0;
@@ -389,28 +431,42 @@ int inputQuery(InputRequest request, const wchar_t* filename, const wchar_t* fie
         auto tag = trackMetadata(owner->store, owner->artwork, track, field);
         if (!tag) return 0;
         value = wide(*tag);
-    } else if (request == InputRequest::source && lease) {
-        std::filesystem::path cached;
-        bool rolling = false;
-        owner->playbackError(track.server, {});
-        *lease = owner->store.openCached(id, cached);
-        if (*lease != INVALID_HANDLE_VALUE) {
-            value = cached.wstring();
-            owner->store.touch(id);
-        } else {
-            if (!owner->store.networkAvailable(track.server)) return 0;
+    } else if (request == InputRequest::source && lease && attempts) {
+        const bool first = !attempts->triedCache;
+        *lease = INVALID_HANDLE_VALUE;
+        attempts->rolling = false;
+        if (first) {
+            attempts->triedCache = true;
+            owner->playbackError(track.server, {});
+            std::filesystem::path cached;
+            // IPC_CANPLAY also lets a decoder recognize a real file by probing it.
+            *lease = owner->store.openCached(id, cached);
+            if (*lease != INVALID_HANDLE_VALUE) {
+                value = cached.wstring();
+                if (track.cachedFormat.empty()) attempts->excluded |= originalSource;
+                owner->store.touch(id);
+            }
+        }
+        if (value.empty()) {
+            if (!owner->store.networkAvailable(track.server)) {
+                owner->playbackError(track.server, "Playback: No playable cached copy is available offline.");
+                return 0;
+            }
             try {
                 const auto profile = owner->store.server(track.server);
                 const bool metered = meteredInternet();
-                value = wide(connect(profile)->stream(track, metered ? profile.metered : profile.unmetered).url);
-                rolling = !metered;
+                const auto stream = connect(profile)->stream(track, metered ? profile.metered : profile.unmetered,
+                                                             inputs, attempts->excluded);
+                attempts->excluded |= stream.choice;
+                value = wide(stream.url);
+                attempts->rolling = !metered;
             } catch (const std::exception& error) {
                 owner->playbackError(track.server, std::string("Playback: ") + error.what());
                 return 0;
             }
         }
         if (value.size() >= capacity) return 0;
-        owner->preparePlayback(track, filename, rolling);
+        if (first) owner->preparePlayback(track, filename);
     } else return 0;
     lstrcpynW(dest, value.c_str(), static_cast<int>(std::min<size_t>(capacity, INT_MAX)));
     return 1;
@@ -555,24 +611,24 @@ void App::maintain() {
     using namespace std::chrono;
     std::map<Id, Clock::time_point> nextFavorites;
     for (;;) {
-        Id requested = 0;
+        RollingRequest requested;
         {
             std::unique_lock lock(maintenanceMutex);
             maintenanceReady.wait_for(lock, seconds(5), [this] { return stopping || pendingMaintenance; });
             if (stopping) return;
-            requested = std::exchange(rollingRequest, 0);
+            requested = std::exchange(rollingRequest, RollingRequest{});
             pendingMaintenance = false;
             if (refreshFavorites) nextFavorites.clear();
             refreshFavorites = false;
         }
         std::vector<Server> profiles;
         try {
-            if (requested) {
-                auto track = store.track(requested);
+            if (requested.key) {
+                auto track = store.track(requested.key);
                 if (track.key && !track.bytes && store.networkAvailable(track.server)) {
                     try {
                         const auto profile = store.server(track.server);
-                        if (!meteredInternet()) downloadAudio(store, track, profile, *connect(profile), false, stopping);
+                        if (!meteredInternet()) downloadAudio(store, track, profile, *connect(profile), false, stopping, inputs(), requested.excluded);
                     }
                     catch (const ConnectionError&) { store.connectionFailed(track.server); }
                     catch (const Error&) { /* Rolling storage is optional during streaming. */ }
@@ -619,11 +675,12 @@ void App::maintain() {
             std::string failure;
             try {
                 const bool upgrade = profile.cacheFavorites && profile.upgradeFavorites && !meteredInternet();
-                for (const auto& track : store.pendingPins(profile.id, upgrade)) {
+                const auto enabled = inputs();
+                for (const auto& track : store.pendingPins(profile.id, upgrade, enabled)) {
                     if (stopping) return;
                     if (!store.networkAvailable(profile.id)) break;
                     try {
-                        downloadAudio(store, track, profile, connection(), meteredInternet(), stopping);
+                        downloadAudio(store, track, profile, connection(), meteredInternet(), stopping, enabled);
                         artwork.requestTrack(track.key);
                     } catch (const std::exception& error) {
                         if (dynamic_cast<const ConnectionError*>(&error)) store.connectionFailed(profile.id);
@@ -844,7 +901,13 @@ LRESULT CALLBACK playerProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, D
     if (app && ((msg == WM_TIMER && w == playbackTimer) ||
                 (msg == WM_WA_IPC && l == IPC_PLAYING_FILEW && w > 1))) {
         try {
-            if (msg == WM_TIMER) app->finishAlbums();
+            if (msg == WM_TIMER) {
+                if (Clock::now() >= app->nextInputRefresh) {
+                    app->nextInputRefresh = Clock::now() + std::chrono::seconds(30);
+                    app->refreshInputs();
+                }
+                app->finishAlbums();
+            }
             auto key = msg == WM_WA_IPC ? app->playback.key(reinterpret_cast<const wchar_t*>(w)) : 0;
             app->sample(key);
         } catch (const std::exception& error) { app->reportError = error.what(); }
@@ -2288,9 +2351,9 @@ extern "C" __declspec(dllexport) winampMediaLibraryPlugin* winampGetMediaLibrary
     return &tangerine::plugin;
 }
 
-extern "C" __declspec(dllexport) int __cdecl tangerineInputQueryV1(
+extern "C" __declspec(dllexport) int __cdecl tangerineInputQueryV2(
     tangerine::InputRequest request, const wchar_t* filename, const wchar_t* field,
-    wchar_t* dest, size_t capacity, HANDLE* lease) {
-    try { return tangerine::inputQuery(request, filename, field, dest, capacity, lease); }
+    wchar_t* dest, size_t capacity, HANDLE* lease, tangerine::SourceAttempts* attempts) {
+    try { return tangerine::inputQuery(request, filename, field, dest, capacity, lease, attempts); }
     catch (...) { return 0; }
 }

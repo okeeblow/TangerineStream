@@ -11,8 +11,12 @@ namespace tangerine {
 
 using Parameters = std::vector<std::pair<std::string, std::string>>;
 
+bool acceptsCodec(const InputExtensions& inputs, std::string_view codec);
+
+constexpr unsigned originalSource = 1;
 struct AudioStream {
     std::string url;
+    unsigned choice; // One bit per candidate, for bounded decoder retries.
     std::string format; // Empty for the original; otherwise the output container's file extension.
 };
 
@@ -46,7 +50,8 @@ public:
     virtual std::string cover(const LibraryItem& item, int size) = 0;
     virtual Lyrics lyrics(const Track& track) = 0;
     virtual BrowsePage favorites(const std::atomic_bool& stopping) = 0;
-    virtual AudioStream stream(const Track& track, const StreamQuality& quality) = 0;
+    virtual AudioStream stream(const Track& track, const StreamQuality& quality,
+                               const InputExtensions& inputs, unsigned excluded = 0) = 0;
     virtual void submit(const std::vector<Report>& reports) = 0;
 };
 

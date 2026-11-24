@@ -50,7 +50,7 @@ public:
     void saveLyrics(Id key, const Lyrics& lyrics);
     void pin(const std::vector<Track>& tracks, bool permanent);
     void syncFavorites(Id server, BrowsePage& page);
-    std::vector<Track> pendingPins(Id server, bool upgradeFavorites);
+    std::vector<Track> pendingPins(Id server, bool upgradeFavorites, const InputExtensions& inputs);
     void postponePin(Id key);
 
     HANDLE openCached(Id key, std::filesystem::path& path);

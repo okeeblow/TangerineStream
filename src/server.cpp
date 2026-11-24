@@ -423,37 +423,64 @@ void appendItems(std::vector<LibraryItem>& result, const Json& items, BrowseKind
     }
 }
 
-struct AudioFormat { const char* codec; const char* container; const char* suffix; };
-constexpr AudioFormat audioFormats[] = {
-    {"mp3", "mp3", "mp3"}, {"opus", "ogg", "opus"}, {"aac", "mp4", "m4a"},
-    {"vorbis", "ogg", "ogg"}, {"flac", "flac", "flac"}
+struct AudioFormat {
+    const char* codec;
+    const char* container;
+    const char* suffix;
 };
 
-std::string clientCapabilities(const StreamQuality& quality) {
-    const bool automatic = quality.format == "auto";
+constexpr AudioFormat audioFormats[] = {
+    {"mp3", "mp3", "mp3"}, {"opus", "ogg", "opus"}, {"aac", "mp4", "m4a"},
+    {"aac", "aac", "aac"}, {"vorbis", "ogg", "ogg"}, {"flac", "flac", "flac"},
+    {"wav", "wav", "wav"}
+};
+
+unsigned choice(const AudioFormat& format) {
+    return 2u << (&format - audioFormats);
+}
+
+std::string playableSuffix(const InputExtensions& inputs, const AudioFormat& format) {
+    if (inputs.count(format.suffix)) return format.suffix;
+    if (std::string_view(format.container) == "mp4" && inputs.count("mp4")) return "mp4";
+    return {};
+}
+
+using Targets = std::vector<const AudioFormat*>;
+
+std::string clientCapabilities(int kbps, const Targets& targets, bool directPlay, bool allowAlac,
+                               const std::string& extraContainer) {
     std::string direct, transcode;
-    for (const auto& f : audioFormats) {
-        if (!automatic && quality.format != f.codec) continue;
-        if (!direct.empty()) {
-            direct += ',';
-            transcode += ',';
+    for (const auto* f : targets) {
+        const auto codec = jsonString(f->codec), container = jsonString(f->container);
+        if (directPlay) {
+            if (!direct.empty()) direct += ',';
+            auto containers = container;
+            if (std::string_view(f->suffix) != f->container) containers += "," + jsonString(f->suffix);
+            auto codecs = codec;
+            if (allowAlac && std::string_view(f->container) == "mp4") codecs += ",\"alac\"";
+            if (std::string_view(f->codec) == "wav") codecs += ",\"pcm\",\"pcm_s16le\",\"pcm_s24le\"";
+            direct += "{\"containers\":[" + containers + "],\"audioCodecs\":[" + codecs + "],\"protocols\":[\"http\"]}";
         }
-        const auto codec = jsonString(f.codec), container = jsonString(f.container);
-        direct += "{\"containers\":[" + container;
-        if (std::string_view(f.codec) == "opus") direct += ",\"opus\"";
-        if (std::string_view(f.codec) == "aac") direct += ",\"aac\",\"m4a\"";
-        direct += "],\"audioCodecs\":[" + codec + "],\"protocols\":[\"http\"]}";
+        if (!transcode.empty()) transcode += ',';
         transcode += "{\"container\":" + container + ",\"audioCodec\":" + codec + ",\"protocol\":\"http\"}";
     }
-    if (direct.empty() || quality.kbps < 0 || quality.kbps > 100000)
-        throw Error("Invalid streaming quality in server settings.");
-    if (automatic)
-        direct += ",{\"containers\":[\"mp4\",\"m4a\"],\"audioCodecs\":[\"alac\"],\"protocols\":[\"http\"]}"
-                  ",{\"containers\":[\"wav\"],\"audioCodecs\":[\"wav\",\"pcm_s16le\",\"pcm_s24le\"],\"protocols\":[\"http\"]}";
-    const auto bps = std::to_string(quality.kbps * 1000);
+    if (!extraContainer.empty()) {
+        if (!direct.empty()) direct += ',';
+        direct += "{\"containers\":[" + jsonString(extraContainer) + "],\"protocols\":[\"http\"]}";
+    }
+    const auto bps = std::to_string(kbps * 1000);
     return "{\"name\":\"Tangerine Stream\",\"platform\":\"WACUP\",\"maxAudioBitrate\":" + bps +
         ",\"maxTranscodingAudioBitrate\":" + bps + ",\"directPlayProfiles\":[" + direct +
         "],\"transcodingProfiles\":[" + transcode + "],\"codecProfiles\":[]}";
+}
+
+bool matchesStream(const AudioFormat& f, const Json& details, bool allowAlac, bool direct) {
+    const auto container = details.at("container").string();
+    if (container != f.container && container != f.suffix) return false;
+    const auto codec = details.at("codec").string();
+    if (codec == f.codec) return true;
+    if (direct && allowAlac && std::string_view(f.container) == "mp4" && codec == "alac") return true;
+    return direct && container == "wav" && (codec == "pcm" || codec.find("pcm_") == 0);
 }
 
 std::string escapedDecisionToken(const std::string& token) {
@@ -674,45 +701,88 @@ public:
         return result;
     }
 
-    AudioStream stream(const Track& track, const StreamQuality& quality) override {
-        auto original = [&] { return AudioStream{url("stream", {{"id", track.id}, {"format", "raw"}}), {}}; };
-        if (quality.format == "raw") return original();
-        const bool automatic = quality.format == "auto";
-        const auto body = clientCapabilities(quality);
-        if (!hasTranscoding()) {
-            if (automatic && !quality.kbps) return original();
-            const std::string format = automatic ? "mp3" : quality.format == "vorbis" ? "ogg" : quality.format;
-            Parameters params{{"id", track.id}, {"format", format}};
-            if (quality.kbps) params.emplace_back("maxBitRate", std::to_string(quality.kbps));
-            return {url("stream", std::move(params)), format};
-        }
-        Parameters media{{"mediaId", track.id}, {"mediaType", "song"}};
-        auto reply = api("getTranscodeDecision", media, nullptr, body);
-        const auto& decision = reply.at("transcodeDecision");
-        auto allowed = [&](const char* key) {
-            auto flag = std::get_if<bool>(&decision.at(key).value);
-            return flag && *flag;
-        };
-        auto fits = [&](const Json& details) {
-            const auto codec = details.at("codec").string();
-            return (automatic || codec == quality.format) &&
-                (!quality.kbps || details.at("audioBitrate").seconds() <= quality.kbps * 1000);
-        };
-        if (allowed("canDirectPlay") && fits(decision.at("sourceStream"))) return original();
-        const auto& output = decision.at("transcodeStream");
-        const auto token = decision.at("transcodeParams").string();
-        if (!allowed("canTranscode") || token.empty() || output.at("protocol").string() != "http" || !fits(output)) {
-            const auto reason = decision.at("errorReason").string();
-            throw Error(reason.empty() ? "The server could not provide the requested streaming quality." : reason.substr(0, 300));
-        }
-        const auto container = output.at("container").string(), codec = output.at("codec").string();
+    AudioStream stream(const Track& track, const StreamQuality& quality,
+                       const InputExtensions& inputs, unsigned excluded) override {
+        const bool preferOriginal = quality.format == "raw";
+        const bool direct = !(excluded & originalSource) && acceptsExtension(inputs, track.suffix);
+        const int kbps = preferOriginal ? 0 : quality.kbps;
+        if (kbps < 0 || kbps > 100000) throw Error("Invalid streaming bitrate in server settings.");
+        auto original = [&] { return AudioStream{url("stream", {{"id", track.id}, {"format", "raw"}}), originalSource, {}}; };
+
+        Targets preferred, alternatives;
         for (const auto& f : audioFormats) {
-            if (codec != f.codec) continue;
-            if (container != f.container && container != f.suffix && !(codec == "aac" && container == "aac")) continue;
-            return {url("getTranscodeStream", media) + "&transcodeParams=" + escapedDecisionToken(token),
-                    container == "aac" ? "aac" : f.suffix};
+            if ((excluded & choice(f)) || playableSuffix(inputs, f).empty()) continue;
+            (quality.format == f.codec ? preferred : alternatives).push_back(&f);
         }
-        throw Error("The server selected an unsupported streaming format.");
+        if (preferOriginal) {
+            const auto lossless = std::find_if(alternatives.begin(), alternatives.end(), [](const AudioFormat* f) {
+                return std::string_view(f->codec) == "flac";
+            });
+            if (lossless != alternatives.end()) std::rotate(alternatives.begin(), lossless, lossless + 1);
+        }
+        const bool directOnly = preferred.empty() && alternatives.empty();
+        if (directOnly && !direct) throw Error("No enabled WACUP input can play the remaining stream formats.");
+        if (!hasTranscoding()) {
+            if (!kbps && direct && (preferOriginal || quality.format == "auto" || directOnly)) return original();
+            if (directOnly) throw Error("No enabled WACUP input supports a transcoding target within the selected bitrate.");
+            const auto& f = *(preferred.empty() ? alternatives.front() : preferred.front());
+            const std::string format = std::string_view(f.codec) == "vorbis" ? "ogg" : f.codec;
+            Parameters params{{"id", track.id}, {"format", format}};
+            if (kbps) params.emplace_back("maxBitRate", std::to_string(kbps));
+            return {url("stream", std::move(params)), choice(f), playableSuffix(inputs, f)};
+        }
+
+        Parameters media{{"mediaId", track.id}, {"mediaType", "song"}};
+        std::string reason;
+        for (const auto* targets : {&preferred, &alternatives}) {
+            if (targets->empty() && !(directOnly && targets == &alternatives)) continue;
+            const bool allowAlac = targets == &alternatives;
+            // A specialist input (e.g. Monkey's Audio) may play originals even
+            // though the server has no corresponding transcoding target.
+            std::string extraContainer;
+            if (direct && allowAlac && (directOnly || std::none_of(std::begin(audioFormats), std::end(audioFormats),
+                [&](const AudioFormat& f) { return track.suffix == f.suffix || track.suffix == f.container; })))
+                extraContainer = track.suffix;
+            bool offerDirect = direct;
+            for (;;) {
+                Json reply;
+                try {
+                    reply = api("getTranscodeDecision", media, nullptr,
+                                clientCapabilities(kbps, *targets, offerDirect, allowAlac, offerDirect ? extraContainer : ""));
+                } catch (const SubsonicError& error) {
+                    // Some servers report an unavailable encoder as a generic API error.
+                    if (error.code != 0 || targets != &preferred || alternatives.empty()) throw;
+                    break;
+                }
+                const auto& decision = reply.at("transcodeDecision");
+                auto allowed = [&](const char* key) {
+                    auto flag = std::get_if<bool>(&decision.at(key).value);
+                    return flag && *flag;
+                };
+                auto withinRate = [&](const Json& details) {
+                    return !kbps || details.at("audioBitrate").seconds() <= kbps * 1000;
+                };
+                const auto& source = decision.at("sourceStream");
+                if (offerDirect && allowed("canDirectPlay") && withinRate(source)) {
+                    if (!extraContainer.empty() && source.at("container").string() == extraContainer) return original();
+                    for (const auto* f : *targets)
+                        if (matchesStream(*f, source, allowAlac, true)) return original();
+                }
+                const auto& output = decision.at("transcodeStream");
+                const auto token = decision.at("transcodeParams").string();
+                if (allowed("canTranscode") && !token.empty() && output.at("protocol").string() == "http" && withinRate(output)) {
+                    for (const auto* f : *targets) {
+                        if (matchesStream(*f, output, false, false))
+                            return {url("getTranscodeStream", media) + "&transcodeParams=" + escapedDecisionToken(token),
+                                    choice(*f), playableSuffix(inputs, *f)};
+                    }
+                }
+                reason = decision.at("errorReason").string();
+                if (!offerDirect || !allowed("canDirectPlay") || targets->empty()) break;
+                offerDirect = false;
+            }
+        }
+        throw Error(reason.empty() ? "The server could not supply a format playable by the enabled WACUP inputs." : reason.substr(0, 300));
     }
 
     void submit(const std::vector<Report>& reports) override {
@@ -1021,6 +1091,17 @@ std::string normalizeUrl(std::string url) {
     splitUrl(wide(url));
     while (!url.empty() && url.back() == '/') url.pop_back();
     return url;
+}
+
+bool acceptsExtension(const InputExtensions& inputs, std::string suffix) {
+    std::transform(suffix.begin(), suffix.end(), suffix.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return inputs.count(suffix) != 0;
+}
+
+bool acceptsCodec(const InputExtensions& inputs, std::string_view codec) {
+    return std::any_of(std::begin(audioFormats), std::end(audioFormats), [&](const AudioFormat& f) {
+        return f.codec == codec && !playableSuffix(inputs, f).empty();
+    });
 }
 
 Response::Response(const std::string& url, const wchar_t* method,

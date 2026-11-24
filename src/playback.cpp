@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cctype>
 #include <limits>
+#include <optional>
 #include <netlistmgr.h>
 
 namespace tangerine {
@@ -164,29 +165,45 @@ bool meteredInternet() {
 }
 
 void downloadAudio(Store& store, const Track& track, const Server& profile, ServerApi& api,
-                   bool metered, const std::atomic_bool& stopping, bool (*currentCost)()) {
-    const bool upgrade = !metered && profile.upgradeFavorites && track.favorite;
+                   bool metered, const std::atomic_bool& stopping, const InputExtensions& inputs,
+                   unsigned excluded, bool (*currentCost)()) {
+    const bool upgrade = !metered && profile.upgradeFavorites && track.favorite &&
+        !(excluded & originalSource) && acceptsExtension(inputs, track.suffix);
     if (track.bytes && !(upgrade && !track.cachedFormat.empty())) return;
     if (metered && !track.favorite && !track.pinned) return;
-    auto stream = api.stream(track, upgrade ? StreamQuality{"raw", 0} :
-                                      (metered ? profile.metered : profile.unmetered));
-    if (stopping || !store.networkAvailable(track.server) || currentCost() != metered) return;
-    Response response(stream.url, L"GET", L"");
-    auto mime = response.header(WINHTTP_QUERY_CONTENT_TYPE);
-    if (response.status == 408 || response.status >= 500)
-        throw ConnectionError("The server returned HTTP " + std::to_string(response.status) + ".");
-    if (response.status != 200 || (!mime.empty() && !audioType(mime)))
-        throw Error("The server did not provide a complete audio file.");
-    // Legacy servers can pick a different container (notably AAC in MP4).
-    if (!stream.format.empty()) {
-        mime = mime.substr(0, mime.find(';'));
-        if (mime == "audio/mp4" || mime == "video/mp4" || mime == "audio/x-m4a") stream.format = "m4a";
-        else if (mime == "audio/aac") stream.format = "aac";
-        else if (mime == "audio/ogg" && stream.format != "opus") stream.format = "ogg";
-        else if (mime == "audio/mpeg") stream.format = "mp3";
-        else if (mime == "audio/flac" || mime == "audio/x-flac") stream.format = "flac";
+    const auto quality = upgrade ? StreamQuality{"raw", 0} : (metered ? profile.metered : profile.unmetered);
+    AudioStream stream;
+    std::optional<Response> response;
+    for (;;) {
+        stream = api.stream(track, quality, inputs, excluded);
+        if (track.bytes && stream.choice != originalSource) {
+            // A shared container can hold a codec the available decoder cannot play.
+            // Keep the existing favorite when the server also recommends a transcode.
+            store.postponePin(track.key);
+            return;
+        }
+        if (stopping || !store.networkAvailable(track.server) || currentCost() != metered) return;
+        response.emplace(stream.url, L"GET", L"");
+        auto mime = response->header(WINHTTP_QUERY_CONTENT_TYPE);
+        if (response->status == 408 || response->status >= 500)
+            throw ConnectionError("The server returned HTTP " + std::to_string(response->status) + ".");
+        if (response->status != 200 || (!mime.empty() && !audioType(mime)))
+            throw Error("The server did not provide a complete audio file.");
+        // Legacy servers can pick a different container (notably AAC in MP4).
+        if (!stream.format.empty()) {
+            mime = mime.substr(0, mime.find(';'));
+            if (mime == "audio/mp4" || mime == "video/mp4" || mime == "audio/x-m4a")
+                stream.format = inputs.count("m4a") ? "m4a" : "mp4";
+            else if (mime == "audio/aac") stream.format = "aac";
+            else if (mime == "audio/ogg" && stream.format != "opus") stream.format = "ogg";
+            else if (mime == "audio/mpeg") stream.format = "mp3";
+            else if (mime == "audio/flac" || mime == "audio/x-flac") stream.format = "flac";
+        }
+        if (stream.format.empty() || acceptsExtension(inputs, stream.format)) break;
+        // A legacy encoder can return a different container from the one requested.
+        excluded |= stream.choice;
     }
-    CacheWrite cache(store, track, number(response.header(WINHTTP_QUERY_CONTENT_LENGTH)), upgrade);
+    CacheWrite cache(store, track, number(response->header(WINHTTP_QUERY_CONTENT_LENGTH)), upgrade);
     if (!cache) {
         if (cache.reserved()) throw Error("The cache file could not be opened for writing.");
         return;
@@ -198,7 +215,7 @@ void downloadAudio(Store& store, const Track& track, const Server& profile, Serv
             if (!store.networkAvailable(track.server) || currentCost() != metered) return;
             nextCheck = std::chrono::steady_clock::now() + std::chrono::seconds(1);
         }
-        auto count = response.read(buffer, sizeof(buffer));
+        auto count = response->read(buffer, sizeof(buffer));
         if (count == 0) {
             if (!cache.finish(stream.format)) throw Error("The audio file could not be cached.");
             return;

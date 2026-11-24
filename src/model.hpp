@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -12,6 +13,9 @@ namespace tangerine {
 using Id = std::int64_t;
 constexpr std::int64_t MiB = 1024 * 1024;
 constexpr int pageSize = 100;
+
+using InputExtensions = std::set<std::string, std::less<>>;
+bool acceptsExtension(const InputExtensions& inputs, std::string suffix);
 
 struct StreamQuality {
     std::string format = "auto";

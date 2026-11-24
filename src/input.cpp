@@ -36,16 +36,16 @@ In_Module* selectInput(const wchar_t* source) {
 }
 
 int query(InputRequest op, const wchar_t* filename, const wchar_t* field = nullptr,
-          wchar_t* value = nullptr, size_t capacity = 0, HANDLE* file = nullptr) {
+          wchar_t* value = nullptr, size_t capacity = 0, HANDLE* file = nullptr, tangerine::SourceAttempts* attempts = nullptr) {
     if (!filename || !*filename) return 0;
     std::wstring_view name(filename);
     bool marker = name.size() > 8 && !_wcsicmp(filename + name.size() - 8, L".tstream");
     if (!marker && name.substr(0, 17) != L"http://127.0.0.1:") return 0;
     HMODULE library = nullptr;
     if (!GetModuleHandleExW(0, L"ml_tangerinestream.dll", &library)) return 0;
-    auto address = reinterpret_cast<void*>(GetProcAddress(library, "tangerineInputQueryV1"));
+    auto address = reinterpret_cast<void*>(GetProcAddress(library, "tangerineInputQueryV2"));
     auto fn = reinterpret_cast<tangerine::InputQuery>(address);
-    int result = fn ? fn(op, filename, field, value, capacity, file) : 0;
+    int result = fn ? fn(op, filename, field, value, capacity, file, attempts) : 0;
     FreeLibrary(library);
     return result;
 }
@@ -125,11 +125,19 @@ int play(const wchar_t* filename) {
             current = filename;
         }
         std::vector<wchar_t> source(32768);
-        if (query(InputRequest::source, filename, nullptr, source.data(), source.size(), &lease)) {
-            getFileInfo(filename, nullptr, &duration);
-            bool started = playNative(source.data());
+        tangerine::SourceAttempts attempts;
+        getFileInfo(filename, nullptr, &duration);
+        for (;;) {
+            auto previous = attempts;
+            if (!query(InputRequest::source, filename, nullptr, source.data(), source.size(), &lease, &attempts)) break;
+            const bool started = playNative(source.data());
             SecureZeroMemory(source.data(), source.size() * sizeof(wchar_t));
-            if (started) return 0;
+            if (started) {
+                if (attempts.rolling) query(InputRequest::started, filename, nullptr, nullptr, 0, nullptr, &previous);
+                return 0;
+            }
+            if (lease != INVALID_HANDLE_VALUE) { CloseHandle(lease); lease = INVALID_HANDLE_VALUE; }
+            if (previous.triedCache == attempts.triedCache && previous.excluded == attempts.excluded) break;
         }
     } catch (...) {}
     stop();
