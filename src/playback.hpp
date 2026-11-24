@@ -18,7 +18,8 @@ private:
     std::wstring legacy_;
 };
 
-void downloadPinned(Store& store, const Track& track, ServerApi& api,
-                    const std::atomic_bool& stopping);
+bool meteredInternet();
+void downloadAudio(Store& store, const Track& track, const Server& profile, ServerApi& api,
+                   bool metered, const std::atomic_bool& stopping, bool (*currentCost)() = meteredInternet);
 
 } // namespace tangerine

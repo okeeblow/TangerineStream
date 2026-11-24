@@ -50,13 +50,14 @@ public:
     void saveLyrics(Id key, const Lyrics& lyrics);
     void pin(const std::vector<Track>& tracks, bool permanent);
     void syncFavorites(Id server, BrowsePage& page);
-    std::vector<Track> pendingPins(Id server);
+    std::vector<Track> pendingPins(Id server, bool upgradeFavorites);
     void postponePin(Id key);
 
     HANDLE openCached(Id key, std::filesystem::path& path);
     std::filesystem::path partialPath(Id key) const;
-    bool reserve(Id key, std::int64_t bytes);
-    void publish(Id key, std::int64_t bytes, const std::string& mime);
+    bool reserve(Id key, std::int64_t bytes, bool upgrade);
+    bool growReservation(Id key, std::int64_t bytes);
+    bool publish(Id key, std::int64_t bytes, const std::string& format);
     void release(Id key);
     void touch(Id key);
     void trim();

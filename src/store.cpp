@@ -105,7 +105,7 @@ private:
 
 constexpr char trackColumns[] =
     "key,server,remote_id,title,artist,album,suffix,mime,duration,pinned,favorite,bytes,"
-    "cover_id,album_id,artist_id,album_artist_id,album_artist,genre,disc_number,track_number,year,sort_tags";
+    "cover_id,album_id,artist_id,album_artist_id,album_artist,genre,disc_number,track_number,year,sort_tags,cached_format";
 
 Track getTrack(const Statement& statement) {
     return {statement.integer(0), statement.integer(1), statement.text(2), statement.text(3),
@@ -114,7 +114,7 @@ Track getTrack(const Statement& statement) {
             statement.integer(10) != 0, statement.integer(11), statement.text(12), statement.text(13),
             statement.text(14), statement.text(15), statement.text(16), statement.text(17),
             static_cast<int>(statement.integer(18)), static_cast<int>(statement.integer(19)),
-            static_cast<int>(statement.integer(20)), decodeSortTags(statement.text(21))};
+            static_cast<int>(statement.integer(20)), decodeSortTags(statement.text(21)), statement.text(22)};
 }
 
 std::string protect(std::string password) {
@@ -211,6 +211,15 @@ Store::Store(const std::filesystem::path& directory) : cache_(directory / L"cach
             Statement(db_, "ALTER TABLE catalog ADD COLUMN sort_tags TEXT NOT NULL DEFAULT ''").run();
             Statement(db_, "PRAGMA user_version=2").run();
         }
+        if (schema < 3) {
+            Statement(db_, "ALTER TABLE tracks ADD COLUMN cached_format TEXT NOT NULL DEFAULT ''").run();
+            Statement(db_, "ALTER TABLE servers ADD COLUMN unmetered_format TEXT NOT NULL DEFAULT 'auto'").run();
+            Statement(db_, "ALTER TABLE servers ADD COLUMN unmetered_kbps INTEGER NOT NULL DEFAULT 0").run();
+            Statement(db_, "ALTER TABLE servers ADD COLUMN metered_format TEXT NOT NULL DEFAULT 'mp3'").run();
+            Statement(db_, "ALTER TABLE servers ADD COLUMN metered_kbps INTEGER NOT NULL DEFAULT 128").run();
+            Statement(db_, "ALTER TABLE servers ADD COLUMN upgrade_favorites INTEGER NOT NULL DEFAULT 0").run();
+            Statement(db_, "PRAGMA user_version=3").run();
+        }
         Statement(db_, "CREATE TABLE IF NOT EXISTS catalog_totals (server INTEGER NOT NULL REFERENCES servers(id),"
             "kind INTEGER NOT NULL,id TEXT NOT NULL,songs INTEGER NOT NULL,duration INTEGER NOT NULL,"
             "PRIMARY KEY(server,kind,id)) WITHOUT ROWID").run();
@@ -252,20 +261,26 @@ void Store::setSetting(const char* key, const std::string& value) {
 
 std::vector<Server> Store::servers() {
     std::scoped_lock lock(mutex_);
-    Statement statement(db_, "SELECT id,name,url,user,native,cache_favorites FROM servers ORDER BY name,id");
+    Statement statement(db_, "SELECT id,name,url,user,native,cache_favorites,unmetered_format,unmetered_kbps,"
+        "metered_format,metered_kbps,upgrade_favorites FROM servers ORDER BY name,id");
     std::vector<Server> result;
     while (statement.row())
         result.push_back({statement.integer(0), statement.text(1), statement.text(2), statement.text(3), {},
-                          statement.integer(4) != 0, statement.integer(5) != 0});
+                          statement.integer(4) != 0, statement.integer(5) != 0,
+                          {statement.text(6), static_cast<int>(statement.integer(7))},
+                          {statement.text(8), static_cast<int>(statement.integer(9))}, statement.integer(10) != 0});
     return result;
 }
 
 Server Store::loadServer(Id id) {
-    Statement statement(db_, "SELECT name,url,user,password,native,cache_favorites FROM servers WHERE id=?");
+    Statement statement(db_, "SELECT name,url,user,password,native,cache_favorites,unmetered_format,unmetered_kbps,"
+        "metered_format,metered_kbps,upgrade_favorites FROM servers WHERE id=?");
     statement.bind(id);
     if (!statement.row()) throw Error("The selected server is unavailable.");
     return {id, statement.text(0), statement.text(1), statement.text(2), unprotect(statement.text(3)),
-            statement.integer(4) != 0, statement.integer(5) != 0};
+            statement.integer(4) != 0, statement.integer(5) != 0,
+            {statement.text(6), static_cast<int>(statement.integer(7))},
+            {statement.text(8), static_cast<int>(statement.integer(9))}, statement.integer(10) != 0};
 }
 
 Server Store::server(Id id) {
@@ -290,6 +305,9 @@ Id Store::saveProfile(const Server& server) {
             Statement(db_, "UPDATE servers SET password=? WHERE id=?")
                 .bind(protect(server.password)).bind(id).run();
     }
+    Statement(db_, "UPDATE servers SET unmetered_format=?,unmetered_kbps=?,metered_format=?,metered_kbps=?,"
+        "upgrade_favorites=? WHERE id=?").bind(server.unmetered.format).bind(server.unmetered.kbps)
+        .bind(server.metered.format).bind(server.metered.kbps).bind(server.upgradeFavorites).bind(id).run();
     if (!server.cacheFavorites)
         Statement(db_, "UPDATE tracks SET favorite=0 WHERE server=? AND favorite=1").bind(id).run();
     return id;
@@ -401,7 +419,7 @@ void Store::rememberUnlocked(std::vector<Track>& tracks) {
             " title=coalesce(nullif(excluded.title,''),tracks.title),"
             "artist=coalesce(nullif(excluded.artist,''),tracks.artist),"
             "album=coalesce(nullif(excluded.album,''),tracks.album),"
-            "suffix=CASE WHEN tracks.bytes>0 THEN tracks.suffix ELSE excluded.suffix END,"
+            "suffix=CASE WHEN tracks.bytes>0 AND tracks.cached_format='' THEN tracks.suffix ELSE coalesce(nullif(excluded.suffix,''),tracks.suffix) END,"
             "duration=coalesce(nullif(excluded.duration,0),tracks.duration),"
             "cover_id=coalesce(nullif(excluded.cover_id,''),tracks.cover_id),"
             "album_id=coalesce(nullif(excluded.album_id,''),tracks.album_id),"
@@ -413,7 +431,7 @@ void Store::rememberUnlocked(std::vector<Track>& tracks) {
             "track_number=coalesce(nullif(excluded.track_number,0),tracks.track_number),"
             "year=coalesce(nullif(excluded.year,0),tracks.year),"
             "sort_tags=coalesce(nullif(excluded.sort_tags,''),tracks.sort_tags),"
-            "mime=CASE WHEN tracks.bytes>0 THEN tracks.mime ELSE excluded.mime END")
+            "mime=CASE WHEN tracks.bytes>0 AND tracks.cached_format='' THEN tracks.mime ELSE coalesce(nullif(excluded.mime,''),tracks.mime) END")
             .bind(track.server).bind(track.id).bind(track.title).bind(track.artist)
             .bind(track.album).bind(track.suffix).bind(track.mime).bind(track.duration)
             .bind(track.coverId).bind(track.albumId).bind(track.artistId).bind(track.albumArtistId)
@@ -770,12 +788,13 @@ void Store::syncFavorites(Id server, BrowsePage& page) {
     transaction.commit();
 }
 
-std::vector<Track> Store::pendingPins(Id server) {
+std::vector<Track> Store::pendingPins(Id server, bool upgradeFavorites) {
     std::scoped_lock lock(mutex_);
-    auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE server=? AND bytes=0"
+    auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE server=?"
+        " AND (bytes=0 OR (? AND favorite=1 AND cached_format<>''))"
         " AND (pinned=1 OR favorite=1) AND retry_at<=? ORDER BY pinned DESC,key LIMIT 4";
     Statement statement(db_, sql.c_str());
-    statement.bind(server).bind(nowMs());
+    statement.bind(server).bind(upgradeFavorites).bind(nowMs());
     std::vector<Track> result;
     while (statement.row()) result.push_back(getTrack(statement));
     return result;
@@ -787,11 +806,11 @@ void Store::postponePin(Id key) {
 }
 
 std::filesystem::path Store::audioPath(const Track& track) const {
-    auto suffix = track.suffix;
+    auto suffix = track.cachedFormat.empty() ? track.suffix : track.cachedFormat;
     if (suffix.empty() || suffix.size() > 12 ||
         suffix.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != suffix.npos)
         suffix = "mp3";
-    return cache_ / (std::to_wstring(track.key) + L".media." + wide(suffix));
+    return cache_ / (std::to_wstring(track.key) + (track.cachedFormat.empty() ? L".media." : L".encoded.") + wide(suffix));
 }
 
 HANDLE Store::openCached(Id key, std::filesystem::path& path) {
@@ -808,31 +827,36 @@ std::filesystem::path Store::partialPath(Id key) const { return cache_ / (std::t
 void Store::reconcile() {
     Statement saved(db_, "SELECT key,bytes FROM tracks WHERE bytes>0");
     std::vector<Id> missing;
-    std::map<Id, std::uintmax_t> files;
-    while (saved.row()) files.emplace(saved.integer(0), saved.integer(1));
-    for (const auto& [key, bytes] : files) {
+    std::map<Id, std::filesystem::path> files;
+    while (saved.row()) {
+        const auto key = saved.integer(0);
+        const auto bytes = static_cast<std::uintmax_t>(saved.integer(1));
         std::error_code error;
-        auto path = audioPath(loadTrack(key));
+        auto track = loadTrack(key);
+        auto path = audioPath(track);
         auto legacy = cache_ / (std::to_wstring(key) + L".audio");
-        if (!std::filesystem::exists(path) && std::filesystem::exists(legacy))
+        if (track.cachedFormat.empty() && !std::filesystem::exists(path) && std::filesystem::exists(legacy))
             std::filesystem::rename(legacy, path);
         if (std::filesystem::file_size(path, error) != bytes || error) missing.push_back(key);
+        else files.emplace(key, path);
     }
     for (const auto& entry : std::filesystem::directory_iterator(cache_)) {
         auto extension = entry.path().extension();
         auto stem = entry.path().stem().string();
         const bool media = stem.size() > 6 && stem.compare(stem.size()-6, 6, ".media") == 0;
+        const bool encoded = stem.size() > 8 && stem.compare(stem.size()-8, 8, ".encoded") == 0;
         if (media) stem.resize(stem.size()-6);
+        if (encoded) stem.resize(stem.size()-8);
         Id key;
         auto parsed = std::from_chars(stem.data(), stem.data() + stem.size(), key);
         if (parsed.ec != std::errc{} || parsed.ptr != stem.data() + stem.size()) continue;
-        if (extension == L".part" || ((media || extension == L".audio") &&
-            (!files.count(key) || std::find(missing.begin(), missing.end(), key) != missing.end()))) {
+        if (extension == L".part" || ((media || encoded || extension == L".audio") &&
+            (!files.count(key) || files.at(key) != entry.path()))) {
             std::error_code error;
             std::filesystem::remove(entry.path(), error);
         }
     }
-    for (Id key : missing) Statement(db_, "UPDATE tracks SET bytes=0 WHERE key=?").bind(key).run();
+    for (Id key : missing) Statement(db_, "UPDATE tracks SET bytes=0,cached_format='' WHERE key=?").bind(key).run();
 }
 
 bool Store::trimUnlocked(std::int64_t incoming) {
@@ -852,37 +876,57 @@ bool Store::trimUnlocked(std::int64_t incoming) {
     for (const auto& [key, bytes] : candidates) {
         auto path = audioPath(loadTrack(key));
         if (!DeleteFileW(path.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) continue;
-        Statement(db_, "UPDATE tracks SET bytes=0 WHERE key=?").bind(key).run();
+        Statement(db_, "UPDATE tracks SET bytes=0,cached_format='' WHERE key=?").bind(key).run();
         used -= bytes;
         if (used <= budget_ - incoming) return true;
     }
     return false;
 }
 
-bool Store::reserve(Id key, std::int64_t bytes) {
+bool Store::reserve(Id key, std::int64_t bytes, bool upgrade) {
     std::scoped_lock lock(mutex_);
     auto track = loadTrack(key);
-    if (!track.key || track.bytes > 0 || downloads_.count(key)) return false;
-    if (!track.pinned && !track.favorite && (bytes <= 0 || !trimUnlocked(bytes))) return false;
+    if (!track.key || downloads_.count(key)) return false;
+    if (track.bytes > 0 && !(upgrade && track.favorite && !track.cachedFormat.empty())) return false;
+    if (!track.pinned && !track.favorite && (!budget_ || !trimUnlocked(std::max<std::int64_t>(bytes, 0)))) return false;
     downloads_.emplace(key, bytes > 0 ? bytes : 0);
     return true;
 }
 
-void Store::publish(Id key, std::int64_t bytes, const std::string& mime) {
+bool Store::growReservation(Id key, std::int64_t bytes) {
+    std::scoped_lock lock(mutex_);
+    auto& reserved = downloads_.at(key);
+    if (bytes <= reserved) return true;
+    const auto track = loadTrack(key);
+    if (!track.pinned && !track.favorite && !trimUnlocked(bytes - reserved)) return false;
+    reserved = bytes;
+    return true;
+}
+
+bool Store::publish(Id key, std::int64_t bytes, const std::string& format) {
     std::scoped_lock lock(mutex_);
     downloads_.at(key) = 0;
     auto track = loadTrack(key);
-    if (bytes <= 0 || (!track.pinned && !track.favorite && !trimUnlocked(bytes))) return;
+    if (bytes <= 0 || (!track.pinned && !track.favorite && !trimUnlocked(bytes))) return false;
+    if (track.bytes) {
+        if (!track.favorite || track.cachedFormat.empty() || !format.empty()) return false;
+        Statement enabled(db_, "SELECT 1 FROM servers WHERE id=? AND cache_favorites=1 AND upgrade_favorites=1");
+        if (!enabled.bind(track.server).row()) return false;
+    }
+    const auto previous = track.bytes ? audioPath(track) : std::filesystem::path{};
+    track.cachedFormat = format;
     if (!MoveFileExW(partialPath(key).c_str(), audioPath(track).c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         throw Error("The completed audio file could not be saved.");
     try {
-        Statement(db_, "UPDATE tracks SET bytes=?,last_use=?,mime=?,retry_at=0 WHERE key=?")
-            .bind(bytes).bind(nowMs()).bind(mime).bind(key).run();
+        Statement(db_, "UPDATE tracks SET bytes=?,last_use=?,cached_format=?,retry_at=0 WHERE key=?")
+            .bind(bytes).bind(nowMs()).bind(format).bind(key).run();
     } catch (...) {
         DeleteFileW(audioPath(track).c_str());
         throw;
     }
+    if (!previous.empty()) DeleteFileW(previous.c_str());
+    return true;
 }
 
 void Store::release(Id key) {

@@ -13,6 +13,11 @@ using Id = std::int64_t;
 constexpr std::int64_t MiB = 1024 * 1024;
 constexpr int pageSize = 100;
 
+struct StreamQuality {
+    std::string format = "auto";
+    int kbps = 0;
+};
+
 struct Server {
     Id id = 0;
     std::string name;
@@ -21,6 +26,9 @@ struct Server {
     std::string password;
     bool native = false;
     bool cacheFavorites = false;
+    StreamQuality unmetered{};
+    StreamQuality metered{"mp3", 128};
+    bool upgradeFavorites = false;
 };
 
 using SortTags = std::map<std::string, std::string, std::less<>>;
@@ -43,6 +51,8 @@ struct Track {
     std::string coverId, albumId, artistId, albumArtistId, albumArtist, genre;
     int discNumber = 0, trackNumber = 0, year = 0;
     SortTags sortTags{};
+    // Empty for an original file. Source tags always describe the server's library.
+    std::string cachedFormat{};
 };
 
 // These values are also stored in the catalog database.

@@ -157,7 +157,7 @@ struct Playing {
 };
 
 struct ServiceStatus {
-    std::string reports, favorites, downloads;
+    std::string reports, favorites, downloads, playback;
 };
 
 enum class AlbumAction { play, enqueue, drop };
@@ -228,9 +228,14 @@ public:
     std::string maintenanceError(Id server) {
         std::scoped_lock lock(maintenanceMutex);
         const auto& status = serviceStatus[server];
+        if (!status.playback.empty()) return status.playback;
         if (!status.reports.empty()) return status.reports;
         if (!status.favorites.empty()) return status.favorites;
         return status.downloads;
+    }
+    void playbackError(Id server, std::string message) {
+        std::scoped_lock lock(maintenanceMutex);
+        serviceStatus[server].playback = std::move(message);
     }
     void sample(Id startedKey = 0);
     void sendAlbums(std::vector<BrowseLocation> albums, AlbumAction action, mlDropItemStruct drop = {});
@@ -386,16 +391,26 @@ int inputQuery(InputRequest request, const wchar_t* filename, const wchar_t* fie
         value = wide(*tag);
     } else if (request == InputRequest::source && lease) {
         std::filesystem::path cached;
+        bool rolling = false;
+        owner->playbackError(track.server, {});
         *lease = owner->store.openCached(id, cached);
         if (*lease != INVALID_HANDLE_VALUE) {
             value = cached.wstring();
             owner->store.touch(id);
         } else {
             if (!owner->store.networkAvailable(track.server)) return 0;
-            value = wide(connect(owner->store.server(track.server))->streamUrl(track));
+            try {
+                const auto profile = owner->store.server(track.server);
+                const bool metered = meteredInternet();
+                value = wide(connect(profile)->stream(track, metered ? profile.metered : profile.unmetered).url);
+                rolling = !metered;
+            } catch (const std::exception& error) {
+                owner->playbackError(track.server, std::string("Playback: ") + error.what());
+                return 0;
+            }
         }
         if (value.size() >= capacity) return 0;
-        owner->preparePlayback(track, filename, *lease == INVALID_HANDLE_VALUE);
+        owner->preparePlayback(track, filename, rolling);
     } else return 0;
     lstrcpynW(dest, value.c_str(), static_cast<int>(std::min<size_t>(capacity, INT_MAX)));
     return 1;
@@ -555,7 +570,10 @@ void App::maintain() {
             if (requested) {
                 auto track = store.track(requested);
                 if (track.key && !track.bytes && store.networkAvailable(track.server)) {
-                    try { downloadPinned(store, track, *connect(store.server(track.server)), stopping); }
+                    try {
+                        const auto profile = store.server(track.server);
+                        if (!meteredInternet()) downloadAudio(store, track, profile, *connect(profile), false, stopping);
+                    }
                     catch (const ConnectionError&) { store.connectionFailed(track.server); }
                     catch (const Error&) { /* Rolling storage is optional during streaming. */ }
                 }
@@ -600,11 +618,12 @@ void App::maintain() {
             }
             std::string failure;
             try {
-                for (const auto& track : store.pendingPins(profile.id)) {
+                const bool upgrade = profile.cacheFavorites && profile.upgradeFavorites && !meteredInternet();
+                for (const auto& track : store.pendingPins(profile.id, upgrade)) {
                     if (stopping) return;
                     if (!store.networkAvailable(profile.id)) break;
                     try {
-                        downloadPinned(store, track, connection(), stopping);
+                        downloadAudio(store, track, profile, connection(), meteredInternet(), stopping);
                         artwork.requestTrack(track.key);
                     } catch (const std::exception& error) {
                         if (dynamic_cast<const ConnectionError*>(&error)) store.connectionFailed(profile.id);

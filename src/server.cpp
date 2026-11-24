@@ -3,11 +3,13 @@
 #include <bcrypt.h>
 #include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <variant>
 
@@ -421,6 +423,54 @@ void appendItems(std::vector<LibraryItem>& result, const Json& items, BrowseKind
     }
 }
 
+struct AudioFormat { const char* codec; const char* container; const char* suffix; };
+constexpr AudioFormat audioFormats[] = {
+    {"mp3", "mp3", "mp3"}, {"opus", "ogg", "opus"}, {"aac", "mp4", "m4a"},
+    {"vorbis", "ogg", "ogg"}, {"flac", "flac", "flac"}
+};
+
+std::string clientCapabilities(const StreamQuality& quality) {
+    const bool automatic = quality.format == "auto";
+    std::string direct, transcode;
+    for (const auto& f : audioFormats) {
+        if (!automatic && quality.format != f.codec) continue;
+        if (!direct.empty()) {
+            direct += ',';
+            transcode += ',';
+        }
+        const auto codec = jsonString(f.codec), container = jsonString(f.container);
+        direct += "{\"containers\":[" + container;
+        if (std::string_view(f.codec) == "opus") direct += ",\"opus\"";
+        if (std::string_view(f.codec) == "aac") direct += ",\"aac\",\"m4a\"";
+        direct += "],\"audioCodecs\":[" + codec + "],\"protocols\":[\"http\"]}";
+        transcode += "{\"container\":" + container + ",\"audioCodec\":" + codec + ",\"protocol\":\"http\"}";
+    }
+    if (direct.empty() || quality.kbps < 0 || quality.kbps > 100000)
+        throw Error("Invalid streaming quality in server settings.");
+    if (automatic)
+        direct += ",{\"containers\":[\"mp4\",\"m4a\"],\"audioCodecs\":[\"alac\"],\"protocols\":[\"http\"]}"
+                  ",{\"containers\":[\"wav\"],\"audioCodecs\":[\"wav\",\"pcm_s16le\",\"pcm_s24le\"],\"protocols\":[\"http\"]}";
+    const auto bps = std::to_string(quality.kbps * 1000);
+    return "{\"name\":\"Tangerine Stream\",\"platform\":\"WACUP\",\"maxAudioBitrate\":" + bps +
+        ",\"maxTranscodingAudioBitrate\":" + bps + ",\"directPlayProfiles\":[" + direct +
+        "],\"transcodingProfiles\":[" + transcode + "],\"codecProfiles\":[]}";
+}
+
+std::string escapedDecisionToken(const std::string& token) {
+    // The extension defines an opaque, already escaped query value. Escape any
+    // remaining reserved characters without encoding existing %HH sequences twice.
+    std::string escaped;
+    for (size_t i = 0; i < token.size(); ++i) {
+        if (token[i] == '%' && i + 2 < token.size() &&
+            std::isxdigit(static_cast<unsigned char>(token[i + 1])) &&
+            std::isxdigit(static_cast<unsigned char>(token[i + 2]))) {
+            escaped.append(token, i, 3);
+            i += 2;
+        } else escaped += percent(std::string_view(token).substr(i, 1));
+    }
+    return escaped;
+}
+
 class Subsonic : public ServerApi {
 public:
     explicit Subsonic(Server server) : server_(std::move(server)) {}
@@ -624,15 +674,45 @@ public:
         return result;
     }
 
-    std::string streamUrl(const Track& track) override {
-        return url("stream", {{"id", track.id}, {"format", "raw"}});
-    }
-
-    std::unique_ptr<Response> audio(const Track& track, const std::string& range,
-                                    bool head) override {
-        auto headers = range.empty() ? L"" : L"Range: " + wide(range) + L"\r\n";
-        return std::make_unique<Response>(streamUrl(track),
-                                          head ? L"HEAD" : L"GET", headers);
+    AudioStream stream(const Track& track, const StreamQuality& quality) override {
+        auto original = [&] { return AudioStream{url("stream", {{"id", track.id}, {"format", "raw"}}), {}}; };
+        if (quality.format == "raw") return original();
+        const bool automatic = quality.format == "auto";
+        const auto body = clientCapabilities(quality);
+        if (!hasTranscoding()) {
+            if (automatic && !quality.kbps) return original();
+            const std::string format = automatic ? "mp3" : quality.format == "vorbis" ? "ogg" : quality.format;
+            Parameters params{{"id", track.id}, {"format", format}};
+            if (quality.kbps) params.emplace_back("maxBitRate", std::to_string(quality.kbps));
+            return {url("stream", std::move(params)), format};
+        }
+        Parameters media{{"mediaId", track.id}, {"mediaType", "song"}};
+        auto reply = api("getTranscodeDecision", media, nullptr, body);
+        const auto& decision = reply.at("transcodeDecision");
+        auto allowed = [&](const char* key) {
+            auto flag = std::get_if<bool>(&decision.at(key).value);
+            return flag && *flag;
+        };
+        auto fits = [&](const Json& details) {
+            const auto codec = details.at("codec").string();
+            return (automatic || codec == quality.format) &&
+                (!quality.kbps || details.at("audioBitrate").seconds() <= quality.kbps * 1000);
+        };
+        if (allowed("canDirectPlay") && fits(decision.at("sourceStream"))) return original();
+        const auto& output = decision.at("transcodeStream");
+        const auto token = decision.at("transcodeParams").string();
+        if (!allowed("canTranscode") || token.empty() || output.at("protocol").string() != "http" || !fits(output)) {
+            const auto reason = decision.at("errorReason").string();
+            throw Error(reason.empty() ? "The server could not provide the requested streaming quality." : reason.substr(0, 300));
+        }
+        const auto container = output.at("container").string(), codec = output.at("codec").string();
+        for (const auto& f : audioFormats) {
+            if (codec != f.codec) continue;
+            if (container != f.container && container != f.suffix && !(codec == "aac" && container == "aac")) continue;
+            return {url("getTranscodeStream", media) + "&transcodeParams=" + escapedDecisionToken(token),
+                    container == "aac" ? "aac" : f.suffix};
+        }
+        throw Error("The server selected an unsupported streaming format.");
     }
 
     void submit(const std::vector<Report>& reports) override {
@@ -744,8 +824,33 @@ private:
             {"c", "ml_tangerinestream"}, {"f", "json"}});
         return server_.url + "/rest/" + endpoint + ".view" + queryString(parameters);
     }
-    Json api(const std::string& endpoint, Parameters parameters = {}, std::string* original = nullptr) {
-        Response response(url(endpoint, std::move(parameters)), L"GET", L"");
+    bool hasTranscoding() {
+        using Clock = std::chrono::steady_clock;
+        static std::mutex mutex;
+        static std::map<std::pair<std::string,std::string>, std::pair<Clock::time_point,bool>> known;
+        const auto key = std::make_pair(server_.url, server_.user);
+        {
+            std::scoped_lock lock(mutex);
+            auto it = known.find(key);
+            if (it != known.end() && it->second.first > Clock::now()) return it->second.second;
+        }
+        bool supported = false;
+        try {
+            auto extensions = api("getOpenSubsonicExtensions");
+            for (const auto& e : extensions.at("openSubsonicExtensions").array())
+                if (e.at("name").string() == "transcoding")
+                    for (const auto& version : e.at("versions").array()) supported |= version.seconds() == 1;
+        } catch (const SubsonicError& error) {
+            if (error.code != 0 && error.code != 70) throw;
+        }
+        std::scoped_lock lock(mutex);
+        known[key] = {Clock::now() + std::chrono::minutes(10), supported};
+        return supported;
+    }
+    Json api(const std::string& endpoint, Parameters parameters = {}, std::string* original = nullptr,
+             const std::string& body = {}) {
+        Response response(url(endpoint, std::move(parameters)), body.empty() ? L"GET" : L"POST",
+                          body.empty() ? L"" : L"Content-Type: application/json\r\n", body);
         if (response.status == 404 || response.status == 501)
             throw SubsonicError(70, "The server does not provide this resource.");
         std::string payload;
