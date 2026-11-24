@@ -878,6 +878,7 @@ struct Settings {
             if (row.iItem == ListView_GetItemCount(list)) ListView_InsertItem(list, &row);
             else ListView_SetItemText(list, row.iItem, 0, row.pszText);
         }
+        ListView_SetColumnWidth(list, 0, LVSCW_AUTOSIZE_USEHEADER);
         ListView_SetItemState(list, static_cast<int>(index), LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
         ListView_EnsureVisible(list, static_cast<int>(index), FALSE);
         const auto& s = profiles.at(index);
@@ -906,11 +907,7 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             switch (GetDlgCtrlID(control)) {
             case IDC_SERVERS: {
                 skinWindow(control, SKINNEDWND_TYPE_LISTVIEW, SWLVS_FULLROWSELECT | SWLVS_SELALWAYS | SWLVS_DOUBLEBUFFER);
-                RECT r{};
-                GetClientRect(control, &r);
                 LVCOLUMNW column{};
-                column.mask = LVCF_WIDTH;
-                column.cx = std::max(1L, r.right - GetSystemMetrics(SM_CXVSCROLL));
                 ListView_InsertColumn(control, 0, &column);
                 break;
             }
