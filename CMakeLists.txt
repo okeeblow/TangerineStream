@@ -1,5 +1,20 @@
-cmake_minimum_required(VERSION 3.20)
-project(ml_tangerinestream VERSION 0.6.2 LANGUAGES CXX RC)
+cmake_minimum_required(VERSION 3.20...3.27)
+
+if(NOT DEFINED ENV{HUNTER_ROOT} AND DEFINED ENV{USERPROFILE})
+    file(TO_CMAKE_PATH "$ENV{USERPROFILE}/.hunter" default_hunter_root)
+    set(HUNTER_ROOT "${default_hunter_root}" CACHE PATH "Hunter package cache")
+endif()
+set(HUNTER_USE_CACHE_SERVERS NO CACHE STRING "Use Hunter remote binary caches")
+include(cmake/HunterGate.cmake)
+HunterGate(
+    URL "https://github.com/cpp-pm/hunter/archive/v0.26.12.tar.gz"
+    SHA1 6498c5d0dec25d7fffb2b0574ebaf265179b894d
+    LOCAL
+)
+project(ml_tangerinestream VERSION 0.6.2 LANGUAGES C CXX RC)
+
+hunter_add_package(simdjson)
+find_package(simdjson CONFIG REQUIRED)
 
 set(WINAMP_SDK "" CACHE PATH "Winamp SDK directory override")
 set(sdk_directory "${WINAMP_SDK}")
@@ -97,7 +112,7 @@ target_include_directories(ml_tangerinestream SYSTEM PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Wasabi"
     "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Agave")
 target_link_libraries(ml_tangerinestream PRIVATE
-    comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
+    simdjson::simdjson comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
 
 if(MINGW)
     if(CMAKE_SIZEOF_VOID_P EQUAL 4)

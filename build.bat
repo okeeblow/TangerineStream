@@ -37,6 +37,8 @@ if not exist "%ts_mingw%\g++.exe" (
 )
 set "MSYSTEM=MINGW32"
 set "PATH=%ts_mingw%;%PATH%"
+set "CC=%ts_mingw%\gcc.exe"
+set "CXX=%ts_mingw%\g++.exe"
 where /q cmake.exe
 if errorlevel 1 goto missing_cmake
 for %%I in (ninja.exe) do set "ts_ninja=%%~$PATH:I"
@@ -50,6 +52,7 @@ set "ts_parallel=--parallel"
 set "ts_mingw_cmake=%ts_mingw:\=/%"
 set "ts_ninja_cmake=%ts_ninja:\=/%"
 cmake.exe -S . -B "%ts_build%" -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+    "-DCMAKE_C_COMPILER=%ts_mingw_cmake%/gcc.exe" ^
     "-DCMAKE_CXX_COMPILER=%ts_mingw_cmake%/g++.exe" "-DCMAKE_RC_COMPILER=%ts_mingw_cmake%/windres.exe" ^
     "-DCMAKE_MAKE_PROGRAM=%ts_ninja_cmake%"
 goto build
@@ -67,6 +70,8 @@ if not defined ts_vsdir (
 )
 call "%ts_vsdir%\VC\Auxiliary\Build\vcvars32.bat"
 if errorlevel 1 goto finish
+set "CC=cl.exe"
+set "CXX=cl.exe"
 where /q cmake.exe
 if errorlevel 1 goto missing_cmake
 set "ts_build=build-vs"

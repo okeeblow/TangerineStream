@@ -2,16 +2,14 @@
 
 #include <bcrypt.h>
 #include <algorithm>
-#include <charconv>
+#include <simdjson.h>
 #include <cctype>
 #include <chrono>
 #include <climits>
-#include <cstdlib>
-#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
-#include <variant>
+#include <optional>
 
 namespace tangerine {
 namespace {
@@ -95,180 +93,77 @@ public:
     int code;
 };
 
-struct Json {
-    using Array = std::vector<Json>;
-    using Object = std::map<std::string, Json, std::less<>>;
-    std::variant<std::monostate, bool, double, std::string, Array, Object> value;
+// Missing optional fields behave like empty collections or strings in both APIs.
+struct JsonArray {
+    simdjson::simdjson_result<simdjson::dom::array> value;
+    using Iterator = simdjson::dom::array::iterator;
 
-    const Json& at(std::string_view key) const {
-        static const Json missing{};
-        auto object = std::get_if<Object>(&value);
-        if (!object) return missing;
-        auto entry = object->find(key);
-        return entry == object->end() ? missing : entry->second;
+    Iterator begin() const { return value.error() ? Iterator{} : value.value_unsafe().begin(); }
+    Iterator end() const { return value.error() ? Iterator{} : value.value_unsafe().end(); }
+    std::size_t size() const { return value.error() ? 0 : value.value_unsafe().size(); }
+};
+
+struct Json {
+    simdjson::simdjson_result<simdjson::dom::element> value{simdjson::NO_SUCH_FIELD};
+
+    Json() = default;
+    Json(simdjson::dom::element element) : value(std::move(element)) {}
+
+    Json at(std::string_view key) const {
+        auto object = value.get_object();
+        Json found;
+        if (!object.error()) {
+            // Keep the last value for a repeated key, as in cached metadata.
+            for (auto field : object.value_unsafe())
+                if (field.key == key) found = field.value;
+        }
+        return found;
     }
-    const Array& array() const {
-        static const Array empty;
-        auto array = std::get_if<Array>(&value);
-        return array ? *array : empty;
-    }
+    JsonArray array() const { return {value.get_array()}; }
     std::string string() const {
-        auto text = std::get_if<std::string>(&value);
-        return text ? *text : "";
+        auto text = value.get_string();
+        return text.error() ? std::string{} : std::string(text.value_unsafe());
+    }
+    std::optional<double> number() const {
+        auto result = value.get_double();
+        if (result.error()) return {};
+        return result.value_unsafe();
+    }
+    std::optional<bool> boolean() const {
+        auto result = value.get_bool();
+        if (result.error()) return {};
+        return result.value_unsafe();
     }
     int seconds() const {
-        auto number = std::get_if<double>(&value);
-        return number && *number > 0 && *number <= INT_MAX ? static_cast<int>(*number) : 0;
+        auto n = number();
+        return n && *n > 0 && *n <= INT_MAX ? static_cast<int>(*n) : 0;
     }
 };
 
-constexpr unsigned char controlLimit = 0x20;
-
-class JsonParser {
-public:
-    explicit JsonParser(std::string_view input) : input_(input) {}
-
-    Json parse() {
-        auto result = value(0);
-        space();
-        if (!input_.empty()) fail();
-        return result;
-    }
-
-private:
-    std::string_view input_;
-
-    [[noreturn]] static void fail() { throw Error("The server returned invalid JSON."); }
-    char pop() {
-        if (input_.empty()) fail();
-        char ch = input_.front();
-        input_.remove_prefix(1);
-        return ch;
-    }
-    void space() {
-        while (!input_.empty() && std::string_view(" \t\r\n").find(input_.front()) !=
-            std::string_view::npos) input_.remove_prefix(1);
-    }
-    bool take(char ch) {
-        space();
-        if (input_.empty() || input_.front() != ch) return false;
-        input_.remove_prefix(1);
-        return true;
-    }
-    void require(char ch) { if (!take(ch)) fail(); }
-    bool digit() const { return !input_.empty() && input_.front() >= '0' && input_.front() <= '9'; }
-    void digits() {
-        if (!digit()) fail();
-        while (digit()) input_.remove_prefix(1);
-    }
-    void literal(std::string_view word) {
-        if (input_.substr(0, word.size()) != word) fail();
-        input_.remove_prefix(word.size());
-    }
-    unsigned codeUnit() {
-        unsigned number = 0;
-        for (int i = 0; i < 4; ++i) {
-            char ch = pop();
-            if (ch >= '0' && ch <= '9') number = number * 16 + (ch - '0');
-            else if (ch >= 'a' && ch <= 'f') number = number * 16 + (ch - 'a' + 10);
-            else if (ch >= 'A' && ch <= 'F') number = number * 16 + (ch - 'A' + 10);
-            else fail();
-        }
-        return number;
-    }
-    std::string string() {
-        require('"');
-        std::string result;
-        for (char ch = pop(); ch != '"'; ch = pop()) {
-            if (static_cast<unsigned char>(ch) < controlLimit) fail();
-            if (ch != '\\') {
-                result += ch;
-                continue;
-            }
-            ch = pop();
-            if (ch == 'u') {
-                unsigned first = codeUnit();
-                std::wstring code{static_cast<wchar_t>(first)};
-                if (first >= 0xd800 && first <= 0xdbff) {
-                    literal("\\u");
-                    unsigned second = codeUnit();
-                    if (second < 0xdc00 || second > 0xdfff) fail();
-                    code += static_cast<wchar_t>(second);
-                } else if (first >= 0xdc00 && first <= 0xdfff) fail();
-                result += utf8(code);
-            } else {
-                auto pos = std::string_view("\"\\/bfnrt").find(ch);
-                if (pos == std::string_view::npos) fail();
-                result += "\"\\/\b\f\n\r\t"[pos];
-            }
-        }
-        return result;
-    }
-    double number() {
-        const char* start = input_.data();
-        if (!input_.empty() && input_.front() == '-') pop();
-        if (input_.empty()) fail();
-        if (input_.front() == '0') pop();
-        else digits();
-        if (!input_.empty() && input_.front() == '.') {
-            pop();
-            digits();
-        }
-        if (!input_.empty() && (input_.front() == 'e' || input_.front() == 'E')) {
-            pop();
-            if (!input_.empty() && (input_.front() == '-' || input_.front() == '+')) pop();
-            digits();
-        }
-        double result = 0;
-        auto conversion = std::from_chars(start, input_.data(), result);
-        if (conversion.ec != std::errc{}) fail();
-        return result;
-    }
-    Json value(int depth) {
-        space();
-        if (input_.empty() || depth == 64) fail();
-        switch (input_.front()) {
-        case '{': {
-            pop();
-            Json::Object object;
-            if (!take('}')) {
-                do {
-                    auto key = string();
-                    require(':');
-                    object.insert_or_assign(std::move(key), value(depth + 1));
-                } while (take(','));
-                require('}');
-            }
-            return {std::move(object)};
-        }
-        case '[': {
-            pop();
-            Json::Array array;
-            if (!take(']')) {
-                do { array.push_back(value(depth + 1)); } while (take(','));
-                require(']');
-            }
-            return {std::move(array)};
-        }
-        case '"': return {string()};
-        case 't': literal("true"); return {true};
-        case 'f': literal("false"); return {false};
-        case 'n': literal("null"); return {};
-        default: return {number()};
-        }
-    }
+// Elements borrow the document's tape. Keep its address stable when returning
+// a document or selecting a Subsonic envelope as its root.
+struct JsonDocument : Json {
+    std::unique_ptr<simdjson::dom::document> storage;
 };
+
+JsonDocument parseJson(const std::string& input) {
+    JsonDocument document;
+    document.storage = std::make_unique<simdjson::dom::document>();
+    simdjson::dom::parser parser;
+    if (auto error = parser.allocate(input.size(), 64))
+        throw Error(simdjson::error_message(error));
+    document.value = parser.parse_into_document(*document.storage, input);
+    if (document.value.error())
+        throw Error(std::string("Invalid JSON: ") + simdjson::error_message(document.value.error()));
+    return document;
+}
 
 std::string jsonString(std::string_view value) {
-    std::string result = "\"";
-    for (unsigned char ch : value) {
-        if (ch < controlLimit) result += "\\u00" + hex(&ch, 1);
-        else {
-            if (ch == '"' || ch == '\\') result += '\\';
-            result += static_cast<char>(ch);
-        }
-    }
-    return result + "\"";
+    simdjson::builder::string_builder builder;
+    builder.escape_and_append_with_quotes(value);
+    auto text = builder.view();
+    if (text.error()) throw Error(simdjson::error_message(text.error()));
+    return std::string(text.value_unsafe());
 }
 
 std::string windowsLines(std::string_view text) {
@@ -281,12 +176,12 @@ std::string windowsLines(std::string_view text) {
     return result;
 }
 
-Json readJson(Response& response) {
+JsonDocument readJson(Response& response) {
     if (response.status == 408 || (response.status >= 500 && response.status <= 599))
         throw ConnectionError("The server returned HTTP " + std::to_string(response.status) + ".");
     if (response.status != 200)
         throw Error("The server returned HTTP " + std::to_string(response.status) + ".");
-    return JsonParser(response.text()).parse();
+    return parseJson(response.text());
 }
 
 std::string trackSuffix(const Json& value) {
@@ -304,10 +199,10 @@ bool usableId(const std::string& id) {
 SortTags sortTags(const Json& node) {
     SortTags tags;
     auto value = [](const Json& v) -> std::string {
-        if (const auto* number = std::get_if<double>(&v.value)) {
+        if (const auto number = v.number()) {
             if (*number >= 0 && *number <= INT_MAX) return std::to_string(static_cast<int>(*number));
         }
-        if (const auto* flag = std::get_if<bool>(&v.value)) return *flag ? "1" : "0";
+        if (const auto flag = v.boolean()) return *flag ? "1" : "0";
         return v.string();
     };
     auto field = [&](const char* key, std::initializer_list<const char*> aliases) {
@@ -342,7 +237,7 @@ SortTags sortTags(const Json& node) {
     }
     for (const auto& credit : {std::pair{"artist", "artists"}, std::pair{"albumArtist", "albumArtists"}}) {
         std::string names;
-        for (const auto& artist : node.at(credit.second).array()) {
+        for (Json artist : node.at(credit.second).array()) {
             const auto name = artist.at("name").string();
             if (name.empty()) continue;
             if (!names.empty()) names += ", ";
@@ -371,10 +266,11 @@ void appendTrack(std::vector<Track>& result, Id server, const Json& item) {
     track.albumArtist = item.at("albumArtist").string();
     track.albumArtistId = item.at("albumArtistId").string();
     const auto& albumArtists = item.at("albumArtists").array();
-    if (!albumArtists.empty()) {
-        if (track.albumArtist.empty()) track.albumArtist = albumArtists.front().at("name").string();
+    if (albumArtists.size()) {
+        const Json first = *albumArtists.begin();
+        if (track.albumArtist.empty()) track.albumArtist = first.at("name").string();
         if (track.albumArtistId.empty() && albumArtists.size() == 1)
-            track.albumArtistId = albumArtists.front().at("id").string();
+            track.albumArtistId = first.at("id").string();
     }
     track.genre = item.at("genre").string();
     track.discNumber = item.at("discNumber").seconds();
@@ -386,7 +282,7 @@ void appendTrack(std::vector<Track>& result, Id server, const Json& item) {
 }
 
 void appendTracks(std::vector<Track>& result, Id server, const Json& items) {
-    for (const auto& item : items.array()) appendTrack(result, server, item);
+    for (Json item : items.array()) appendTrack(result, server, item);
 }
 
 std::string itemCount(int count, const char* singular, const char* plural) {
@@ -395,7 +291,7 @@ std::string itemCount(int count, const char* singular, const char* plural) {
 
 void appendItems(std::vector<LibraryItem>& result, const Json& items, BrowseKind kind,
                  const std::wstring& query = {}) {
-    for (const auto& node : items.array()) {
+    for (Json node : items.array()) {
         auto name = node.at("name").string();
         if (name.empty()) name = node.at("title").string();
         if (kind == BrowseKind::genreAlbums) name = node.at("value").string();
@@ -418,7 +314,7 @@ void appendItems(std::vector<LibraryItem>& result, const Json& items, BrowseKind
         const auto& count = node.at("songCount");
         result.push_back({{kind, std::move(id), std::move(name)}, std::move(subtitle),
                           node.at("coverArt").string(), kind == BrowseKind::song ? 1 :
-                          (std::holds_alternative<double>(count.value) ? count.seconds() : -1),
+                          (count.value.is_number() ? count.seconds() : -1),
                           node.at("duration").seconds(), sortTags(node)});
     }
 }
@@ -517,7 +413,7 @@ public:
         }
         case BrowseKind::albumArtists: {
             auto response = api("getArtists");
-            for (const auto& index : response.at("artists").at("index").array())
+            for (Json index : response.at("artists").at("index").array())
                 appendItems(result.items, index.at("artist"), BrowseKind::artistAlbums, filter);
             break;
         }
@@ -537,9 +433,9 @@ public:
         case BrowseKind::folders: {
             auto response = api("getMusicFolders");
             const auto& folders = response.at("musicFolders").at("musicFolder");
-            for (const auto& folder : folders.array()) {
+            for (Json folder : folders.array()) {
                 // Some servers encode the library ID as a JSON number.
-                auto number = std::get_if<double>(&folder.at("id").value);
+                auto number = folder.at("id").number();
                 auto id = number && *number >= 0 && *number <= INT_MAX
                     ? std::to_string(static_cast<int>(*number)) : folder.at("id").string();
                 auto name = folder.at("name").string();
@@ -551,7 +447,7 @@ public:
         case BrowseKind::folderIndex: {
             auto response = api("getIndexes", {{"musicFolderId", location.id}});
             const auto& indexes = response.at("indexes");
-            for (const auto& index : indexes.at("index").array())
+            for (Json index : indexes.at("index").array())
                 appendItems(result.items, index.at("artist"), BrowseKind::directory, filter);
             appendDirectory(result.items, indexes.at("child"), filter);
             appendDirectoryTracks(result.relatedTracks, indexes.at("child"));
@@ -634,19 +530,21 @@ public:
                 return api("getLyricsBySongId", std::move(parameters), &result.structured);
             } catch (const SubsonicError& error) {
                 if (error.code != 0 && error.code != 10 && error.code != 70) throw;
-                return Json{};
+                return JsonDocument{};
             }
         };
         auto response = structured(true);
         if (result.structured.empty()) response = structured(false);
         const auto& variants = response.at("lyricsList").at("structuredLyrics").array();
-        for (const auto& variant : variants) {
+        for (Json variant : variants) {
             auto kind = variant.at("kind").string();
             if (!kind.empty() && kind != "main") continue;
             const auto& lines = variant.at("line").array();
-            for (std::size_t i = 0; i < lines.size(); ++i) {
-                if (i) result.plain += "\r\n";
-                result.plain += lines[i].at("value").string();
+            bool firstLine = true;
+            for (Json line : lines) {
+                if (!firstLine) result.plain += "\r\n";
+                result.plain += line.at("value").string();
+                firstLine = false;
             }
             if (result.plain.find_first_not_of("\r\n\t ") != std::string::npos) {
                 result.plain = windowsLines(result.plain);
@@ -676,17 +574,17 @@ public:
     BrowsePage favorites(const std::atomic_bool& stopping) override {
         auto response = api("getStarred2");
         const auto& starred = response.at("starred2");
-        if (!std::holds_alternative<Json::Object>(starred.value))
+        if (!starred.value.is_object())
             throw Error("The server returned an unexpected favorites response.");
         BrowsePage result;
         appendStarred(result.items, starred, {});
         appendTracks(result.tracks, server_.id, starred.at("song"));
         std::set<std::string> albums;
-        for (const auto& entry : starred.at("album").array()) albums.insert(entry.at("id").string());
-        for (const auto& entry : starred.at("artist").array()) {
+        for (Json entry : starred.at("album").array()) albums.insert(entry.at("id").string());
+        for (Json entry : starred.at("artist").array()) {
             if (stopping) throw Error("Favorite sync interrupted.");
             const auto artist = api("getArtist", {{"id", entry.at("id").string()}});
-            for (const auto& album : artist.at("artist").at("album").array())
+            for (Json album : artist.at("artist").at("album").array())
                 albums.insert(album.at("id").string());
         }
         for (const auto& id : albums) {
@@ -745,7 +643,7 @@ public:
                 extraContainer = track.suffix;
             bool offerDirect = direct;
             for (;;) {
-                Json reply;
+                JsonDocument reply;
                 try {
                     reply = api("getTranscodeDecision", media, nullptr,
                                 clientCapabilities(kbps, *targets, offerDirect, allowAlac, offerDirect ? extraContainer : ""));
@@ -756,8 +654,7 @@ public:
                 }
                 const auto& decision = reply.at("transcodeDecision");
                 auto allowed = [&](const char* key) {
-                    auto flag = std::get_if<bool>(&decision.at(key).value);
-                    return flag && *flag;
+                    return decision.at(key).boolean().value_or(false);
                 };
                 auto withinRate = [&](const Json& details) {
                     return !kbps || details.at("audioBitrate").seconds() <= kbps * 1000;
@@ -806,22 +703,20 @@ private:
     }
 
     void appendDirectoryTracks(std::vector<Track>& result, const Json& items) {
-        for (const auto& node : items.array()) {
-            auto directory = std::get_if<bool>(&node.at("isDir").value);
-            if (!directory || !*directory) appendTrack(result, server_.id, node);
+        for (Json node : items.array()) {
+            if (!node.at("isDir").boolean().value_or(false)) appendTrack(result, server_.id, node);
         }
     }
 
     static void appendDirectory(std::vector<LibraryItem>& result, const Json& items,
                                 const std::wstring& query) {
-        for (const auto& node : items.array()) {
+        for (Json node : items.array()) {
             auto id = node.at("id").string();
             auto title = node.at("title").string();
             auto artist = node.at("artist").string();
             if (!usableId(id) || (!matches(title, query) && !matches(artist, query))) continue;
             if (title.empty()) title = id;
-            auto isDirectory = std::get_if<bool>(&node.at("isDir").value);
-            auto kind = isDirectory && *isDirectory ? BrowseKind::directory : BrowseKind::song;
+            auto kind = node.at("isDir").boolean().value_or(false) ? BrowseKind::directory : BrowseKind::song;
             result.push_back({{kind, std::move(id), std::move(title)}, std::move(artist),
                               node.at("coverArt").string(), kind == BrowseKind::song ? 1 : -1,
                               node.at("duration").seconds(), sortTags(node)});
@@ -852,24 +747,24 @@ private:
     }
 
     std::string representativeCover(const BrowseLocation& location) {
-        Json response;
-        const Json* entries = nullptr;
+        JsonDocument response;
+        Json entries;
         switch (location.kind) {
         case BrowseKind::genreAlbums:
             response = api("getAlbumList2", {{"type", "byGenre"}, {"genre", location.id}, {"size", "5"}});
-            entries = &response.at("albumList2").at("album");
+            entries = response.at("albumList2").at("album");
             break;
         case BrowseKind::artistAlbums:
             response = api("getArtist", {{"id", location.id}});
-            entries = &response.at("artist").at("album");
+            entries = response.at("artist").at("album");
             break;
         case BrowseKind::playlistTracks:
             response = api("getPlaylist", {{"id", location.id}});
-            entries = &response.at("playlist").at("entry");
+            entries = response.at("playlist").at("entry");
             break;
         case BrowseKind::directory:
             response = api("getMusicDirectory", {{"id", location.id}});
-            entries = &response.at("directory").at("child");
+            entries = response.at("directory").at("child");
             break;
         case BrowseKind::song:
             return api("getSong", {{"id", location.id}}).at("song").at("coverArt").string();
@@ -880,7 +775,7 @@ private:
         default:
             return {};
         }
-        for (const auto& entry : entries->array()) {
+        for (Json entry : entries.array()) {
             auto cover = entry.at("coverArt").string();
             if (usableId(cover)) return cover;
         }
@@ -907,9 +802,9 @@ private:
         bool supported = false;
         try {
             auto extensions = api("getOpenSubsonicExtensions");
-            for (const auto& e : extensions.at("openSubsonicExtensions").array())
+            for (Json e : extensions.at("openSubsonicExtensions").array())
                 if (e.at("name").string() == "transcoding")
-                    for (const auto& version : e.at("versions").array()) supported |= version.seconds() == 1;
+                    for (Json version : e.at("versions").array()) supported |= version.seconds() == 1;
         } catch (const SubsonicError& error) {
             if (error.code != 0 && error.code != 70) throw;
         }
@@ -917,7 +812,7 @@ private:
         known[key] = {Clock::now() + std::chrono::minutes(10), supported};
         return supported;
     }
-    Json api(const std::string& endpoint, Parameters parameters = {}, std::string* original = nullptr,
+    JsonDocument api(const std::string& endpoint, Parameters parameters = {}, std::string* original = nullptr,
              const std::string& body = {}) {
         Response response(url(endpoint, std::move(parameters)), body.empty() ? L"GET" : L"POST",
                           body.empty() ? L"" : L"Content-Type: application/json\r\n", body);
@@ -925,7 +820,7 @@ private:
             throw SubsonicError(70, "The server does not provide this resource.");
         std::string payload;
         if (original && response.status == 200) payload = response.text(2 * MiB);
-        auto envelope = payload.empty() ? readJson(response) : JsonParser(payload).parse();
+        auto envelope = payload.empty() ? readJson(response) : parseJson(payload);
         const auto& result = envelope.at("subsonic-response");
         if (result.at("status").string() != "ok") {
             const auto& error = result.at("error");
@@ -934,7 +829,8 @@ private:
                 reason.empty() ? "The Subsonic request failed." : reason.substr(0, 300));
         }
         if (original) *original = std::move(payload);
-        return result;
+        envelope.value = result.value;
+        return envelope;
     }
 };
 
@@ -982,7 +878,7 @@ public:
 private:
     std::string token_;
 
-    Json list(const char* endpoint, int offset, const char* order, Parameters parameters) {
+    JsonDocument list(const char* endpoint, int offset, const char* order, Parameters parameters) {
         parameters.insert(parameters.end(), {{"_start", std::to_string(offset)},
             {"_end", std::to_string(offset + pageSize)}, {"_sort", order}, {"_order", "ASC"}});
         auto url = server_.url + "/api/" + endpoint + queryString(parameters);
@@ -994,7 +890,7 @@ private:
         auto renewed = response->header(L"x-nd-authorization");
         if (validToken(renewed)) token_ = std::move(renewed);
         auto items = readJson(*response);
-        if (!std::holds_alternative<Json::Array>(items.value))
+        if (!items.value.is_array())
             throw Error("Navidrome returned an unexpected library response.");
         return items;
     }
@@ -1034,10 +930,12 @@ std::string encodeSortTags(const SortTags& tags) {
 
 SortTags decodeSortTags(const std::string& text) {
     if (text.empty()) return {};
-    auto parsed = JsonParser(text).parse();
+    auto parsed = parseJson(text);
     SortTags tags;
-    if (auto object = std::get_if<Json::Object>(&parsed.value))
-        for (const auto& [key, value] : *object) tags.emplace(key, value.string());
+    auto object = parsed.value.get_object();
+    if (!object.error())
+        for (auto field : object.value_unsafe())
+            tags.insert_or_assign(std::string(field.key), Json(field.value).string());
     return tags;
 }
 
