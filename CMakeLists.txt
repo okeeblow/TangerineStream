@@ -129,6 +129,8 @@ target_link_libraries(in_tangerinestream PRIVATE user32)
 add_wacup_plugin(ml_tangerinestream
     src/plugin.cpp src/list_scroll.cpp src/server.cpp src/store.cpp src/playback.cpp src/artwork.cpp src/browse_sort.cpp
     src/host_metadata.cpp src/plugin.rc)
+include(cmake/Migrations.cmake)
+embed_migrations(ml_tangerinestream)
 # The 5.666 package omits the Wasabi art and metadata service headers.
 target_include_directories(ml_tangerinestream SYSTEM PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Wasabi"

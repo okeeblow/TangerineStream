@@ -6,6 +6,7 @@
 #include <charconv>
 #include <set>
 #include <fstream>
+#include <iterator>
 #include <system_error>
 
 namespace tangerine {
@@ -79,6 +80,29 @@ private:
     sqlite3* db_;
     bool committed_ = false;
 };
+
+void migrate(sqlite3* db) {
+    static constexpr const char* migrations[] = {
+#include "migrations.inc"
+    };
+    Transaction transaction(db);
+    Statement version(db, "PRAGMA user_version");
+    if (!version.row()) databaseError(db);
+    auto schema = version.integer(0);
+    version.run();
+    const auto latest = static_cast<std::int64_t>(std::size(migrations));
+    if (schema < 0 || schema > latest)
+        throw Error("Unsupported library database version " + std::to_string(schema) +
+                    ". This plug-in supports versions 0 through " + std::to_string(latest) + ".");
+    for (; schema < latest; ++schema) {
+        if (sqlite3_exec(db, migrations[schema], nullptr, nullptr, nullptr) != SQLITE_OK)
+            throw Error("Library database migration " + std::to_string(schema + 1) +
+                        " failed: " + sqlite3_errmsg(db));
+        auto update = "PRAGMA user_version=" + std::to_string(schema + 1);
+        Statement(db, update.c_str()).run();
+    }
+    transaction.commit();
+}
 
 constexpr char trackColumns[] =
     "key,server,remote_id,title,artist,album,suffix,mime,duration,pinned,favorite,bytes,"
@@ -170,88 +194,7 @@ Store::Store(const std::filesystem::path& directory) : cache_(directory / L"cach
         Statement(db_, "PRAGMA foreign_keys=ON").run();
         Statement(db_, "PRAGMA journal_mode=WAL").run();
         Statement(db_, "PRAGMA synchronous=FULL").run();
-        Statement(db_, "CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY,value TEXT NOT NULL)").run();
-        Statement(db_, "CREATE TABLE IF NOT EXISTS servers (id INTEGER PRIMARY KEY,name TEXT NOT NULL,"
-            "url TEXT NOT NULL,user TEXT NOT NULL,password TEXT NOT NULL,native INTEGER NOT NULL,"
-            "cache_favorites INTEGER NOT NULL,UNIQUE(url,user))").run();
-        Statement(db_, "CREATE TABLE IF NOT EXISTS tracks (key INTEGER PRIMARY KEY,"
-            "server INTEGER NOT NULL REFERENCES servers(id),remote_id TEXT NOT NULL,title TEXT NOT NULL,"
-            "artist TEXT NOT NULL,album TEXT NOT NULL,suffix TEXT NOT NULL,mime TEXT NOT NULL,"
-            "duration INTEGER NOT NULL,pinned INTEGER NOT NULL DEFAULT 0,favorite INTEGER NOT NULL DEFAULT 0,"
-            "bytes INTEGER NOT NULL DEFAULT 0,last_use INTEGER NOT NULL DEFAULT 0,"
-            "retry_at INTEGER NOT NULL DEFAULT 0,UNIQUE(server,remote_id))").run();
-        Statement(db_, "CREATE TABLE IF NOT EXISTS reports (key INTEGER PRIMARY KEY,"
-            "server INTEGER NOT NULL REFERENCES servers(id),remote_id TEXT NOT NULL,time INTEGER NOT NULL)").run();
-        Statement(db_, "CREATE INDEX IF NOT EXISTS reports_server ON reports(server,key)").run();
-        Transaction migration(db_);
-        Statement version(db_, "PRAGMA user_version");
-        version.row();
-        auto schema = version.integer(0);
-        version.run();
-        if (schema == 0) {
-            for (const auto* column : {"cover_id", "album_id", "artist_id", "album_artist_id",
-                                      "album_artist", "genre"}) {
-                auto sql = std::string("ALTER TABLE tracks ADD COLUMN ") + column + " TEXT NOT NULL DEFAULT ''";
-                Statement(db_, sql.c_str()).run();
-            }
-            for (const auto* column : {"disc_number", "track_number", "year"}) {
-                auto sql = std::string("ALTER TABLE tracks ADD COLUMN ") + column + " INTEGER NOT NULL DEFAULT 0";
-                Statement(db_, sql.c_str()).run();
-            }
-        }
-        Statement(db_, "CREATE INDEX IF NOT EXISTS tracks_album ON tracks(server,album_id)").run();
-        Statement(db_, "CREATE INDEX IF NOT EXISTS tracks_artist ON tracks(server,artist_id)").run();
-        Statement(db_, "CREATE INDEX IF NOT EXISTS tracks_album_artist ON tracks(server,album_artist_id)").run();
-        Statement(db_, "CREATE INDEX IF NOT EXISTS tracks_genre ON tracks(server,genre)").run();
-        Statement(db_, "CREATE TABLE IF NOT EXISTS catalog (server INTEGER NOT NULL REFERENCES servers(id),"
-            "parent_kind INTEGER NOT NULL,parent_id TEXT NOT NULL,kind INTEGER NOT NULL,id TEXT NOT NULL,"
-            "slot INTEGER NOT NULL,title TEXT NOT NULL,subtitle TEXT NOT NULL,cover_id TEXT NOT NULL,"
-            "track_key INTEGER NOT NULL,PRIMARY KEY(server,parent_kind,parent_id,kind,id,slot)) WITHOUT ROWID").run();
-        Statement(db_, "CREATE INDEX IF NOT EXISTS catalog_objects ON catalog(server,kind,id)").run();
-        if (schema < 2) {
-            Statement(db_, "ALTER TABLE tracks ADD COLUMN sort_tags TEXT NOT NULL DEFAULT ''").run();
-            Statement(db_, "ALTER TABLE catalog ADD COLUMN sort_tags TEXT NOT NULL DEFAULT ''").run();
-            Statement(db_, "PRAGMA user_version=2").run();
-        }
-        if (schema < 3) {
-            Statement(db_, "ALTER TABLE tracks ADD COLUMN cached_format TEXT NOT NULL DEFAULT ''").run();
-            Statement(db_, "ALTER TABLE servers ADD COLUMN unmetered_format TEXT NOT NULL DEFAULT 'auto'").run();
-            Statement(db_, "ALTER TABLE servers ADD COLUMN unmetered_kbps INTEGER NOT NULL DEFAULT 0").run();
-            Statement(db_, "ALTER TABLE servers ADD COLUMN metered_format TEXT NOT NULL DEFAULT 'mp3'").run();
-            Statement(db_, "ALTER TABLE servers ADD COLUMN metered_kbps INTEGER NOT NULL DEFAULT 192").run();
-            Statement(db_, "ALTER TABLE servers ADD COLUMN upgrade_favorites INTEGER NOT NULL DEFAULT 0").run();
-            Statement(db_, "PRAGMA user_version=3").run();
-        }
-        Statement(db_, "CREATE TABLE IF NOT EXISTS catalog_totals (server INTEGER NOT NULL REFERENCES servers(id),"
-            "kind INTEGER NOT NULL,id TEXT NOT NULL,songs INTEGER NOT NULL,duration INTEGER NOT NULL,"
-            "PRIMARY KEY(server,kind,id)) WITHOUT ROWID").run();
-        Statement(db_, "CREATE TABLE IF NOT EXISTS artwork (server INTEGER NOT NULL REFERENCES servers(id),"
-            "cover_key TEXT NOT NULL,data BLOB NOT NULL,last_use INTEGER NOT NULL,"
-            "PRIMARY KEY(server,cover_key)) WITHOUT ROWID").run();
-        Statement(db_, "CREATE TABLE IF NOT EXISTS lyrics (track INTEGER PRIMARY KEY REFERENCES tracks(key),"
-            "plain TEXT NOT NULL,structured TEXT NOT NULL,checked INTEGER NOT NULL)").run();
-        Statement(db_, "CREATE TABLE IF NOT EXISTS playlist_covers (track INTEGER PRIMARY KEY,"
-            "cover_key TEXT NOT NULL,ext TEXT NOT NULL,bytes INTEGER NOT NULL,last_use INTEGER NOT NULL)").run();
-        if (schema < 4) {
-            Statement(db_, "CREATE VIRTUAL TABLE track_search USING fts5(title,artist,album,"
-                "content='tracks',content_rowid='key',tokenize='trigram',columnsize=0)").run();
-            Statement(db_, "INSERT INTO track_search(track_search) VALUES('rebuild')").run();
-            Statement(db_, "CREATE TRIGGER track_search_insert AFTER INSERT ON tracks BEGIN "
-                "INSERT INTO track_search(rowid,title,artist,album) VALUES(new.key,new.title,new.artist,new.album); END").run();
-            Statement(db_, "CREATE TRIGGER track_search_delete AFTER DELETE ON tracks BEGIN "
-                "INSERT INTO track_search(track_search,rowid,title,artist,album) "
-                "VALUES('delete',old.key,old.title,old.artist,old.album); END").run();
-            Statement(db_, "CREATE TRIGGER track_search_update AFTER UPDATE OF title,artist,album ON tracks "
-                "WHEN old.title!=new.title OR old.artist!=new.artist OR old.album!=new.album BEGIN "
-                "INSERT INTO track_search(track_search,rowid,title,artist,album) VALUES('delete',old.key,old.title,old.artist,old.album); "
-                "INSERT INTO track_search(rowid,title,artist,album) VALUES(new.key,new.title,new.artist,new.album); END").run();
-            const auto index = std::string("CREATE INDEX tracks_linguistic ON tracks(server) WHERE ") + linguisticRows;
-            Statement(db_, index.c_str()).run();
-            Statement(db_, "CREATE INDEX tracks_browse_order ON tracks(server,artist COLLATE NOCASE,"
-                "album COLLATE NOCASE,title COLLATE NOCASE,key)").run();
-            Statement(db_, "PRAGMA user_version=4").run();
-        }
-        migration.commit();
+        migrate(db_);
         auto budget = setting("rolling_mib");
         budget_ = (budget.empty() ? defaultBudget : std::stoi(budget)) * MiB;
         offline_ = setting("offline_mode") == "1";

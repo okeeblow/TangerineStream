@@ -1,0 +1,23 @@
+function(embed_migrations target)
+    set(directory "${CMAKE_CURRENT_SOURCE_DIR}/migrations")
+    file(GLOB files CONFIGURE_DEPENDS RELATIVE "${directory}" "${directory}/*.sql")
+    if(NOT files)
+        message(FATAL_ERROR "No database migrations found in ${directory}")
+    endif()
+
+    set(version 0)
+    set(entries "")
+    foreach(file IN LISTS files)
+        math(EXPR version "${version} + 1")
+        if(NOT file MATCHES "^([0-9][0-9][0-9])_[a-z0-9_]+[.]sql$" OR
+           NOT CMAKE_MATCH_1 EQUAL version)
+            message(FATAL_ERROR "Expected migration ${version}, found ${file}")
+        endif()
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${directory}/${file}")
+        file(READ "${directory}/${file}" sql)
+        string(APPEND entries "R\"ts_sql(${sql})ts_sql\",\n")
+    endforeach()
+    file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/migrations.inc"
+        CONTENT "@entries@" @ONLY)
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+endfunction()
