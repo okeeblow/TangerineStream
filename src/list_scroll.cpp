@@ -18,15 +18,25 @@ bool scrollable(const SCROLLINFO& info) {
 struct ListBars {
     HWND list, player;
     HWND bars[2]{};
+    HWND surfaces[2]{};
     HBITMAP skin{};
     bool pending = false;
     UINT sync = RegisterWindowMessageW(TS_PRODUCT_NAME_W L".SyncListScrollbars");
+
+    void destroyControls() {
+        for (auto surface : surfaces) if (surface) DestroyWindow(surface);
+        for (auto bar : bars) if (bar) DestroyWindow(bar);
+    }
 
     void loadSkin() {
         if (skin) DeleteObject(skin);
         const auto bitmap = SendMessageW(player, WM_WA_IPC, 0, IPC_GET_GENSKINBITMAP);
         skin = bitmap != 1 ? reinterpret_cast<HBITMAP>(bitmap) : nullptr;
-        for (auto bar : bars) InvalidateRect(bar, nullptr, FALSE);
+        for (int axis : {SB_HORZ, SB_VERT}) {
+            HWND bar = bars[axis], surface = surfaces[axis];
+            ShowWindow(surface, skin && (GetWindowLongPtrW(bar, GWL_STYLE) & WS_VISIBLE) ? SW_SHOWNA : SW_HIDE);
+            InvalidateRect(skin ? surface : bar, nullptr, FALSE);
+        }
     }
 
     void schedule() {
@@ -67,22 +77,26 @@ struct ListBars {
             auto& info = range[axis];
             if (!scrollable(info) || IsRectEmpty(&strip)) {
                 if (GetWindowLongPtrW(bar, GWL_STYLE) & WS_VISIBLE) ShowWindow(bar, SW_HIDE);
+                if (GetWindowLongPtrW(surfaces[axis], GWL_STYLE) & WS_VISIBLE) ShowWindow(surfaces[axis], SW_HIDE);
                 continue;
             }
             RECT previous{};
             GetWindowRect(bar, &previous);
             MapWindowPoints(nullptr, list, reinterpret_cast<POINT*>(&previous), 2);
             const bool moved = !(GetWindowLongPtrW(bar, GWL_STYLE) & WS_VISIBLE) || !EqualRect(&previous, &strip);
-            if (moved)
+            if (moved) {
                 SetWindowPos(bar, HWND_TOP, strip.left, strip.top, strip.right - strip.left, strip.bottom - strip.top,
                              SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                SetWindowPos(surfaces[axis], HWND_TOP, strip.left, strip.top, strip.right - strip.left, strip.bottom - strip.top,
+                             SWP_NOACTIVATE | (skin ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+            }
             SCROLLINFO old{};
             old.cbSize = sizeof(old);
             old.fMask = info.fMask;
             if (moved || !GetScrollInfo(bar, SB_CTL, &old) || old.nMin != info.nMin || old.nMax != info.nMax ||
                 old.nPage != info.nPage || old.nPos != info.nPos) {
                 SetScrollInfo(bar, SB_CTL, &info, TRUE);
-                InvalidateRect(bar, nullptr, FALSE);
+                if (skin) InvalidateRect(surfaces[axis], nullptr, FALSE);
             }
         }
     }
@@ -113,7 +127,7 @@ struct ListBars {
     bool paint(HWND bar, HDC dc) const {
         SCROLLBARINFO parts{};
         parts.cbSize = sizeof(parts);
-        if (!skin || !GetScrollBarInfo(bar, OBJID_CLIENT, &parts) || parts.xyThumbBottom <= parts.xyThumbTop) return false;
+        if (!skin || !GetScrollBarInfo(bar, OBJID_CLIENT, &parts)) return false;
         RECT r{};
         GetClientRect(bar, &r);
         const bool vertical = bar == bars[SB_VERT];
@@ -136,7 +150,7 @@ struct ListBars {
         const bool pressed = parts.rgstate[3] & STATE_SYSTEM_PRESSED;
         const int x = vertical ? (pressed ? 70 : 56) : 84;
         const int thumbY = vertical || !pressed ? 31 : 45;
-        const int first = parts.xyThumbTop, last = parts.xyThumbBottom;
+        const int first = parts.xyThumbTop, last = std::max(first, parts.xyThumbBottom);
         // The SDK atlas contains a 14 x 28 thumb (transposed horizontally).
         // Preserve its ends and grip, stretching only the two flat spans.
         const int cap = std::min(4, (last - first) / 4);
@@ -157,18 +171,28 @@ struct ListBars {
     }
 };
 
-LRESULT CALLBACK barProc(HWND bar, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR data) {
+LRESULT CALLBACK surfaceProc(HWND surface, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR data) {
     auto& state = *reinterpret_cast<ListBars*>(data);
-    if (msg == WM_PAINT && state.skin) {
+    const HWND bar = state.bars[surface == state.surfaces[SB_VERT] ? SB_VERT : SB_HORZ];
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+    if (msg == WM_ERASEBKGND) return TRUE;
+    if (msg == WM_PAINT) {
         PAINTSTRUCT ps{};
-        auto dc = BeginPaint(bar, &ps);
-        if (!state.paint(bar, dc)) DefSubclassProc(bar, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT);
-        EndPaint(bar, &ps);
+        auto dc = BeginPaint(surface, &ps);
+        state.paint(bar, dc);
+        EndPaint(surface, &ps);
         return 0;
     }
     if ((msg == WM_PRINTCLIENT || (msg == WM_PRINT && (l & PRF_CLIENT))) &&
         state.paint(bar, reinterpret_cast<HDC>(w))) return 0;
+    return DefSubclassProc(surface, msg, w, l);
+}
+
+LRESULT CALLBACK barProc(HWND bar, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR data) {
+    auto& state = *reinterpret_cast<ListBars*>(data);
     if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL) return SendMessageW(state.list, msg, w, l);
+    if (state.skin && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_CAPTURECHANGED))
+        InvalidateRect(state.surfaces[bar == state.bars[SB_VERT] ? SB_VERT : SB_HORZ], nullptr, FALSE);
     return DefSubclassProc(bar, msg, w, l);
 }
 
@@ -226,8 +250,14 @@ void attachListScrollbars(HWND list, HWND player) {
         auto bar = CreateWindowExW(0, L"SCROLLBAR", nullptr, WS_CHILD | WS_CLIPSIBLINGS | (axis == SB_VERT ? SBS_VERT : SBS_HORZ),
                                    0, 0, 0, 0, list, nullptr, nullptr, nullptr);
         state->bars[axis] = bar;
-        if (!bar || !SetWindowSubclass(bar, barProc, id, data)) {
-            for (auto child : state->bars) if (child) DestroyWindow(child);
+        // The native scrollbar draws directly to its DC while tracking. A
+        // higher sibling clips those draws and passes hit tests to the control.
+        auto surface = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_CLIPSIBLINGS,
+                                       0, 0, 0, 0, list, nullptr, nullptr, nullptr);
+        state->surfaces[axis] = surface;
+        if (!surface || !SetWindowSubclass(surface, surfaceProc, id, data) ||
+            !bar || !SetWindowSubclass(bar, barProc, id, data)) {
+            state->destroyControls();
             return;
         }
     }
@@ -235,13 +265,17 @@ void attachListScrollbars(HWND list, HWND player) {
         // Keep the skinned list and its native scroll model. A Modern skin can
         // give its nonclient scrollbar a fixed-length bitmap thumb.
         SetWindowLongPtrW(list, GWL_STYLE, GetWindowLongPtrW(list, GWL_STYLE) | WS_CLIPCHILDREN);
+        // The header can span the up arrow when its columns are wide. Clip its
+        // focus repaint to the part of the header visible beside the scrollbar.
+        if (HWND header = ListView_GetHeader(list))
+            SetWindowLongPtrW(header, GWL_STYLE, GetWindowLongPtrW(header, GWL_STYLE) | WS_CLIPSIBLINGS);
         MLSkinnedScrollWnd_ShowHorzBar(list, FALSE);
         MLSkinnedScrollWnd_ShowVertBar(list, FALSE);
         state->loadSkin();
         state.release()->schedule();
         return;
     }
-    for (auto bar : state->bars) if (bar) DestroyWindow(bar);
+    state->destroyControls();
 }
 
 } // namespace tangerine
