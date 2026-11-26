@@ -1,4 +1,5 @@
 #include "store.hpp"
+#include "server.hpp"
 
 #include <sqlite3.h>
 #include <wincrypt.h>
@@ -271,11 +272,17 @@ Id Store::saveProfile(const Server& server) {
             .bind(server.native).bind(server.cacheFavorites).run();
         id = sqlite3_last_insert_rowid(db_);
     } else {
-        Statement(db_, "UPDATE servers SET name=?,native=?,cache_favorites=?,configured=1 "
-            "WHERE id=? AND url=? AND user=? AND configured=?")
-            .bind(server.name).bind(server.native).bind(server.cacheFavorites).bind(id)
-            .bind(server.url).bind(server.user).bind(server.id != 0).run();
-        if (!sqlite3_changes(db_)) throw Error("This server profile has changed. Reopen settings and try again.");
+        Statement saved(db_, "SELECT url FROM servers WHERE id=? AND user=? AND configured=?");
+        saved.bind(id).bind(server.user).bind(server.id != 0);
+        if (!saved.row() || !sameServerEndpoint(saved.text(0), server.url))
+            throw Error("This server profile has changed. Reopen settings and try again.");
+        if (saved.text(0) != server.url) {
+            Statement conflict(db_, "SELECT id FROM servers WHERE url=? AND user=? AND id<>?");
+            conflict.bind(server.url).bind(server.user).bind(id);
+            if (conflict.row()) throw Error("This address already has a profile for this username. Use Add server to reconnect it.");
+        }
+        Statement(db_, "UPDATE servers SET name=?,native=?,cache_favorites=?,configured=1,url=? WHERE id=?")
+            .bind(server.name).bind(server.native).bind(server.cacheFavorites).bind(server.url).bind(id).run();
         if (!server.password.empty())
             Statement(db_, "UPDATE servers SET password=? WHERE id=?")
                 .bind(protect(server.password)).bind(id).run();

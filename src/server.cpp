@@ -1023,6 +1023,21 @@ std::string normalizeUrl(std::string url) {
     return url;
 }
 
+bool sameServerEndpoint(const std::string& savedUrl, const std::string& editedUrl) {
+    if (savedUrl == editedUrl) return true;
+    try {
+        const auto saved = splitUrl(wide(savedUrl));
+        const auto edited = splitUrl(wide(normalizeUrl(editedUrl)));
+        if (_wcsicmp(saved.host.c_str(), edited.host.c_str()) || saved.target != edited.target) return false;
+        if (saved.secure == edited.secure) return saved.port == edited.port;
+        return edited.secure && (saved.port == edited.port ||
+            (saved.port == INTERNET_DEFAULT_HTTP_PORT && edited.port == INTERNET_DEFAULT_HTTPS_PORT));
+    } catch (const Error&) {
+        // The settings dialog also checks incomplete addresses as the user types.
+        return false;
+    }
+}
+
 bool acceptsExtension(const InputExtensions& inputs, std::string suffix) {
     std::transform(suffix.begin(), suffix.end(), suffix.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return inputs.count(suffix) != 0;

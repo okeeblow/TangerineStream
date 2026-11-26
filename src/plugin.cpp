@@ -917,18 +917,20 @@ struct Settings {
     bool unified;
     InputExtensions inputs;
     bool loadingForm = false;
-    std::map<Id, std::string> savedUsers{};
+    std::map<Id, Server> savedAccounts{};
     std::vector<Id> removed{};
     std::future<std::vector<Server>> saving{};
     size_t savedSelection = 0;
 
-    bool sameAccount(const Server& s, const std::string& user) const {
-        return s.id && savedUsers.at(s.id) == user;
+    bool sameAccount(Id id, const std::string& url, const std::string& user) const {
+        if (!id) return false;
+        const auto& saved = savedAccounts.at(id);
+        return saved.user == user && sameServerEndpoint(saved.url, url);
     }
 
     void passwordHint(HWND hwnd) const {
         const bool keep = selected < profiles.size() &&
-            sameAccount(profiles[selected], getText(hwnd, IDC_USERNAME));
+            sameAccount(profiles[selected].id, getText(hwnd, IDC_URL), getText(hwnd, IDC_USERNAME));
         SendDlgItemMessageW(hwnd, IDC_PASSWORD, EM_SETCUEBANNER, FALSE,
             reinterpret_cast<LPARAM>(keep ? L"Leave blank to keep saved password" : L""));
         const bool replacing = selected < profiles.size() && profiles[selected].id && !keep;
@@ -1025,7 +1027,6 @@ struct Settings {
         SetDlgItemTextW(hwnd, IDC_URL, wide(s.url).c_str());
         SetDlgItemTextW(hwnd, IDC_USERNAME, wide(s.user).c_str());
         SetDlgItemTextW(hwnd, IDC_PASSWORD, wide(s.password).c_str());
-        SendDlgItemMessageW(hwnd, IDC_URL, EM_SETREADONLY, s.id != 0, 0);
         passwordHint(hwnd);
         CheckDlgButton(hwnd, IDC_NATIVE, s.native ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hwnd, IDC_FAVORITES, s.cacheFavorites ? BST_CHECKED : BST_UNCHECKED);
@@ -1130,7 +1131,7 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         }
         if (!settings->loadingForm && HIWORD(w) == EN_CHANGE &&
             (LOWORD(w) == IDC_URL || LOWORD(w) == IDC_USERNAME || LOWORD(w) == IDC_PASSWORD)) {
-            if (LOWORD(w) == IDC_USERNAME) settings->passwordHint(hwnd);
+            if (LOWORD(w) != IDC_PASSWORD) settings->passwordHint(hwnd);
             settings->updateTreeOption(hwnd);
             return TRUE;
         }
@@ -1165,8 +1166,8 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             if (!s.id && s.name.empty() && s.url.empty() && s.user.empty() && s.password.empty()) continue;
             try {
                 s.url = normalizeUrl(s.url);
-                if (s.id && !settings->sameAccount(s, s.user)) {
-                    if (s.password.empty()) throw Error("Enter the password for the new username.");
+                if (s.id && !settings->sameAccount(s.id, s.url, s.user)) {
+                    if (s.password.empty()) throw Error("Enter the password for the new server address or username.");
                     removed.push_back(s.id);
                     s.id = 0;
                 }
@@ -1220,7 +1221,7 @@ INT_PTR CALLBACK settingsProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 void configure(HWND hwnd, Id preferred, bool add = false) {
     app->refreshInputs();
     Settings settings{app->store.servers(), 0, app->store.rollingMiB(), app->store.unifiedTree(), app->inputs()};
-    for (const auto& s : settings.profiles) settings.savedUsers.emplace(s.id, s.user);
+    for (const auto& s : settings.profiles) settings.savedAccounts.emplace(s.id, s);
     if (add) {
         settings.selected = settings.profiles.size();
         settings.profiles.emplace_back();

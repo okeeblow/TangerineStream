@@ -57,5 +57,6 @@ public:
 
 std::unique_ptr<ServerApi> connect(const Server& server);
 std::string normalizeUrl(std::string url);
+bool sameServerEndpoint(const std::string& savedUrl, const std::string& editedUrl);
 
 } // namespace tangerine
