@@ -15,3 +15,16 @@ hunter_config(date
     SHA1 94cb7b3427d24fe52949aab149976a622314b68b
     CMAKE_ARGS BUILD_TZ_LIB=OFF
 )
+
+hunter_config(uriparser
+    VERSION 1.0.3
+    URL "https://github.com/uriparser/uriparser/archive/refs/tags/uriparser-1.0.3.tar.gz"
+    SHA1 4efa4d737e25d7b9d0eb60d87ce7e16cf8afde2a
+    CMAKE_ARGS
+        URIPARSER_SHARED_LIBS=OFF
+        URIPARSER_MSVC_STATIC_CRT=ON
+        URIPARSER_BUILD_WCHAR_T=OFF
+        URIPARSER_BUILD_DOCS=OFF
+        URIPARSER_BUILD_TESTS=OFF
+        URIPARSER_BUILD_TOOLS=OFF
+)

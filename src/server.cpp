@@ -3,9 +3,11 @@
 #include <bcrypt.h>
 #include <algorithm>
 #include <simdjson.h>
+#include <uriparser/Uri.h>
 #include <cctype>
 #include <chrono>
 #include <climits>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <set>
@@ -38,27 +40,44 @@ std::string md5(const std::string& value) {
     return hex(digest, sizeof(digest));
 }
 
-std::string percent(std::string_view value) {
-    std::string result;
-    for (unsigned char ch : value) {
-        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-            (ch >= '0' && ch <= '9') || ch == '-' || ch == '.' || ch == '_' || ch == '~') {
-            result += static_cast<char>(ch);
-        } else {
-            result += '%';
-            result += hex(&ch, 1);
-        }
+// uriparser's string APIs stop at NUL even with an explicit end pointer.
+void appendEscaped(std::string& output, std::string_view bytes) {
+    while (!bytes.empty()) {
+        const auto part = bytes.substr(0, bytes.find('\0'));
+        const auto start = output.size();
+        if (part.size() > (output.max_size() - start - 1) / 3) throw Error("URL is too long.");
+        output.resize(start + 3 * part.size() + 1);
+        auto end = uriEscapeExA(part.data(), part.data() + part.size(), output.data() + start,
+                                URI_FALSE, URI_FALSE);
+        output.resize(static_cast<std::size_t>(end - output.data()));
+        if (part.size() == bytes.size()) break;
+        output += "%00";
+        bytes.remove_prefix(part.size() + 1);
     }
-    return result;
 }
 
 std::string queryString(const Parameters& parameters) {
-    std::string result;
-    for (const auto& [key, value] : parameters) {
-        result += result.empty() ? '?' : '&';
-        result += key + "=" + percent(value);
+    if (parameters.empty()) return {};
+    std::vector<UriQueryListA> list(parameters.size());
+    for (std::size_t i = 0; i < list.size(); ++i) {
+        const auto& [key, value] = parameters[i];
+        if (key.find('\0') != key.npos || value.find('\0') != value.npos) {
+            std::string query;
+            for (const auto& [k, v] : parameters) {
+                query += query.empty() ? '?' : '&';
+                appendEscaped(query, k);
+                query += '=';
+                appendEscaped(query, v);
+            }
+            return query;
+        }
+        list[i] = {key.c_str(), value.c_str(), i + 1 < list.size() ? &list[i + 1] : nullptr};
     }
-    return result;
+    char* raw = nullptr;
+    if (uriComposeQueryMallocExA(&raw, list.data(), URI_FALSE, URI_FALSE) != URI_SUCCESS)
+        throw Error("The request URL could not be encoded.");
+    std::unique_ptr<char, decltype(&std::free)> query(raw, &std::free);
+    return std::string("?") + query.get();
 }
 
 struct Address {
@@ -383,14 +402,19 @@ std::string escapedDecisionToken(const std::string& token) {
     // The extension defines an opaque, already escaped query value. Escape any
     // remaining reserved characters without encoding existing %HH sequences twice.
     std::string escaped;
-    for (size_t i = 0; i < token.size(); ++i) {
-        if (token[i] == '%' && i + 2 < token.size() &&
-            std::isxdigit(static_cast<unsigned char>(token[i + 1])) &&
-            std::isxdigit(static_cast<unsigned char>(token[i + 2]))) {
-            escaped.append(token, i, 3);
-            i += 2;
-        } else escaped += percent(std::string_view(token).substr(i, 1));
+    std::string_view remaining(token);
+    std::size_t search = 0;
+    while ((search = remaining.find('%', search)) != remaining.npos) {
+        if (remaining.size() - search >= 3 &&
+            std::isxdigit(static_cast<unsigned char>(remaining[search + 1])) &&
+            std::isxdigit(static_cast<unsigned char>(remaining[search + 2]))) {
+            appendEscaped(escaped, remaining.substr(0, search));
+            escaped.append(remaining.substr(search, 3));
+            remaining.remove_prefix(search + 3);
+            search = 0;
+        } else ++search;
     }
+    appendEscaped(escaped, remaining);
     return escaped;
 }
 

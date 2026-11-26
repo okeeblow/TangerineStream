@@ -17,6 +17,8 @@ hunter_add_package(date)
 find_package(date CONFIG REQUIRED)
 hunter_add_package(simdjson)
 find_package(simdjson CONFIG REQUIRED)
+hunter_add_package(uriparser)
+find_package(uriparser CONFIG REQUIRED)
 
 # SQLite publishes its amalgamation without a CMake project. Let Hunter cache
 # the official source archive and compile it with the plug-in's toolchain.
@@ -129,4 +131,4 @@ target_include_directories(ml_tangerinestream SYSTEM PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Wasabi"
     "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Agave")
 target_link_libraries(ml_tangerinestream PRIVATE
-    date::date simdjson::simdjson tangerine_sqlite comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
+    date::date simdjson::simdjson uriparser::uriparser tangerine_sqlite comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
