@@ -917,6 +917,26 @@ struct Settings {
     bool unified;
     InputExtensions inputs;
     bool loadingForm = false;
+    std::map<Id, std::string> savedUsers{};
+    std::vector<Id> removed{};
+    std::future<std::vector<Server>> saving{};
+    size_t savedSelection = 0;
+
+    bool sameAccount(const Server& s, const std::string& user) const {
+        return s.id && savedUsers.at(s.id) == user;
+    }
+
+    void passwordHint(HWND hwnd) const {
+        const bool keep = selected < profiles.size() &&
+            sameAccount(profiles[selected], getText(hwnd, IDC_USERNAME));
+        SendDlgItemMessageW(hwnd, IDC_PASSWORD, EM_SETCUEBANNER, FALSE,
+            reinterpret_cast<LPARAM>(keep ? L"Leave blank to keep saved password" : L""));
+        const bool replacing = selected < profiles.size() && profiles[selected].id && !keep;
+        const wchar_t* note = L"";
+        if (replacing || !removed.empty()) note = L"Cached music and pending scrobbles stay with their account.";
+        else if (profiles.empty()) note = L"Choose Add server to connect a library.";
+        SetDlgItemTextW(hwnd, IDC_ACCOUNT_NOTE, note);
+    }
 
     void displayQuality(HWND hwnd, int format, int rate, const StreamQuality& quality) const {
         auto box = GetDlgItem(hwnd, format);
@@ -964,6 +984,7 @@ struct Settings {
     }
 
     void read(HWND hwnd) {
+        if (profiles.empty()) return;
         auto& s = profiles.at(selected);
         s.name = getText(hwnd, IDC_NAME);
         s.url = getText(hwnd, IDC_URL);
@@ -980,6 +1001,8 @@ struct Settings {
         loadingForm = true;
         selected = index;
         auto list = GetDlgItem(hwnd, IDC_SERVERS);
+        while (ListView_GetItemCount(list) > static_cast<int>(profiles.size()))
+            ListView_DeleteItem(list, ListView_GetItemCount(list) - 1);
         for (size_t i = 0; i < profiles.size(); ++i) {
             const auto& profile = profiles[i];
             auto label = wide(profile.name.empty() ? (profile.url.empty() ? "New server" : profile.url) : profile.name);
@@ -991,23 +1014,31 @@ struct Settings {
             else ListView_SetItemText(list, row.iItem, 0, row.pszText);
         }
         ListView_SetColumnWidth(list, 0, listViewportWidth(list));
-        ListView_SetItemState(list, static_cast<int>(index), LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-        ListView_EnsureVisible(list, static_cast<int>(index), FALSE);
-        const auto& s = profiles.at(index);
+        const bool hasProfile = !profiles.empty();
+        if (hasProfile) {
+            ListView_SetItemState(list, static_cast<int>(index), LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_EnsureVisible(list, static_cast<int>(index), FALSE);
+        }
+        const Server blank{};
+        const auto& s = hasProfile ? profiles.at(index) : blank;
         SetDlgItemTextW(hwnd, IDC_NAME, wide(s.name).c_str());
         SetDlgItemTextW(hwnd, IDC_URL, wide(s.url).c_str());
         SetDlgItemTextW(hwnd, IDC_USERNAME, wide(s.user).c_str());
         SetDlgItemTextW(hwnd, IDC_PASSWORD, wide(s.password).c_str());
         SendDlgItemMessageW(hwnd, IDC_URL, EM_SETREADONLY, s.id != 0, 0);
-        SendDlgItemMessageW(hwnd, IDC_USERNAME, EM_SETREADONLY, s.id != 0, 0);
-        SendDlgItemMessageW(hwnd, IDC_PASSWORD, EM_SETCUEBANNER, FALSE,
-            reinterpret_cast<LPARAM>(s.id ? L"Leave blank to keep saved password" : L""));
+        passwordHint(hwnd);
         CheckDlgButton(hwnd, IDC_NATIVE, s.native ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hwnd, IDC_FAVORITES, s.cacheFavorites ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hwnd, IDC_UPGRADE_FAVORITES, s.upgradeFavorites ? BST_CHECKED : BST_UNCHECKED);
         displayQuality(hwnd, IDC_UNMETERED_FORMAT, IDC_UNMETERED_RATE, s.unmetered);
         displayQuality(hwnd, IDC_METERED_FORMAT, IDC_METERED_RATE, s.metered);
         enableQualityFields(hwnd);
+        for (int id : {IDC_NAME, IDC_URL, IDC_USERNAME, IDC_PASSWORD, IDC_NATIVE, IDC_FAVORITES,
+                       IDC_METERED_FORMAT, IDC_UNMETERED_FORMAT, IDC_REMOVE_SERVER})
+            EnableWindow(GetDlgItem(hwnd, id), hasProfile);
+        if (!hasProfile)
+            for (int id : {IDC_METERED_RATE, IDC_UNMETERED_RATE, IDC_UPGRADE_FAVORITES})
+                EnableWindow(GetDlgItem(hwnd, id), FALSE);
         loadingForm = false;
         updateTreeOption(hwnd);
     }
@@ -1038,7 +1069,8 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                 skinWindow(control, SKINNEDWND_TYPE_EDIT, SWES_VCENTER);
                 break;
             case IDC_UPGRADE_FAVORITES:
-            case IDC_UNIFIED: case IDC_NATIVE: case IDC_FAVORITES: case IDC_ADD_SERVER: case IDOK: case IDCANCEL:
+            case IDC_UNIFIED: case IDC_NATIVE: case IDC_FAVORITES: case IDC_ADD_SERVER: case IDC_REMOVE_SERVER:
+            case IDOK: case IDCANCEL:
                 skinWindow(control, SKINNEDWND_TYPE_BUTTON);
                 break;
             default: skinWindow(control, SKINNEDWND_TYPE_STATIC); break;
@@ -1054,6 +1086,22 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         return TRUE;
     }
     if (!settings) return FALSE;
+    if (settings->saving.valid()) {
+        if (msg == WM_TIMER && w == 1 &&
+            settings->saving.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            KillTimer(hwnd, 1);
+            try {
+                settings->profiles = settings->saving.get();
+                settings->selected = settings->savedSelection;
+                EndDialog(GetParent(hwnd), IDOK);
+            } catch (const std::exception& error) {
+                EnableWindow(hwnd, TRUE);
+                SetDlgItemTextW(hwnd, IDOK, L"Save");
+                showError(GetParent(hwnd), error);
+            }
+        }
+        return msg == WM_COMMAND || msg == WM_TIMER;
+    }
     if (msg == WM_NOTIFY && !settings->loadingForm) {
         const auto* header = reinterpret_cast<const NMHDR*>(l);
         if (header->idFrom == IDC_SERVERS && header->code == LVN_ITEMCHANGED) {
@@ -1082,6 +1130,7 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         }
         if (!settings->loadingForm && HIWORD(w) == EN_CHANGE &&
             (LOWORD(w) == IDC_URL || LOWORD(w) == IDC_USERNAME || LOWORD(w) == IDC_PASSWORD)) {
+            if (LOWORD(w) == IDC_USERNAME) settings->passwordHint(hwnd);
             settings->updateTreeOption(hwnd);
             return TRUE;
         }
@@ -1096,9 +1145,19 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             SetFocus(GetDlgItem(hwnd, IDC_NAME));
             return TRUE;
         }
+        if (LOWORD(w) == IDC_REMOVE_SERVER && !settings->profiles.empty()) {
+            auto& profiles = settings->profiles;
+            const auto index = settings->selected;
+            if (profiles[index].id) settings->removed.push_back(profiles[index].id);
+            profiles.erase(profiles.begin() + index);
+            settings->select(hwnd, profiles.empty() ? 0 : std::min(index, profiles.size() - 1));
+            SetFocus(GetDlgItem(hwnd, profiles.empty() ? IDC_ADD_SERVER : IDC_SERVERS));
+            return TRUE;
+        }
         if (LOWORD(w) != IDOK) return FALSE;
         settings->read(hwnd);
         std::vector<Server> updated;
+        auto removed = settings->removed;
         size_t selection = 0;
         std::set<std::pair<std::string, std::string>> accounts;
         for (size_t i = 0; i < settings->profiles.size(); ++i) {
@@ -1106,6 +1165,11 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             if (!s.id && s.name.empty() && s.url.empty() && s.user.empty() && s.password.empty()) continue;
             try {
                 s.url = normalizeUrl(s.url);
+                if (s.id && !settings->sameAccount(s, s.user)) {
+                    if (s.password.empty()) throw Error("Enter the password for the new username.");
+                    removed.push_back(s.id);
+                    s.id = 0;
+                }
                 if (s.user.empty() || (!s.id && s.password.empty())) throw Error("Enter the server username and password.");
                 if (!accounts.emplace(s.url, s.user).second) throw Error("This server and username already have a profile.");
             } catch (const std::exception&) {
@@ -1119,11 +1183,20 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         BOOL valid = FALSE;
         auto budget = GetDlgItemInt(hwnd, IDC_BUDGET, &valid, FALSE);
         if (!valid || budget > 1'048'576) throw Error("Enter a rolling cache size from 0 to 1048576 MiB.");
-        app->store.saveProfiles(updated, static_cast<int>(budget), settings->unified);
-        settings->profiles = std::move(updated);
-        settings->selected = selection;
-        EndDialog(GetParent(hwnd), IDOK);
-    } catch (const std::exception& error) { showError(GetParent(hwnd), error); }
+        if (!SetTimer(hwnd, 1, 30, nullptr)) throw Error("Could not start saving server settings.");
+        settings->saving = std::async(std::launch::async,
+            [store = &app->store, profiles = std::move(updated), removed = std::move(removed),
+             budget, unified = settings->unified]() mutable {
+                store->saveProfiles(profiles, static_cast<int>(budget), unified, removed);
+                return profiles;
+            });
+        settings->savedSelection = selection;
+        SetDlgItemTextW(hwnd, IDOK, L"Saving...");
+        EnableWindow(hwnd, FALSE);
+    } catch (const std::exception& error) {
+        KillTimer(hwnd, 1);
+        showError(GetParent(hwnd), error);
+    }
     return TRUE;
 }
 
@@ -1137,9 +1210,9 @@ INT_PTR CALLBACK settingsProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         SetWindowLongPtrW(hwnd, DWLP_USER, reinterpret_cast<LONG_PTR>(form));
         return TRUE;
     }
-    if (msg == WM_COMMAND && (LOWORD(w) == IDOK || LOWORD(w) == IDCANCEL)) {
+    if (msg == WM_CLOSE || (msg == WM_COMMAND && (LOWORD(w) == IDOK || LOWORD(w) == IDCANCEL))) {
         auto form = reinterpret_cast<HWND>(GetWindowLongPtrW(hwnd, DWLP_USER));
-        if (form) return SendMessageW(form, msg, w, l);
+        if (form) return SendMessageW(form, WM_COMMAND, msg == WM_CLOSE ? IDCANCEL : w, l);
     }
     return FALSE;
 }
@@ -1147,7 +1220,8 @@ INT_PTR CALLBACK settingsProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 void configure(HWND hwnd, Id preferred, bool add = false) {
     app->refreshInputs();
     Settings settings{app->store.servers(), 0, app->store.rollingMiB(), app->store.unifiedTree(), app->inputs()};
-    if (add || settings.profiles.empty()) {
+    for (const auto& s : settings.profiles) settings.savedUsers.emplace(s.id, s.user);
+    if (add) {
         settings.selected = settings.profiles.size();
         settings.profiles.emplace_back();
     } else {
@@ -1157,6 +1231,9 @@ void configure(HWND hwnd, Id preferred, bool add = false) {
     if (DialogBoxParamW(plugin.hDllInstance, MAKEINTRESOURCEW(IDD_SERVER), hwnd, settingsProc,
                         reinterpret_cast<LPARAM>(&settings)) == IDOK) {
         app->selectedServer = settings.profiles.empty() ? 0 : settings.profiles[settings.selected].id;
+        if (app->filterServer && std::none_of(settings.profiles.begin(), settings.profiles.end(),
+                [](const Server& s) { return s.id == app->filterServer; }))
+            app->filterServer = app->selectedServer;
         app->wakeMaintenance(true);
         PostMessageW(plugin.hwndWinampParent, app->navigationChanged, 0, 0);
     }
