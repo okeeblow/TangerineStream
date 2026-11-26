@@ -1,5 +1,8 @@
 #include "browse_sort.hpp"
 #include <windows.h>
+#include <date/date.h>
+#include <sstream>
+#include <optional>
 #include <algorithm>
 #include <charconv>
 #include <random>
@@ -58,39 +61,33 @@ int collate(const std::wstring& a, const std::wstring& b) {
         a.c_str(), -1, b.c_str(), -1, nullptr, nullptr, 0) - CSTR_EQUAL;
 }
 
-// Navidrome and OpenSubsonic timestamps can have different UTC offsets and precision.
-int64_t timestamp(std::string_view value) {
-    auto digits = [&](size_t pos, size_t width) -> int {
-        if (pos + width > value.size()) return 0;
-        int n = 0;
-        auto first = value.data() + pos, last = first + width;
-        return std::from_chars(first, last, n).ptr == last ? n : 0;
-    };
-    if (value.size() < 10) return 0;
-    SYSTEMTIME time{};
-    time.wYear = static_cast<WORD>(digits(0, 4));
-    time.wMonth = static_cast<WORD>(digits(5, 2));
-    time.wDay = static_cast<WORD>(digits(8, 2));
-    time.wHour = static_cast<WORD>(digits(11, 2));
-    time.wMinute = static_cast<WORD>(digits(14, 2));
-    time.wSecond = static_cast<WORD>(digits(17, 2));
-    FILETIME file{};
-    if (!SystemTimeToFileTime(&time, &file)) return 0;
-    int64_t ticks = (static_cast<int64_t>(file.dwHighDateTime) << 32) + file.dwLowDateTime;
-    if (value.size() > 19 && value[19] == '.') {
-        int place = 1000000;
-        for (size_t i = 20; i < value.size() && place && value[i] >= '0' && value[i] <= '9'; ++i) {
-            ticks += (value[i] - '0') * place;
-            place /= 10;
+// Both APIs use UTC when the timestamp omits an offset.
+std::optional<int64_t> timestamp(std::string value) {
+    using Ticks = std::chrono::duration<int64_t, std::ratio<1, 10000000>>;
+    std::string format = "%F";
+    if (value.size() > 10) {
+        format += value[10] == ' ' ? " %T" : "T%T";
+        if (value.size() > 19 && value[19] == '.') {
+            const auto end = value.find_first_not_of("0123456789", 20);
+            const auto digits = (end == value.npos ? value.size() : end) - 20;
+            if (!digits) return {};
+            if (digits > 7) value.erase(27, digits - 7);
+        }
+        if (value.back() == 'Z') format += 'Z';
+        else if (auto zone = value.find_first_of("+-", 11); zone != value.npos) {
+            const auto offset = std::string_view(value).substr(zone + 1);
+            if (offset.size() != 2 && offset.size() != 4 && offset.size() != 5) return {};
+            if (offset.substr(0, 2) > "23" || (offset.size() == 5 && offset[2] != ':') ||
+                (offset.size() > 2 && offset.substr(offset.size() - 2) > "59")) return {};
+            format += offset.size() == 5 ? "%Ez" : "%z";
         }
     }
-    const auto zone = value.find_first_of("+-", 19);
-    if (zone != value.npos) {
-        const auto minute = zone + 3 < value.size() && value[zone + 3] == ':' ? zone + 4 : zone + 3;
-        const auto minutes = 60 * digits(zone + 1, 2) + digits(minute, 2);
-        ticks += (value[zone] == '-' ? 1LL : -1LL) * minutes * 60 * 10000000;
-    }
-    return ticks;
+    std::istringstream input(value);
+    input.imbue(std::locale::classic());
+    date::sys_time<Ticks> time;
+    if (!(date::from_stream(input, format.c_str(), time)) || input.peek() != std::char_traits<char>::eof())
+        return {};
+    return time.time_since_epoch().count();
 }
 
 template<class T>
@@ -111,10 +108,13 @@ std::vector<size_t> sort(std::vector<T>& rows, const SortChoice& choice, bool de
         entries.reserve(rows.size());
         const bool date = key == "created" || key == "played" || key == "starred" || key == "updated";
         for (const auto& row : rows) {
-            const auto value = field(row, key);
+            auto value = field(row, key);
             int64_t n = 0;
             if (choice.numeric) std::from_chars(value.data(), value.data() + value.size(), n);
-            if (date) n = timestamp(value);
+            if (date) {
+                if (auto parsed = timestamp(value)) n = *parsed;
+                else value.clear();
+            }
             entries.push_back({wide(value), key == "name" ? L"" : wide(field(row, "name")), n});
         }
         std::stable_sort(indices.begin(), indices.end(), [&](size_t left, size_t right) {

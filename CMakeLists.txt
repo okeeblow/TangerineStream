@@ -13,6 +13,8 @@ HunterGate(
 )
 project(ml_tangerinestream VERSION 0.6.2 LANGUAGES C CXX RC)
 
+hunter_add_package(date)
+find_package(date CONFIG REQUIRED)
 hunter_add_package(simdjson)
 find_package(simdjson CONFIG REQUIRED)
 
@@ -127,4 +129,4 @@ target_include_directories(ml_tangerinestream SYSTEM PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Wasabi"
     "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Agave")
 target_link_libraries(ml_tangerinestream PRIVATE
-    simdjson::simdjson tangerine_sqlite comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
+    date::date simdjson::simdjson tangerine_sqlite comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
