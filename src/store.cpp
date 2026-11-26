@@ -1,5 +1,6 @@
 #include "store.hpp"
 
+#include <sqlite3.h>
 #include <wincrypt.h>
 #include <algorithm>
 #include <charconv>
@@ -7,31 +8,9 @@
 #include <fstream>
 #include <system_error>
 
-// The plugin uses the SQLite C ABI exported by Windows 10 and later.
-struct sqlite3_stmt;
-extern "C" {
-int WINAPI sqlite3_open_v2(const char*, sqlite3**, int, const char*);
-int WINAPI sqlite3_close(sqlite3*);
-int WINAPI sqlite3_busy_timeout(sqlite3*, int);
-const char* WINAPI sqlite3_errmsg(sqlite3*);
-int WINAPI sqlite3_prepare_v2(sqlite3*, const char*, int, sqlite3_stmt**, const char**);
-int WINAPI sqlite3_finalize(sqlite3_stmt*);
-int WINAPI sqlite3_bind_int64(sqlite3_stmt*, int, std::int64_t);
-int WINAPI sqlite3_bind_text(sqlite3_stmt*, int, const char*, int, void (*)(void*));
-int WINAPI sqlite3_bind_blob(sqlite3_stmt*, int, const void*, int, void (*)(void*));
-int WINAPI sqlite3_step(sqlite3_stmt*);
-std::int64_t WINAPI sqlite3_column_int64(sqlite3_stmt*, int);
-const unsigned char* WINAPI sqlite3_column_text(sqlite3_stmt*, int);
-const void* WINAPI sqlite3_column_blob(sqlite3_stmt*, int);
-int WINAPI sqlite3_column_bytes(sqlite3_stmt*, int);
-std::int64_t WINAPI sqlite3_last_insert_rowid(sqlite3*);
-}
-
 namespace tangerine {
 namespace {
 
-constexpr int sqliteOk = 0, sqliteRow = 100, sqliteDone = 101;
-constexpr int sqliteReadWriteCreate = 0x02 | 0x04;
 constexpr int defaultBudget = 1024;
 
 [[noreturn]] void databaseError(sqlite3* db) {
@@ -41,30 +20,29 @@ constexpr int defaultBudget = 1024;
 class Statement {
 public:
     Statement(sqlite3* db, const char* sql) : db_(db) {
-        if (sqlite3_prepare_v2(db_, sql, -1, &statement_, nullptr) != sqliteOk) databaseError(db_);
+        if (sqlite3_prepare_v2(db_, sql, -1, &statement_, nullptr) != SQLITE_OK) databaseError(db_);
     }
     ~Statement() { sqlite3_finalize(statement_); }
     Statement(const Statement&) = delete;
     Statement& operator=(const Statement&) = delete;
     Statement& bind(std::int64_t value) {
-        if (sqlite3_bind_int64(statement_, next_++, value) != sqliteOk) databaseError(db_);
+        if (sqlite3_bind_int64(statement_, next_++, value) != SQLITE_OK) databaseError(db_);
         return *this;
     }
     Statement& bind(const std::string& value) {
-        // SQLite copies the value before bind returns (SQLITE_TRANSIENT).
         if (sqlite3_bind_text(statement_, next_++, value.c_str(), static_cast<int>(value.size()),
-                              copy) != sqliteOk) databaseError(db_);
+                              SQLITE_TRANSIENT) != SQLITE_OK) databaseError(db_);
         return *this;
     }
     Statement& bindBlob(const std::string& value) {
         if (sqlite3_bind_blob(statement_, next_++, value.data(), static_cast<int>(value.size()),
-                              copy) != sqliteOk) databaseError(db_);
+                              SQLITE_TRANSIENT) != SQLITE_OK) databaseError(db_);
         return *this;
     }
     bool row() {
         auto result = sqlite3_step(statement_);
-        if (result == sqliteRow) return true;
-        if (result == sqliteDone) return false;
+        if (result == SQLITE_ROW) return true;
+        if (result == SQLITE_DONE) return false;
         databaseError(db_);
     }
     void run() { while (row()) {} }
@@ -79,7 +57,6 @@ public:
     }
 
 private:
-    inline static const auto copy = reinterpret_cast<void (*)(void*)>(static_cast<std::intptr_t>(-1));
     sqlite3* db_;
     sqlite3_stmt* statement_ = nullptr;
     int next_ = 1;
@@ -163,8 +140,8 @@ Store::Store(const std::filesystem::path& directory) : cache_(directory / L"cach
         throw Error("The Tangerine Stream profile could not be opened exclusively.");
     try {
         if (sqlite3_open_v2(utf8((directory / L"library.sqlite3").wstring()).c_str(), &db_,
-                           sqliteReadWriteCreate, nullptr) != sqliteOk) databaseError(db_);
-        if (sqlite3_busy_timeout(db_, 2000) != sqliteOk) databaseError(db_);
+                           SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) databaseError(db_);
+        if (sqlite3_busy_timeout(db_, 2000) != SQLITE_OK) databaseError(db_);
         Statement(db_, "PRAGMA foreign_keys=ON").run();
         Statement(db_, "PRAGMA journal_mode=WAL").run();
         Statement(db_, "PRAGMA synchronous=FULL").run();

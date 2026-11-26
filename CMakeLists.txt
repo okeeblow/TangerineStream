@@ -16,6 +16,21 @@ project(ml_tangerinestream VERSION 0.6.2 LANGUAGES C CXX RC)
 hunter_add_package(simdjson)
 find_package(simdjson CONFIG REQUIRED)
 
+# SQLite publishes its amalgamation without a CMake project. Let Hunter cache
+# the official source archive and compile it with the plug-in's toolchain.
+include(hunter_private_data)
+hunter_private_data(
+    URL "https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip"
+    SHA1 dbe0fa9aaeac8ad29fc3e094792896d556a57163
+    LOCATION sqlite_source
+)
+add_library(tangerine_sqlite STATIC "${sqlite_source}/sqlite3.c")
+target_include_directories(tangerine_sqlite PUBLIC "${sqlite_source}")
+target_compile_definitions(tangerine_sqlite PRIVATE SQLITE_OMIT_LOAD_EXTENSION)
+if(MSVC)
+    set_property(TARGET tangerine_sqlite PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 set(WINAMP_SDK "" CACHE PATH "Winamp SDK directory override")
 set(sdk_directory "${WINAMP_SDK}")
 if(NOT sdk_directory)
@@ -112,25 +127,4 @@ target_include_directories(ml_tangerinestream SYSTEM PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Wasabi"
     "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Agave")
 target_link_libraries(ml_tangerinestream PRIVATE
-    simdjson::simdjson comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
-
-if(MINGW)
-    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
-        set(sqlite_machine i386)
-        set(sqlite_def src/winsqlite3-x86.def)
-        set(sqlite_options --kill-at)
-    else()
-        set(sqlite_machine i386:x86-64)
-        set(sqlite_def src/winsqlite3.def)
-    endif()
-    set(sqlite_import "${CMAKE_CURRENT_BINARY_DIR}/libwinsqlite3.a")
-    add_custom_command(OUTPUT "${sqlite_import}"
-        COMMAND "${CMAKE_DLLTOOL}" -m "${sqlite_machine}" ${sqlite_options}
-            -d "${CMAKE_CURRENT_SOURCE_DIR}/${sqlite_def}" -l "${sqlite_import}"
-        DEPENDS "${sqlite_def}" VERBATIM)
-    add_custom_target(sqlite_import DEPENDS "${sqlite_import}")
-    add_dependencies(ml_tangerinestream sqlite_import)
-    target_link_libraries(ml_tangerinestream PRIVATE "${sqlite_import}")
-else()
-    target_link_libraries(ml_tangerinestream PRIVATE winsqlite3)
-endif()
+    simdjson::simdjson tangerine_sqlite comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
