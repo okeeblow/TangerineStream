@@ -10,8 +10,11 @@
 #include <set>
 
 struct sqlite3;
+struct sqlite3_stmt;
 
 namespace tangerine {
+
+class Statement;
 
 class Store {
 public:
@@ -70,6 +73,8 @@ public:
     std::int64_t reportCount(Id server);
 
 private:
+    Statement prepare(const char* sql);
+    void closeDatabase();
     void rememberUnlocked(std::vector<Track>& tracks);
     void rememberCatalog(Id server, const BrowseLocation& location, bool unfiltered,
                          int offset, const BrowsePage& page);
@@ -85,6 +90,7 @@ private:
     std::filesystem::path cache_;
     HANDLE lockFile_ = INVALID_HANDLE_VALUE;
     sqlite3* db_ = nullptr;
+    std::map<std::string, sqlite3_stmt*, std::less<>> statements_;
     std::mutex mutex_;
     std::set<Id> configured_;
     std::map<Id, std::int64_t> downloads_;

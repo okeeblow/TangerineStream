@@ -44,7 +44,7 @@ int init();
 void quit();
 INT_PTR message(int type, INT_PTR a, INT_PTR b, INT_PTR c);
 
-char description[] = "Tangerine Stream v0.6.3";
+char description[] = "Tangerine Stream v0.6.4";
 winampMediaLibraryPlugin plugin = [] {
     winampMediaLibraryPlugin descriptor{};
 #ifdef MLHDR_VER_OLD

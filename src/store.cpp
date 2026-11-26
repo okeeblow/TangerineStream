@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iterator>
 #include <system_error>
+#include <utility>
 
 namespace tangerine {
 namespace {
@@ -19,12 +20,24 @@ constexpr int defaultBudget = 1024;
     throw Error(std::string("Tangerine Stream storage: ") + (db ? sqlite3_errmsg(db) : "out of memory"));
 }
 
+} // namespace
+
 class Statement {
 public:
-    Statement(sqlite3* db, const char* sql) : db_(db) {
-        if (sqlite3_prepare_v2(db_, sql, -1, &statement_, nullptr) != SQLITE_OK) databaseError(db_);
+    Statement(sqlite3* db, const char* sql, sqlite3_stmt** slot = nullptr) : db_(db), slot_(slot) {
+        if (slot_) statement_ = std::exchange(*slot_, nullptr);
+        if (!statement_ && sqlite3_prepare_v3(db_, sql, -1, slot_ ? SQLITE_PREPARE_PERSISTENT : 0,
+                                             &statement_, nullptr) != SQLITE_OK) databaseError(db_);
     }
-    ~Statement() { sqlite3_finalize(statement_); }
+    ~Statement() {
+        if (slot_ && !*slot_) {
+            sqlite3_reset(statement_);
+            sqlite3_clear_bindings(statement_);
+            *slot_ = statement_;
+        } else {
+            sqlite3_finalize(statement_);
+        }
+    }
     Statement(const Statement&) = delete;
     Statement& operator=(const Statement&) = delete;
     Statement& bind(std::int64_t value) {
@@ -60,9 +73,12 @@ public:
 
 private:
     sqlite3* db_;
+    sqlite3_stmt** slot_;
     sqlite3_stmt* statement_ = nullptr;
     int next_ = 1;
 };
+
+namespace {
 
 class Transaction {
 public:
@@ -204,31 +220,45 @@ Store::Store(const std::filesystem::path& directory) : cache_(directory / L"cach
         reconcile();
         trimUnlocked(0);
     } catch (...) {
-        if (db_) sqlite3_close(db_);
+        closeDatabase();
         CloseHandle(lockFile_);
         throw;
     }
 }
 
 Store::~Store() {
-    sqlite3_close(db_);
+    closeDatabase();
     CloseHandle(lockFile_);
 }
 
+void Store::closeDatabase() {
+    for (const auto& entry : statements_) sqlite3_finalize(entry.second);
+    statements_.clear();
+    if (db_) sqlite3_close(db_);
+}
+
+Statement Store::prepare(const char* sql) {
+    // Only query shapes are keys. All user input is bound separately.
+    auto slot = statements_.lower_bound(sql);
+    if (slot == statements_.end() || slot->first != sql)
+        slot = statements_.emplace_hint(slot, sql, nullptr);
+    return Statement(db_, sql, &slot->second);
+}
+
 std::string Store::setting(const char* key) {
-    Statement statement(db_, "SELECT value FROM settings WHERE name=?");
+    auto statement = prepare("SELECT value FROM settings WHERE name=?");
     statement.bind(std::string(key));
     return statement.row() ? statement.text(0) : "";
 }
 
 void Store::setSetting(const char* key, const std::string& value) {
-    Statement(db_, "INSERT INTO settings VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value")
+    prepare("INSERT INTO settings VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value")
         .bind(std::string(key)).bind(value).run();
 }
 
 std::vector<Server> Store::servers() {
     std::scoped_lock lock(mutex_);
-    Statement statement(db_, "SELECT id,name,url,user,native,cache_favorites,unmetered_format,unmetered_kbps,"
+    auto statement = prepare("SELECT id,name,url,user,native,cache_favorites,unmetered_format,unmetered_kbps,"
         "metered_format,metered_kbps,upgrade_favorites FROM servers WHERE configured=1 ORDER BY name,id");
     std::vector<Server> result;
     while (statement.row())
@@ -240,7 +270,7 @@ std::vector<Server> Store::servers() {
 }
 
 Server Store::loadServer(Id id) {
-    Statement statement(db_, "SELECT name,url,user,password,native,cache_favorites,unmetered_format,unmetered_kbps,"
+    auto statement = prepare("SELECT name,url,user,password,native,cache_favorites,unmetered_format,unmetered_kbps,"
         "metered_format,metered_kbps,upgrade_favorites FROM servers WHERE id=? AND configured=1");
     statement.bind(id);
     if (!statement.row()) throw Error("The selected server is unavailable.");
@@ -259,7 +289,7 @@ Id Store::saveProfile(const Server& server) {
     auto id = server.id;
     if (!id) {
         if (server.password.empty()) throw Error("Enter a password for the new account.");
-        Statement existing(db_, "SELECT id,configured FROM servers WHERE url=? AND user=?");
+        auto existing = prepare("SELECT id,configured FROM servers WHERE url=? AND user=?");
         existing.bind(server.url).bind(server.user);
         if (existing.row()) {
             if (existing.integer(1)) throw Error("This server and username already have a profile.");
@@ -267,31 +297,31 @@ Id Store::saveProfile(const Server& server) {
         }
     }
     if (!id) {
-        Statement(db_, "INSERT INTO servers(name,url,user,password,native,cache_favorites) VALUES(?,?,?,?,?,?)")
+        prepare("INSERT INTO servers(name,url,user,password,native,cache_favorites) VALUES(?,?,?,?,?,?)")
             .bind(server.name).bind(server.url).bind(server.user).bind(protect(server.password))
             .bind(server.native).bind(server.cacheFavorites).run();
         id = sqlite3_last_insert_rowid(db_);
     } else {
-        Statement saved(db_, "SELECT url FROM servers WHERE id=? AND user=? AND configured=?");
+        auto saved = prepare("SELECT url FROM servers WHERE id=? AND user=? AND configured=?");
         saved.bind(id).bind(server.user).bind(server.id != 0);
         if (!saved.row() || !sameServerEndpoint(saved.text(0), server.url))
             throw Error("This server profile has changed. Reopen settings and try again.");
         if (saved.text(0) != server.url) {
-            Statement conflict(db_, "SELECT id FROM servers WHERE url=? AND user=? AND id<>?");
+            auto conflict = prepare("SELECT id FROM servers WHERE url=? AND user=? AND id<>?");
             conflict.bind(server.url).bind(server.user).bind(id);
             if (conflict.row()) throw Error("This address already has a profile for this username. Use Add server to reconnect it.");
         }
-        Statement(db_, "UPDATE servers SET name=?,native=?,cache_favorites=?,configured=1,url=? WHERE id=?")
+        prepare("UPDATE servers SET name=?,native=?,cache_favorites=?,configured=1,url=? WHERE id=?")
             .bind(server.name).bind(server.native).bind(server.cacheFavorites).bind(server.url).bind(id).run();
         if (!server.password.empty())
-            Statement(db_, "UPDATE servers SET password=? WHERE id=?")
+            prepare("UPDATE servers SET password=? WHERE id=?")
                 .bind(protect(server.password)).bind(id).run();
     }
-    Statement(db_, "UPDATE servers SET unmetered_format=?,unmetered_kbps=?,metered_format=?,metered_kbps=?,"
+    prepare("UPDATE servers SET unmetered_format=?,unmetered_kbps=?,metered_format=?,metered_kbps=?,"
         "upgrade_favorites=? WHERE id=?").bind(server.unmetered.format).bind(server.unmetered.kbps)
         .bind(server.metered.format).bind(server.metered.kbps).bind(server.upgradeFavorites).bind(id).run();
     if (!server.cacheFavorites)
-        Statement(db_, "UPDATE tracks SET favorite=0 WHERE server=? AND favorite=1").bind(id).run();
+        prepare("UPDATE tracks SET favorite=0 WHERE server=? AND favorite=1").bind(id).run();
     return id;
 }
 
@@ -306,7 +336,7 @@ void Store::saveProfiles(std::vector<Server>& profiles, int rollingMiB, bool uni
     Transaction transaction(db_);
     auto configured = configured_;
     for (Id id : removed) {
-        Statement(db_, "UPDATE servers SET configured=0,password='' WHERE id=?").bind(id).run();
+        prepare("UPDATE servers SET configured=0,password='' WHERE id=?").bind(id).run();
         configured.erase(id);
     }
     std::vector<Id> ids;
@@ -394,7 +424,7 @@ void Store::connectionRestored(Id server) {
 
 Track Store::loadTrack(Id key, bool configuredOnly) {
     auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE key=?";
-    Statement statement(db_, sql.c_str());
+    auto statement = prepare(sql.c_str());
     statement.bind(key);
     if (!statement.row() || (configuredOnly && !configured_.count(statement.integer(1)))) return {};
     return getTrack(statement);
@@ -407,7 +437,7 @@ Track Store::track(Id key) {
 
 void Store::rememberUnlocked(std::vector<Track>& tracks) {
     for (auto& track : tracks) {
-        Statement(db_, "INSERT INTO tracks(server,remote_id,title,artist,album,suffix,mime,duration,"
+        prepare("INSERT INTO tracks(server,remote_id,title,artist,album,suffix,mime,duration,"
             "cover_id,album_id,artist_id,album_artist_id,album_artist,genre,disc_number,track_number,year,sort_tags)"
             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(server,remote_id) DO UPDATE SET"
             " title=coalesce(nullif(excluded.title,''),tracks.title),"
@@ -431,8 +461,8 @@ void Store::rememberUnlocked(std::vector<Track>& tracks) {
             .bind(track.coverId).bind(track.albumId).bind(track.artistId).bind(track.albumArtistId)
             .bind(track.albumArtist).bind(track.genre).bind(track.discNumber).bind(track.trackNumber)
             .bind(track.year).bind(encodeSortTags(track.sortTags)).run();
-        auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE server=? AND remote_id=?";
-        Statement statement(db_, sql.c_str());
+        static const auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE server=? AND remote_id=?";
+        auto statement = prepare(sql.c_str());
         statement.bind(track.server).bind(track.id);
         if (statement.row()) track = getTrack(statement);
     }
@@ -453,10 +483,10 @@ void Store::rememberCatalog(Id server, const BrowseLocation& location, bool unfi
                             const BrowsePage& page) {
     auto parent = static_cast<int>(location.kind);
     if (unfiltered && offset == 0 && !page.more)
-        Statement(db_, "DELETE FROM catalog WHERE server=? AND parent_kind=? AND parent_id=?")
+        prepare("DELETE FROM catalog WHERE server=? AND parent_kind=? AND parent_id=?")
             .bind(server).bind(parent).bind(location.id).run();
     auto save = [&](const LibraryItem& item, Id slot, Id key) {
-        Statement(db_, "INSERT INTO catalog(server,parent_kind,parent_id,kind,id,slot,title,subtitle,cover_id,track_key,sort_tags)"
+        prepare("INSERT INTO catalog(server,parent_kind,parent_id,kind,id,slot,title,subtitle,cover_id,track_key,sort_tags)"
             " VALUES(?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(server,parent_kind,parent_id,kind,id,slot) DO UPDATE SET"
             " title=excluded.title,subtitle=excluded.subtitle,"
@@ -468,7 +498,7 @@ void Store::rememberCatalog(Id server, const BrowseLocation& location, bool unfi
     };
     auto saveTotals = [&](BrowseKind kind, const std::string& id, int songs, std::int64_t duration) {
         if (songs < 0 && duration <= 0) return;
-        Statement(db_, "INSERT INTO catalog_totals VALUES(?,?,?,?,?) ON CONFLICT(server,kind,id) DO UPDATE SET"
+        prepare("INSERT INTO catalog_totals VALUES(?,?,?,?,?) ON CONFLICT(server,kind,id) DO UPDATE SET"
             " songs=CASE WHEN excluded.songs>=0 THEN excluded.songs ELSE catalog_totals.songs END,"
             " duration=CASE WHEN excluded.songs=0 OR excluded.duration>0 THEN excluded.duration"
             " ELSE catalog_totals.duration END").bind(server).bind(static_cast<int>(kind)).bind(id)
@@ -525,7 +555,7 @@ BrowsePage Store::cachedPage(Id server, const BrowseLocation& location, const st
         else if (kind == BrowseKind::albumTracks) sql += " ORDER BY disc_number,track_number,title COLLATE NOCASE,key";
         else sql += " ORDER BY artist COLLATE NOCASE,album COLLATE NOCASE,title COLLATE NOCASE,key";
         sql += " LIMIT ? OFFSET ?";
-        Statement entries(db_, sql.c_str());
+        auto entries = prepare(sql.c_str());
         if (playlist) entries.bind(server).bind(static_cast<int>(kind)).bind(location.id);
         entries.bind(server);
         if (kind == BrowseKind::song || kind == BrowseKind::albumTracks)
@@ -552,7 +582,7 @@ BrowsePage Store::cachedPage(Id server, const BrowseLocation& location, const st
         if (kind == BrowseKind::albums) sql += "kind=?";
         else sql += "parent_kind=? AND parent_id=?";
         sql += " ORDER BY title COLLATE NOCASE,id,cover_id DESC";
-        Statement entries(db_, sql.c_str());
+        auto entries = prepare(sql.c_str());
         entries.bind(server).bind(static_cast<int>(kind == BrowseKind::albums ? BrowseKind::albumTracks : kind));
         if (kind != BrowseKind::albums) entries.bind(location.id);
         std::set<std::pair<std::string, std::string>> names;
@@ -564,7 +594,7 @@ BrowsePage Store::cachedPage(Id server, const BrowseLocation& location, const st
         }
         if (result.more) return result;
         if (kind == BrowseKind::genres) {
-            Statement genres(db_, "SELECT DISTINCT genre FROM tracks WHERE server=? AND genre<>'' ORDER BY genre");
+            auto genres = prepare("SELECT DISTINCT genre FROM tracks WHERE server=? AND genre<>'' ORDER BY genre");
             genres.bind(server);
             while (!result.more && genres.row())
                 addItem({{BrowseKind::genreAlbums, genres.text(0), genres.text(0)}, {}, {}});
@@ -575,7 +605,7 @@ BrowsePage Store::cachedPage(Id server, const BrowseLocation& location, const st
                 "coalesce(nullif(album_artist_id,''),CASE WHEN album_artist='' OR album_artist=artist THEN artist_id ELSE '' END)";
             auto artistSql = std::string("SELECT ") + id + "," + name +
                 " FROM tracks WHERE server=? GROUP BY 1,2 ORDER BY 2 COLLATE NOCASE,1 DESC";
-            Statement artists(db_, artistSql.c_str());
+            auto artists = prepare(artistSql.c_str());
             artists.bind(server);
             std::set<std::string> represented;
             for (const auto& namePair : names) represented.insert(namePair.first);
@@ -598,7 +628,7 @@ BrowsePage Store::cachedPage(Id server, const BrowseLocation& location, const st
                 " OR (artist_id='' AND artist=?) OR (album_artist_id='' AND album_artist=?))";
             albumSql += " GROUP BY 1,2,CASE WHEN album_id='' THEN coalesce(nullif(album_artist,''),artist)"
                 " ELSE '' END ORDER BY 2 COLLATE NOCASE,1 DESC";
-            Statement albums(db_, albumSql.c_str());
+            auto albums = prepare(albumSql.c_str());
             albums.bind(server);
             if (kind == BrowseKind::genreAlbums) albums.bind(location.id);
             if (kind == BrowseKind::artistAlbums) {
@@ -625,7 +655,7 @@ BrowsePage Store::cachedPage(Id server, const BrowseLocation& location, const st
 std::string Store::albumCover(Id server, const std::string& albumId) {
     if (albumId.empty()) return {};
     std::scoped_lock lock(mutex_);
-    Statement cover(db_, "SELECT cover_id FROM catalog WHERE server=? AND kind=? AND id=?"
+    auto cover = prepare("SELECT cover_id FROM catalog WHERE server=? AND kind=? AND id=?"
         " AND cover_id<>'' LIMIT 1");
     cover.bind(server).bind(static_cast<int>(BrowseKind::albumTracks)).bind(albumId);
     return cover.row() ? cover.text(0) : "";
@@ -643,11 +673,11 @@ std::string artworkKey(const LibraryItem& item) {
 std::string Store::artwork(Id server, const LibraryItem& item) {
     std::scoped_lock lock(mutex_);
     auto key = artworkKey(item);
-    Statement artwork(db_, "SELECT data FROM artwork WHERE server=? AND cover_key=?");
+    auto artwork = prepare("SELECT data FROM artwork WHERE server=? AND cover_key=?");
     artwork.bind(server).bind(key);
     if (!artwork.row()) return {};
     auto data = artwork.blob(0);
-    Statement(db_, "UPDATE artwork SET last_use=? WHERE server=? AND cover_key=?")
+    prepare("UPDATE artwork SET last_use=? WHERE server=? AND cover_key=?")
         .bind(nowMs()).bind(server).bind(key).run();
     return data;
 }
@@ -665,7 +695,7 @@ bool Store::stageCover(const Track& track, const LibraryItem& song, const Librar
     std::error_code ec;
     if (!std::filesystem::is_directory(directory, ec)) return false;
     const auto primary = artworkKey(song);
-    Statement match(db_, "SELECT cover_key,length(data) FROM artwork WHERE server=? AND cover_key IN (?,?)"
+    auto match = prepare("SELECT cover_key,length(data) FROM artwork WHERE server=? AND cover_key IN (?,?)"
                          " ORDER BY cover_key=? DESC LIMIT 1");
     match.bind(track.server).bind(primary).bind(album.target.id.empty() ? primary : artworkKey(album)).bind(primary);
     if (!match.row()) return false;
@@ -679,7 +709,7 @@ bool Store::stageCover(const Track& track, const LibraryItem& song, const Librar
     };
     std::string oldExt;
     {
-        Statement old(db_, "SELECT cover_key,ext,bytes,last_use FROM playlist_covers WHERE track=?");
+        auto old = prepare("SELECT cover_key,ext,bytes,last_use FROM playlist_covers WHERE track=?");
         old.bind(track.key);
         if (old.row()) {
             oldExt = old.text(1);
@@ -688,13 +718,13 @@ bool Store::stageCover(const Track& track, const LibraryItem& song, const Librar
                 std::filesystem::file_size(pathFor(track.key, oldExt), ec) == static_cast<uintmax_t>(bytes) && !ec) {
                 // Avoid journaling on every metadata query during playback.
                 if (old.integer(3) < nowMs() - 60000)
-                    Statement(db_, "UPDATE playlist_covers SET last_use=? WHERE track=?")
+                    prepare("UPDATE playlist_covers SET last_use=? WHERE track=?")
                         .bind(nowMs()).bind(track.key).run();
                 return false;
             }
         }
     }
-    Statement payload(db_, "SELECT data FROM artwork WHERE server=? AND cover_key=?");
+    auto payload = prepare("SELECT data FROM artwork WHERE server=? AND cover_key=?");
     payload.bind(track.server).bind(key);
     if (!payload.row()) return false;
     auto data = payload.blob(0);
@@ -711,10 +741,10 @@ bool Store::stageCover(const Track& track, const LibraryItem& song, const Librar
     }
     if (!oldExt.empty() && wide(oldExt) != ext) DeleteFileW(pathFor(track.key, oldExt).c_str());
     Transaction transaction(db_);
-    Statement(db_, "INSERT OR REPLACE INTO playlist_covers VALUES(?,?,?,?,?)")
+    prepare("INSERT OR REPLACE INTO playlist_covers VALUES(?,?,?,?,?)")
         .bind(track.key).bind(key).bind(utf8(ext)).bind(bytes).bind(nowMs()).run();
 
-    Statement overflow(db_, "SELECT track,ext FROM (SELECT track,ext,"
+    auto overflow = prepare("SELECT track,ext FROM (SELECT track,ext,"
         "sum(bytes) OVER (ORDER BY (track=? OR track=?) DESC,last_use DESC,track) AS total "
         "FROM playlist_covers) WHERE total>?");
     overflow.bind(activeCover_).bind(track.key).bind(24 * MiB);
@@ -729,7 +759,7 @@ bool Store::stageCover(const Track& track, const LibraryItem& song, const Librar
                 if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) continue;
             }
         }
-        Statement(db_, "DELETE FROM playlist_covers WHERE track=?").bind(id).run();
+        prepare("DELETE FROM playlist_covers WHERE track=?").bind(id).run();
     }
     transaction.commit();
     return true;
@@ -739,12 +769,12 @@ void Store::saveArtwork(Id server, const LibraryItem& item, const std::string& d
     if (data.empty()) return;
     std::scoped_lock lock(mutex_);
     Transaction transaction(db_);
-    Statement(db_, "UPDATE playlist_covers SET cover_key='' WHERE cover_key=? AND track IN"
+    prepare("UPDATE playlist_covers SET cover_key='' WHERE cover_key=? AND track IN"
         " (SELECT key FROM tracks WHERE server=?)").bind(artworkKey(item)).bind(server).run();
-    Statement(db_, "INSERT INTO artwork VALUES(?,?,?,?) ON CONFLICT(server,cover_key) DO UPDATE SET"
+    prepare("INSERT INTO artwork VALUES(?,?,?,?) ON CONFLICT(server,cover_key) DO UPDATE SET"
         " data=excluded.data,last_use=excluded.last_use")
         .bind(server).bind(artworkKey(item)).bindBlob(data).bind(nowMs()).run();
-    Statement(db_, "DELETE FROM artwork WHERE (server,cover_key) IN (SELECT server,cover_key FROM"
+    prepare("DELETE FROM artwork WHERE (server,cover_key) IN (SELECT server,cover_key FROM"
         " (SELECT server,cover_key,sum(length(data)) OVER (ORDER BY last_use DESC,server,cover_key"
         " ROWS UNBOUNDED PRECEDING) AS bytes FROM artwork) WHERE bytes>?)").bind(128 * MiB).run();
     transaction.commit();
@@ -752,7 +782,7 @@ void Store::saveArtwork(Id server, const LibraryItem& item, const std::string& d
 
 std::optional<Lyrics> Store::lyrics(Id key, bool fresh) {
     std::scoped_lock lock(mutex_);
-    Statement lyrics(db_, "SELECT plain,structured,checked FROM lyrics WHERE track=?");
+    auto lyrics = prepare("SELECT plain,structured,checked FROM lyrics WHERE track=?");
     lyrics.bind(key);
     if (!lyrics.row()) return {};
     Lyrics result{lyrics.text(0), lyrics.text(1)};
@@ -762,7 +792,7 @@ std::optional<Lyrics> Store::lyrics(Id key, bool fresh) {
 
 void Store::saveLyrics(Id key, const Lyrics& lyrics) {
     std::scoped_lock lock(mutex_);
-    Statement(db_, "INSERT INTO lyrics VALUES(?,?,?,?) ON CONFLICT(track) DO UPDATE SET"
+    prepare("INSERT INTO lyrics VALUES(?,?,?,?) ON CONFLICT(track) DO UPDATE SET"
         " plain=excluded.plain,structured=excluded.structured,checked=excluded.checked")
         .bind(key).bind(lyrics.plain).bind(lyrics.structured).bind(nowMs()).run();
 }
@@ -771,22 +801,22 @@ void Store::pin(const std::vector<Track>& tracks, bool permanent) {
     std::scoped_lock lock(mutex_);
     Transaction transaction(db_);
     for (const auto& track : tracks)
-        Statement(db_, "UPDATE tracks SET pinned=?,retry_at=0 WHERE key=?").bind(permanent).bind(track.key).run();
+        prepare("UPDATE tracks SET pinned=?,retry_at=0 WHERE key=?").bind(permanent).bind(track.key).run();
     transaction.commit();
 }
 
 void Store::syncFavorites(Id server, BrowsePage& page) {
     std::scoped_lock lock(mutex_);
     if (!configured_.count(server)) return;
-    Statement enabled(db_, "SELECT id FROM servers WHERE id=? AND cache_favorites=1");
+    auto enabled = prepare("SELECT id FROM servers WHERE id=? AND cache_favorites=1");
     enabled.bind(server);
     if (!enabled.row()) return;
     Transaction transaction(db_);
     rememberUnlocked(page.tracks);
     rememberCatalog(server, {BrowseKind::favorites, {}, {}}, true, 0, page);
-    Statement(db_, "UPDATE tracks SET favorite=0 WHERE server=? AND favorite=1").bind(server).run();
+    prepare("UPDATE tracks SET favorite=0 WHERE server=? AND favorite=1").bind(server).run();
     for (const auto& track : page.tracks)
-        Statement(db_, "UPDATE tracks SET favorite=1 WHERE key=?").bind(track.key).run();
+        prepare("UPDATE tracks SET favorite=1 WHERE key=?").bind(track.key).run();
     transaction.commit();
 }
 
@@ -800,7 +830,7 @@ std::vector<Track> Store::pendingPins(Id server, bool upgradeFavorites, const In
     auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE server=?"
         " AND (bytes=0 OR (favorite=1 AND cached_format<>'' AND instr(?, '|' || lower(suffix) || '|')>0))"
         " AND (pinned=1 OR favorite=1) AND retry_at<=? ORDER BY pinned DESC,key LIMIT 4";
-    Statement statement(db_, sql.c_str());
+    auto statement = prepare(sql.c_str());
     statement.bind(server).bind(playable).bind(nowMs());
     std::vector<Track> result;
     while (statement.row()) result.push_back(getTrack(statement));
@@ -809,7 +839,7 @@ std::vector<Track> Store::pendingPins(Id server, bool upgradeFavorites, const In
 
 void Store::postponePin(Id key) {
     std::scoped_lock lock(mutex_);
-    Statement(db_, "UPDATE tracks SET retry_at=? WHERE key=?").bind(nowMs() + 60'000).bind(key).run();
+    prepare("UPDATE tracks SET retry_at=? WHERE key=?").bind(nowMs() + 60'000).bind(key).run();
 }
 
 std::filesystem::path Store::audioPath(const Track& track) const {
@@ -832,7 +862,7 @@ HANDLE Store::openCached(Id key, std::filesystem::path& path) {
 std::filesystem::path Store::partialPath(Id key) const { return cache_ / (std::to_wstring(key) + L".part"); }
 
 void Store::reconcile() {
-    Statement saved(db_, "SELECT key,bytes FROM tracks WHERE bytes>0");
+    auto saved = prepare("SELECT key,bytes FROM tracks WHERE bytes>0");
     std::vector<Id> missing;
     std::map<Id, std::filesystem::path> files;
     while (saved.row()) {
@@ -863,7 +893,7 @@ void Store::reconcile() {
             std::filesystem::remove(entry.path(), error);
         }
     }
-    for (Id key : missing) Statement(db_, "UPDATE tracks SET bytes=0,cached_format='' WHERE key=?").bind(key).run();
+    for (Id key : missing) prepare("UPDATE tracks SET bytes=0,cached_format='' WHERE key=?").bind(key).run();
 }
 
 bool Store::trimUnlocked(std::int64_t incoming) {
@@ -872,18 +902,18 @@ bool Store::trimUnlocked(std::int64_t incoming) {
         if (!track.pinned && !track.favorite) incoming += bytes;
     }
     if (incoming > budget_) return false;
-    Statement total(db_, "SELECT COALESCE(SUM(bytes),0) FROM tracks WHERE pinned=0 AND favorite=0");
+    auto total = prepare("SELECT COALESCE(SUM(bytes),0) FROM tracks WHERE pinned=0 AND favorite=0");
     total.row();
     auto used = total.integer(0);
     total.run();
     if (used <= budget_ - incoming) return true;
-    Statement oldest(db_, "SELECT key,bytes FROM tracks WHERE bytes>0 AND pinned=0 AND favorite=0 ORDER BY last_use,key");
+    auto oldest = prepare("SELECT key,bytes FROM tracks WHERE bytes>0 AND pinned=0 AND favorite=0 ORDER BY last_use,key");
     std::vector<std::pair<Id, std::int64_t>> candidates;
     while (oldest.row()) candidates.emplace_back(oldest.integer(0), oldest.integer(1));
     for (const auto& [key, bytes] : candidates) {
         auto path = audioPath(loadTrack(key));
         if (!DeleteFileW(path.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) continue;
-        Statement(db_, "UPDATE tracks SET bytes=0,cached_format='' WHERE key=?").bind(key).run();
+        prepare("UPDATE tracks SET bytes=0,cached_format='' WHERE key=?").bind(key).run();
         used -= bytes;
         if (used <= budget_ - incoming) return true;
     }
@@ -918,7 +948,7 @@ bool Store::publish(Id key, std::int64_t bytes, const std::string& format) {
     if (!track.key || bytes <= 0 || (!track.pinned && !track.favorite && !trimUnlocked(bytes))) return false;
     if (track.bytes) {
         if (!track.favorite || track.cachedFormat.empty() || !format.empty()) return false;
-        Statement enabled(db_, "SELECT 1 FROM servers WHERE id=? AND cache_favorites=1 AND upgrade_favorites=1");
+        auto enabled = prepare("SELECT 1 FROM servers WHERE id=? AND cache_favorites=1 AND upgrade_favorites=1");
         if (!enabled.bind(track.server).row()) return false;
     }
     const auto previous = track.bytes ? audioPath(track) : std::filesystem::path{};
@@ -927,7 +957,7 @@ bool Store::publish(Id key, std::int64_t bytes, const std::string& format) {
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         throw Error("The completed audio file could not be saved.");
     try {
-        Statement(db_, "UPDATE tracks SET bytes=?,last_use=?,cached_format=?,retry_at=0 WHERE key=?")
+        prepare("UPDATE tracks SET bytes=?,last_use=?,cached_format=?,retry_at=0 WHERE key=?")
             .bind(bytes).bind(nowMs()).bind(format).bind(key).run();
     } catch (...) {
         DeleteFileW(audioPath(track).c_str());
@@ -945,7 +975,7 @@ void Store::release(Id key) {
 
 void Store::touch(Id key) {
     std::scoped_lock lock(mutex_);
-    Statement(db_, "UPDATE tracks SET last_use=? WHERE key=?").bind(nowMs()).bind(key).run();
+    prepare("UPDATE tracks SET last_use=? WHERE key=?").bind(nowMs()).bind(key).run();
 }
 
 void Store::trim() {
@@ -956,14 +986,14 @@ void Store::trim() {
 void Store::enqueueReport(const Track& track, std::int64_t time) {
     std::scoped_lock lock(mutex_);
     if (configured_.count(track.server))
-        Statement(db_, "INSERT INTO reports(server,remote_id,time) VALUES(?,?,?)")
+        prepare("INSERT INTO reports(server,remote_id,time) VALUES(?,?,?)")
             .bind(track.server).bind(track.id).bind(time).run();
 }
 
 std::vector<Report> Store::reports(Id server) {
     std::scoped_lock lock(mutex_);
     if (!configured_.count(server)) return {};
-    Statement statement(db_, "SELECT key,remote_id,time FROM reports WHERE server=? ORDER BY key LIMIT 25");
+    auto statement = prepare("SELECT key,remote_id,time FROM reports WHERE server=? ORDER BY key LIMIT 25");
     statement.bind(server);
     std::vector<Report> result;
     std::size_t querySize = 0;
@@ -980,13 +1010,13 @@ void Store::acknowledge(const std::vector<Report>& reports) {
     std::scoped_lock lock(mutex_);
     Transaction transaction(db_);
     for (const auto& report : reports)
-        Statement(db_, "DELETE FROM reports WHERE key=?").bind(report.key).run();
+        prepare("DELETE FROM reports WHERE key=?").bind(report.key).run();
     transaction.commit();
 }
 
 std::int64_t Store::reportCount(Id server) {
     std::scoped_lock lock(mutex_);
-    Statement statement(db_, "SELECT COUNT(*) FROM reports WHERE server=?");
+    auto statement = prepare("SELECT COUNT(*) FROM reports WHERE server=?");
     statement.bind(server);
     return statement.row() ? statement.integer(0) : 0;
 }
