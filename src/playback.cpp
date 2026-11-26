@@ -164,7 +164,7 @@ bool meteredInternet() {
                  NLM_CONNECTION_COST_APPROACHINGDATALIMIT)) != 0;
 }
 
-void downloadAudio(Store& store, const Track& track, const Server& profile, ServerApi& api,
+void downloadAudio(Store& store, HttpClient& http, const Track& track, const Server& profile, ServerApi& api,
                    bool metered, const std::atomic_bool& stopping, const InputExtensions& inputs,
                    unsigned excluded, bool (*currentCost)()) {
     const bool upgrade = !metered && profile.upgradeFavorites && track.favorite &&
@@ -183,7 +183,7 @@ void downloadAudio(Store& store, const Track& track, const Server& profile, Serv
             return;
         }
         if (stopping || !store.networkAvailable(track.server) || currentCost() != metered) return;
-        response.emplace(stream.url, L"GET", L"");
+        response.emplace(http, stream.url, L"GET", L"");
         auto mime = response->header(WINHTTP_QUERY_CONTENT_TYPE);
         if (response->status == 408 || response->status >= 500)
             throw ConnectionError("The server returned HTTP " + std::to_string(response->status) + ".");

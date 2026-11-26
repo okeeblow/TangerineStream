@@ -44,7 +44,7 @@ int init();
 void quit();
 INT_PTR message(int type, INT_PTR a, INT_PTR b, INT_PTR c);
 
-char description[] = "Tangerine Stream v0.6.4";
+char description[] = "Tangerine Stream v0.6.5";
 winampMediaLibraryPlugin plugin = [] {
     winampMediaLibraryPlugin descriptor{};
 #ifdef MLHDR_VER_OLD
@@ -183,7 +183,7 @@ struct AlbumJob {
 class App {
 public:
     explicit App(const std::filesystem::path& profile)
-        : store(profile), playback(store, profile), artwork(store, plugin.hwndWinampParent),
+        : store(profile), playback(store, profile), artwork(store, http, plugin.hwndWinampParent),
           hostMetadata(reinterpret_cast<void*>(player(IPC_GET_API_SERVICE)), store, playback, artwork) {
         try {
             refreshInputs();
@@ -283,6 +283,7 @@ public:
         return reinterpret_cast<UINT_PTR>(file) > 1 && playback.key(file) == key ? file : L"";
     }
 
+    HttpClient http;
     Store store;
     Playback playback;
     ArtworkLoader artwork;
@@ -444,7 +445,7 @@ int inputQuery(InputRequest request, const wchar_t* filename, const wchar_t* fie
             try {
                 const auto profile = owner->store.server(track.server);
                 const bool metered = meteredInternet();
-                const auto stream = connect(profile)->stream(track, metered ? profile.metered : profile.unmetered,
+                const auto stream = owner->http.connect(profile)->stream(track, metered ? profile.metered : profile.unmetered,
                                                              inputs, attempts->excluded);
                 attempts->excluded |= stream.choice;
                 value = wide(stream.url);
@@ -465,7 +466,7 @@ int inputQuery(InputRequest request, const wchar_t* filename, const wchar_t* fie
 std::vector<Track> App::albumTracks(Id server, const BrowseLocation& album) {
     if (store.networkAvailable(server) && !localLocation(album)) {
         try {
-            auto page = connect(store.server(server))->browse(album, {}, 0);
+            auto page = http.connect(store.server(server))->browse(album, {}, 0);
             store.rememberPage(server, album, true, 0, page);
             return std::move(page.tracks);
         } catch (const ConnectionError&) { store.connectionFailed(server); }
@@ -555,9 +556,9 @@ void App::browse() {
                 try {
                     auto profile = store.server(search.server);
                     auto& session = sessions[profile.id];
-                    if (!session.api || profile.native != session.profile.native ||
+                    if (!session.api || profile.native != session.profile.native || profile.url != session.profile.url ||
                         profile.password != session.profile.password) {
-                        session.api = connect(profile);
+                        session.api = http.connect(profile);
                         session.profile = std::move(profile);
                     }
                     const bool filterPlaylist = search.location.kind == BrowseKind::playlistTracks &&
@@ -617,7 +618,7 @@ void App::maintain() {
                 if (track.key && !track.bytes && store.networkAvailable(track.server)) {
                     try {
                         const auto profile = store.server(track.server);
-                        if (!meteredInternet()) downloadAudio(store, track, profile, *connect(profile), false, stopping, inputs(), requested.excluded);
+                        if (!meteredInternet()) downloadAudio(store, http, track, profile, *http.connect(profile), false, stopping, inputs(), requested.excluded);
                     }
                     catch (const ConnectionError&) { store.connectionFailed(track.server); }
                     catch (const Error&) { /* Rolling storage is optional during streaming. */ }
@@ -630,7 +631,7 @@ void App::maintain() {
             if (stopping) return;
             std::unique_ptr<ServerApi> api;
             auto connection = [&]() -> ServerApi& {
-                if (!api) api = connect(store.server(profile.id));
+                if (!api) api = http.connect(store.server(profile.id));
                 return *api;
             };
             if (store.connectionRetryDue(profile.id)) {
@@ -669,7 +670,7 @@ void App::maintain() {
                     if (stopping) return;
                     if (!store.networkAvailable(profile.id)) break;
                     try {
-                        downloadAudio(store, track, profile, connection(), meteredInternet(), stopping, enabled);
+                        downloadAudio(store, http, track, profile, connection(), meteredInternet(), stopping, enabled);
                         artwork.requestTrack(track.key);
                     } catch (const std::exception& error) {
                         if (dynamic_cast<const ConnectionError*>(&error)) store.connectionFailed(profile.id);
@@ -712,7 +713,7 @@ void App::report() {
                     if (!store.networkAvailable(profile.id)) break;
                     auto batch = store.reports(profile.id);
                     if (batch.empty()) break;
-                    if (!api) api = connect(store.server(profile.id));
+                    if (!api) api = http.connect(store.server(profile.id));
                     api->submit(batch);
                     store.acknowledge(batch);
                 }

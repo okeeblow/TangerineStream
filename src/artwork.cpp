@@ -86,10 +86,10 @@ std::vector<std::uint32_t> decode(IWICImagingFactory* factory, std::string& byte
 
 } // namespace
 
-ArtworkLoader::ArtworkLoader(Store& store, HWND player)
+ArtworkLoader::ArtworkLoader(Store& store, HttpClient& http, HWND player)
     : coverReadyMessage(RegisterWindowMessageW(L"ml_tangerinestream.coverReady")),
       lyricsReadyMessage(RegisterWindowMessageW(L"ml_tangerinestream.lyricsReady")),
-      store_(store), player_(player) {
+      store_(store), http_(http), player_(player) {
     try {
         for (int i = 0; i < 3; ++i) workers_.emplace_back([this] { load(); });
     } catch (...) {
@@ -187,7 +187,7 @@ void ArtworkLoader::stageCover(const Track& track) {
 void ArtworkLoader::loadTrack(Id key) {
     auto track = store_.track(key);
     if (!track.key || !store_.networkAvailable(track.server)) return;
-    auto connection = connect(store_.server(track.server));
+    auto connection = http_.connect(store_.server(track.server));
     try {
         const auto item = songArtwork(track);
         if (store_.artwork(track.server, item).empty()) {
@@ -243,7 +243,7 @@ void ArtworkLoader::load() {
             if (factory.get()) {
                 auto bytes = store_.artwork(request.server, request.item);
                 if (bytes.empty() && store_.networkAvailable(request.server) && !localLocation(request.item.target)) {
-                    auto api = connect(store_.server(request.server));
+                    auto api = http_.connect(store_.server(request.server));
                     bytes = loadArtwork(store_, *api, request.server, request.item);
                 }
                 thumbnail.pixels = decode(factory.get(), bytes, request.size);

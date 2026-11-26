@@ -425,7 +425,7 @@ std::string escapedDecisionToken(const std::string& token) {
 
 class Subsonic : public ServerApi {
 public:
-    explicit Subsonic(Server server) : server_(std::move(server)) {}
+    Subsonic(HttpClient& http, Server server) : http_(http), server_(std::move(server)) {}
     void ping() override { api("ping"); }
 
     BrowsePage browse(const BrowseLocation& location, const std::string& query, int offset) override {
@@ -541,7 +541,7 @@ public:
             if (!representative.empty()) id = std::move(representative);
         }
         if (!usableId(id)) return {};
-        Response response(url("getCoverArt", {{"id", id}, {"size", std::to_string(size)}}), L"GET", L"");
+        Response response(http_, url("getCoverArt", {{"id", id}, {"size", std::to_string(size)}}), L"GET", L"");
         if (response.status != 200) return {};
         auto mime = response.header(WINHTTP_QUERY_CONTENT_TYPE);
         if (!mime.empty() && mime.compare(0, 6, "image/") != 0 &&
@@ -721,6 +721,7 @@ public:
     }
 
 protected:
+    HttpClient& http_;
     Server server_;
 
 private:
@@ -843,7 +844,7 @@ private:
     }
     JsonDocument api(const std::string& endpoint, Parameters parameters = {}, std::string* original = nullptr,
              const std::string& body = {}) {
-        Response response(url(endpoint, std::move(parameters)), body.empty() ? L"GET" : L"POST",
+        Response response(http_, url(endpoint, std::move(parameters)), body.empty() ? L"GET" : L"POST",
                           body.empty() ? L"" : L"Content-Type: application/json\r\n", body);
         if (response.status == 404 || response.status == 501)
             throw SubsonicError(70, "The server does not provide this resource.");
@@ -930,13 +931,13 @@ private:
     }
     std::unique_ptr<Response> authorizedGet(const std::string& url) {
         if (token_.empty()) token_ = login();
-        return std::make_unique<Response>(url, L"GET",
+        return std::make_unique<Response>(http_, url, L"GET",
             L"x-nd-authorization: Bearer " + wide(token_) + L"\r\n");
     }
     std::string login() {
         auto body = "{\"username\":" + jsonString(server_.user) +
                     ",\"password\":" + jsonString(server_.password) + "}";
-        Response response(server_.url + "/auth/login", L"POST",
+        Response response(http_, server_.url + "/auth/login", L"POST",
                           L"Content-Type: application/json\r\n", body);
         auto token = readJson(response).at("token").string();
         if (!validToken(token))
@@ -1049,15 +1050,33 @@ bool acceptsCodec(const InputExtensions& inputs, std::string_view codec) {
     });
 }
 
-Response::Response(const std::string& url, const wchar_t* method,
+std::shared_ptr<void> HttpClient::connection(const std::wstring& host, INTERNET_PORT port, bool secure) {
+    std::scoped_lock lock(mutex_);
+    auto found = std::find_if(origins_.begin(), origins_.end(), [&](const Origin& origin) {
+        return origin.port == port && origin.secure == secure && !_wcsicmp(origin.host.c_str(), host.c_str());
+    });
+    if (found != origins_.end()) {
+        origins_.splice(origins_.begin(), origins_, found);
+        return found->handle;
+    }
+    if (!session_) {
+        InternetHandle session(WinHttpOpen(L"ml_tangerinestream/0.1", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+        if (!session || !WinHttpSetTimeouts(session.get(), 3000, 4000, 4000, 5000)) networkError();
+        session_ = std::move(session);
+    }
+    InternetHandle handle(WinHttpConnect(session_.get(), host.c_str(), port, 0));
+    if (!handle) networkError();
+    origins_.push_front({host, port, secure, std::shared_ptr<void>(std::move(handle))});
+    constexpr size_t maxIdleOrigins = 16;
+    if (origins_.size() > maxIdleOrigins) origins_.pop_back();
+    return origins_.front().handle;
+}
+
+Response::Response(HttpClient& http, const std::string& url, const wchar_t* method,
                    const std::wstring& headers, const std::string& body) {
     auto address = splitUrl(wide(url));
-    session_.reset(WinHttpOpen(L"ml_tangerinestream/0.1", WINHTTP_ACCESS_TYPE_NO_PROXY,
-                               WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
-    if (!session_) networkError();
-    if (!WinHttpSetTimeouts(session_.get(), 3000, 4000, 4000, 5000)) networkError();
-    connection_.reset(WinHttpConnect(session_.get(), address.host.c_str(), address.port, 0));
-    if (!connection_) networkError();
+    connection_ = http.connection(address.host, address.port, address.secure);
     request_.reset(WinHttpOpenRequest(connection_.get(), method, address.target.c_str(),
         nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
         WINHTTP_FLAG_ESCAPE_DISABLE | (address.secure ? WINHTTP_FLAG_SECURE : 0)));
@@ -1110,9 +1129,9 @@ std::string Response::text(std::size_t limit) {
     return result;
 }
 
-std::unique_ptr<ServerApi> connect(const Server& server) {
-    if (server.native) return std::make_unique<Navidrome>(server);
-    return std::make_unique<Subsonic>(server);
+std::unique_ptr<ServerApi> HttpClient::connect(const Server& server) {
+    if (server.native) return std::make_unique<Navidrome>(*this, server);
+    return std::make_unique<Subsonic>(*this, server);
 }
 
 } // namespace tangerine

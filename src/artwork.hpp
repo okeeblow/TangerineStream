@@ -13,6 +13,8 @@ struct Thumbnail {
     std::vector<std::uint32_t> pixels;
 };
 
+class HttpClient;
+
 class ArtworkLoader {
 public:
     static constexpr UINT readyMessage = WM_APP + 3;
@@ -20,7 +22,7 @@ public:
     const UINT lyricsReadyMessage;
     using Generation = std::uint64_t;
 
-    ArtworkLoader(Store& store, HWND player);
+    ArtworkLoader(Store& store, HttpClient& http, HWND player);
     ~ArtworkLoader();
     ArtworkLoader(const ArtworkLoader&) = delete;
     ArtworkLoader& operator=(const ArtworkLoader&) = delete;
@@ -43,6 +45,7 @@ private:
     };
 
     Store& store_;
+    HttpClient& http_;
     const HWND player_;
     std::mutex mutex_;
     std::condition_variable ready_;
