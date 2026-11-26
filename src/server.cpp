@@ -32,11 +32,16 @@ std::string md5(const std::string& value) {
     unsigned char digest[16];
     if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_MD5_ALGORITHM, nullptr, 0))
         throw Error("Windows could not initialize Subsonic token authentication.");
-    auto status = BCryptHash(algorithm, nullptr, 0,
-        reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
-        static_cast<ULONG>(value.size()), digest, sizeof(digest));
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    auto status = BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0);
+    if (BCRYPT_SUCCESS(status)) {
+        status = BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
+                                static_cast<ULONG>(value.size()), 0);
+        if (BCRYPT_SUCCESS(status)) status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
+        BCryptDestroyHash(hash);
+    }
     BCryptCloseAlgorithmProvider(algorithm, 0);
-    if (status) throw Error("Windows could not create a Subsonic token.");
+    if (!BCRYPT_SUCCESS(status)) throw Error("Windows could not create a Subsonic token.");
     return hex(digest, sizeof(digest));
 }
 
