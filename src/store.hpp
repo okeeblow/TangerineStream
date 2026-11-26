@@ -7,6 +7,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 
 struct sqlite3;
 
@@ -21,7 +22,8 @@ public:
 
     std::vector<Server> servers();
     Server server(Id id);
-    void saveProfiles(std::vector<Server>& profiles, int rollingMiB, bool unified);
+    void saveProfiles(std::vector<Server>& profiles, int rollingMiB, bool unified,
+                      const std::vector<Id>& removed = {});
     bool unifiedTree();
     int rollingMiB();
     std::string playbackSecret();
@@ -75,7 +77,7 @@ private:
     void setSetting(const char* key, const std::string& value);
     Server loadServer(Id id);
     Id saveProfile(const Server& server);
-    Track loadTrack(Id key);
+    Track loadTrack(Id key, bool configuredOnly = false);
     std::filesystem::path audioPath(const Track& track) const;
     void reconcile();
     bool trimUnlocked(std::int64_t incoming);
@@ -84,6 +86,7 @@ private:
     HANDLE lockFile_ = INVALID_HANDLE_VALUE;
     sqlite3* db_ = nullptr;
     std::mutex mutex_;
+    std::set<Id> configured_;
     std::map<Id, std::int64_t> downloads_;
     std::map<Id, std::chrono::steady_clock::time_point> retryConnection_;
     std::int64_t budget_ = 0;

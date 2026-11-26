@@ -195,6 +195,8 @@ Store::Store(const std::filesystem::path& directory) : cache_(directory / L"cach
         Statement(db_, "PRAGMA journal_mode=WAL").run();
         Statement(db_, "PRAGMA synchronous=FULL").run();
         migrate(db_);
+        Statement accounts(db_, "SELECT id FROM servers WHERE configured=1");
+        while (accounts.row()) configured_.insert(accounts.integer(0));
         auto budget = setting("rolling_mib");
         budget_ = (budget.empty() ? defaultBudget : std::stoi(budget)) * MiB;
         offline_ = setting("offline_mode") == "1";
@@ -226,7 +228,7 @@ void Store::setSetting(const char* key, const std::string& value) {
 std::vector<Server> Store::servers() {
     std::scoped_lock lock(mutex_);
     Statement statement(db_, "SELECT id,name,url,user,native,cache_favorites,unmetered_format,unmetered_kbps,"
-        "metered_format,metered_kbps,upgrade_favorites FROM servers ORDER BY name,id");
+        "metered_format,metered_kbps,upgrade_favorites FROM servers WHERE configured=1 ORDER BY name,id");
     std::vector<Server> result;
     while (statement.row())
         result.push_back({statement.integer(0), statement.text(1), statement.text(2), statement.text(3), {},
@@ -238,7 +240,7 @@ std::vector<Server> Store::servers() {
 
 Server Store::loadServer(Id id) {
     Statement statement(db_, "SELECT name,url,user,password,native,cache_favorites,unmetered_format,unmetered_kbps,"
-        "metered_format,metered_kbps,upgrade_favorites FROM servers WHERE id=?");
+        "metered_format,metered_kbps,upgrade_favorites FROM servers WHERE id=? AND configured=1");
     statement.bind(id);
     if (!statement.row()) throw Error("The selected server is unavailable.");
     return {id, statement.text(0), statement.text(1), statement.text(2), unprotect(statement.text(3)),
@@ -255,16 +257,25 @@ Server Store::server(Id id) {
 Id Store::saveProfile(const Server& server) {
     auto id = server.id;
     if (!id) {
-        Statement duplicate(db_, "SELECT id FROM servers WHERE url=? AND user=?");
-        duplicate.bind(server.url).bind(server.user);
-        if (duplicate.row()) throw Error("This server and username already have a profile.");
+        if (server.password.empty()) throw Error("Enter a password for the new account.");
+        Statement existing(db_, "SELECT id,configured FROM servers WHERE url=? AND user=?");
+        existing.bind(server.url).bind(server.user);
+        if (existing.row()) {
+            if (existing.integer(1)) throw Error("This server and username already have a profile.");
+            id = existing.integer(0);
+        }
+    }
+    if (!id) {
         Statement(db_, "INSERT INTO servers(name,url,user,password,native,cache_favorites) VALUES(?,?,?,?,?,?)")
             .bind(server.name).bind(server.url).bind(server.user).bind(protect(server.password))
             .bind(server.native).bind(server.cacheFavorites).run();
         id = sqlite3_last_insert_rowid(db_);
     } else {
-        Statement(db_, "UPDATE servers SET name=?,native=?,cache_favorites=? WHERE id=?")
-            .bind(server.name).bind(server.native).bind(server.cacheFavorites).bind(id).run();
+        Statement(db_, "UPDATE servers SET name=?,native=?,cache_favorites=?,configured=1 "
+            "WHERE id=? AND url=? AND user=? AND configured=?")
+            .bind(server.name).bind(server.native).bind(server.cacheFavorites).bind(id)
+            .bind(server.url).bind(server.user).bind(server.id != 0).run();
+        if (!sqlite3_changes(db_)) throw Error("This server profile has changed. Reopen settings and try again.");
         if (!server.password.empty())
             Statement(db_, "UPDATE servers SET password=? WHERE id=?")
                 .bind(protect(server.password)).bind(id).run();
@@ -282,14 +293,25 @@ bool Store::unifiedTree() {
     return setting("unified_tree") != "0";
 }
 
-void Store::saveProfiles(std::vector<Server>& profiles, int rollingMiB, bool unified) {
+void Store::saveProfiles(std::vector<Server>& profiles, int rollingMiB, bool unified,
+                         const std::vector<Id>& removed) {
     std::scoped_lock lock(mutex_);
     Transaction transaction(db_);
+    auto configured = configured_;
+    for (Id id : removed) {
+        Statement(db_, "UPDATE servers SET configured=0,password='' WHERE id=?").bind(id).run();
+        configured.erase(id);
+    }
     std::vector<Id> ids;
-    for (const auto& profile : profiles) ids.push_back(saveProfile(profile));
+    for (const auto& profile : profiles) {
+        ids.push_back(saveProfile(profile));
+        configured.insert(ids.back());
+    }
     setSetting("unified_tree", unified ? "1" : "0");
     setSetting("rolling_mib", std::to_string(rollingMiB));
     transaction.commit();
+    configured_.swap(configured);
+    for (Id id : removed) retryConnection_.erase(id);
     budget_ = rollingMiB * MiB;
     for (size_t i = 0; i < ids.size(); ++i) profiles[i].id = ids[i];
 }
@@ -344,7 +366,7 @@ void Store::setOfflineMode(bool offline) {
 
 bool Store::networkAvailable(Id server) {
     std::scoped_lock lock(mutex_);
-    return !offline_ && retryConnection_.count(server) == 0;
+    return !offline_ && configured_.count(server) && retryConnection_.count(server) == 0;
 }
 
 bool Store::connectionRetryDue(Id server) {
@@ -363,16 +385,17 @@ void Store::connectionRestored(Id server) {
     retryConnection_.erase(server);
 }
 
-Track Store::loadTrack(Id key) {
+Track Store::loadTrack(Id key, bool configuredOnly) {
     auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE key=?";
     Statement statement(db_, sql.c_str());
     statement.bind(key);
-    return statement.row() ? getTrack(statement) : Track{};
+    if (!statement.row() || (configuredOnly && !configured_.count(statement.integer(1)))) return {};
+    return getTrack(statement);
 }
 
 Track Store::track(Id key) {
     std::scoped_lock lock(mutex_);
-    return loadTrack(key);
+    return loadTrack(key, true);
 }
 
 void Store::rememberUnlocked(std::vector<Track>& tracks) {
@@ -411,6 +434,7 @@ void Store::rememberUnlocked(std::vector<Track>& tracks) {
 void Store::rememberPage(Id server, const BrowseLocation& location, bool unfiltered, int offset,
                          BrowsePage& page) {
     std::scoped_lock lock(mutex_);
+    if (!configured_.count(server)) return;
     Transaction transaction(db_);
     rememberUnlocked(page.relatedTracks);
     rememberUnlocked(page.tracks);
@@ -465,6 +489,7 @@ void Store::rememberCatalog(Id server, const BrowseLocation& location, bool unfi
 
 BrowsePage Store::cachedPage(Id server, const BrowseLocation& location, const std::string& query, int offset) {
     std::scoped_lock lock(mutex_);
+    if (!configured_.count(server)) return {};
     const auto kind = location.kind;
     const auto filter = wide(query);
     BrowsePage result;
@@ -745,6 +770,7 @@ void Store::pin(const std::vector<Track>& tracks, bool permanent) {
 
 void Store::syncFavorites(Id server, BrowsePage& page) {
     std::scoped_lock lock(mutex_);
+    if (!configured_.count(server)) return;
     Statement enabled(db_, "SELECT id FROM servers WHERE id=? AND cache_favorites=1");
     enabled.bind(server);
     if (!enabled.row()) return;
@@ -763,6 +789,7 @@ std::vector<Track> Store::pendingPins(Id server, bool upgradeFavorites, const In
         for (const auto& extension : inputs) playable += extension + "|";
     }
     std::scoped_lock lock(mutex_);
+    if (!configured_.count(server)) return {};
     auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE server=?"
         " AND (bytes=0 OR (favorite=1 AND cached_format<>'' AND instr(?, '|' || lower(suffix) || '|')>0))"
         " AND (pinned=1 OR favorite=1) AND retry_at<=? ORDER BY pinned DESC,key LIMIT 4";
@@ -788,7 +815,7 @@ std::filesystem::path Store::audioPath(const Track& track) const {
 
 HANDLE Store::openCached(Id key, std::filesystem::path& path) {
     std::scoped_lock lock(mutex_);
-    auto track = loadTrack(key);
+    auto track = loadTrack(key, true);
     if (!track.bytes) return INVALID_HANDLE_VALUE;
     path = audioPath(track);
     auto file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -858,7 +885,7 @@ bool Store::trimUnlocked(std::int64_t incoming) {
 
 bool Store::reserve(Id key, std::int64_t bytes, bool upgrade) {
     std::scoped_lock lock(mutex_);
-    auto track = loadTrack(key);
+    auto track = loadTrack(key, true);
     if (!track.key || downloads_.count(key)) return false;
     if (track.bytes > 0 && !(upgrade && track.favorite && !track.cachedFormat.empty())) return false;
     if (!track.pinned && !track.favorite && (!budget_ || !trimUnlocked(std::max<std::int64_t>(bytes, 0)))) return false;
@@ -870,7 +897,8 @@ bool Store::growReservation(Id key, std::int64_t bytes) {
     std::scoped_lock lock(mutex_);
     auto& reserved = downloads_.at(key);
     if (bytes <= reserved) return true;
-    const auto track = loadTrack(key);
+    const auto track = loadTrack(key, true);
+    if (!track.key) return false;
     if (!track.pinned && !track.favorite && !trimUnlocked(bytes - reserved)) return false;
     reserved = bytes;
     return true;
@@ -879,8 +907,8 @@ bool Store::growReservation(Id key, std::int64_t bytes) {
 bool Store::publish(Id key, std::int64_t bytes, const std::string& format) {
     std::scoped_lock lock(mutex_);
     downloads_.at(key) = 0;
-    auto track = loadTrack(key);
-    if (bytes <= 0 || (!track.pinned && !track.favorite && !trimUnlocked(bytes))) return false;
+    auto track = loadTrack(key, true);
+    if (!track.key || bytes <= 0 || (!track.pinned && !track.favorite && !trimUnlocked(bytes))) return false;
     if (track.bytes) {
         if (!track.favorite || track.cachedFormat.empty() || !format.empty()) return false;
         Statement enabled(db_, "SELECT 1 FROM servers WHERE id=? AND cache_favorites=1 AND upgrade_favorites=1");
@@ -920,12 +948,14 @@ void Store::trim() {
 
 void Store::enqueueReport(const Track& track, std::int64_t time) {
     std::scoped_lock lock(mutex_);
-    Statement(db_, "INSERT INTO reports(server,remote_id,time) VALUES(?,?,?)")
-        .bind(track.server).bind(track.id).bind(time).run();
+    if (configured_.count(track.server))
+        Statement(db_, "INSERT INTO reports(server,remote_id,time) VALUES(?,?,?)")
+            .bind(track.server).bind(track.id).bind(time).run();
 }
 
 std::vector<Report> Store::reports(Id server) {
     std::scoped_lock lock(mutex_);
+    if (!configured_.count(server)) return {};
     Statement statement(db_, "SELECT key,remote_id,time FROM reports WHERE server=? ORDER BY key LIMIT 25");
     statement.bind(server);
     std::vector<Report> result;
