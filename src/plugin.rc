@@ -1,11 +1,12 @@
 #include <windows.h>
 #include "resources.h"
+#include "tangerine_product.h"
 
 IDI_TANGERINE ICON "tangerine.ico"
 
 1 VERSIONINFO
-FILEVERSION 0,6,7,0
-PRODUCTVERSION 0,6,7,0
+FILEVERSION TS_VERSION_TUPLE
+PRODUCTVERSION TS_VERSION_TUPLE
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_DLL
 BEGIN
@@ -14,12 +15,12 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName", "COOLTRAINER"
-            VALUE "FileDescription", "Tangerine Stream Media Library Plugin"
-            VALUE "FileVersion", "0.6.7"
+            VALUE "FileDescription", TS_LIBRARY_FILE_DESCRIPTION
+            VALUE "FileVersion", TS_VERSION_STRING
             VALUE "InternalName", "ml_tangerinestream"
             VALUE "OriginalFilename", "ml_tangerinestream.dll"
-            VALUE "ProductName", "Tangerine Stream"
-            VALUE "ProductVersion", "0.6.7"
+            VALUE "ProductName", TS_PRODUCT_NAME
+            VALUE "ProductVersion", TS_VERSION_STRING
             VALUE "Comments", "By COOLTRAINER"
         END
     END
@@ -51,7 +52,7 @@ END
 #define SETTINGS_HEIGHT 261
 IDD_SERVER DIALOGEX 0, 0, SETTINGS_WIDTH, SETTINGS_HEIGHT
 STYLE DS_SETFONT | DS_MODALFRAME | WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_CLIPCHILDREN
-CAPTION "Tangerine Stream settings"
+CAPTION TS_SETTINGS_CAPTION
 FONT 9, "Segoe UI"
 BEGIN
 END

@@ -12,6 +12,12 @@ HunterGate(
     LOCAL
 )
 project(ml_tangerinestream VERSION 0.6.7 LANGUAGES C CXX RC)
+set(TANGERINE_PRODUCT_NAME "Tangerine Stream")
+# Windows VERSIONINFO requires four components.
+string(REPLACE "." ";" version_components "${PROJECT_VERSION};0;0;0")
+list(SUBLIST version_components 0 4 version_components)
+list(JOIN version_components "," TANGERINE_VERSION_TUPLE)
+configure_file(cmake/product.h.in generated/tangerine_product.h @ONLY)
 
 if(MSVC_VERSION GREATER_EQUAL 1950)
     message(FATAL_ERROR "The v145 runtime requires Windows 10. Select MSVC v143 to target Windows 7.")
@@ -107,6 +113,7 @@ function(add_wacup_plugin target)
     set_target_properties(${target} PROPERTIES PREFIX "")
     target_compile_features(${target} PRIVATE cxx_std_17)
     target_compile_definitions(${target} PRIVATE WINVER=0x0601 _WIN32_WINNT=0x0601 UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_include_directories(${target} SYSTEM PRIVATE "${sdk_directory}")
     if(MINGW)
         target_link_options(${target} PRIVATE -static -static-libgcc -static-libstdc++)
@@ -121,7 +128,8 @@ function(add_wacup_plugin target)
 endfunction()
 
 set_property(SOURCE src/input.rc src/plugin.rc APPEND PROPERTY OBJECT_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/tangerine.ico")
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tangerine.ico"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/tangerine_product.h")
 add_wacup_plugin(in_tangerinestream src/input.cpp src/input.rc)
 target_compile_definitions(in_tangerinestream PRIVATE UNICODE_INPUT_PLUGIN)
 target_link_libraries(in_tangerinestream PRIVATE user32)

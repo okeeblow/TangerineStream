@@ -1,0 +1,11 @@
+#pragma once
+
+#define TS_PRODUCT_NAME "@TANGERINE_PRODUCT_NAME@"
+#define TS_PRODUCT_NAME_W L"@TANGERINE_PRODUCT_NAME@"
+#define TS_VERSION_STRING "@PROJECT_VERSION@"
+#define TS_VERSION_TUPLE @TANGERINE_VERSION_TUPLE@
+
+// Windows resource scripts need each caption or description as one literal.
+#define TS_SETTINGS_CAPTION "@TANGERINE_PRODUCT_NAME@ settings"
+#define TS_INPUT_FILE_DESCRIPTION "@TANGERINE_PRODUCT_NAME@ Input Plugin"
+#define TS_LIBRARY_FILE_DESCRIPTION "@TANGERINE_PRODUCT_NAME@ Media Library Plugin"

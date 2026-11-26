@@ -1,11 +1,12 @@
 #include <windows.h>
 #include "resources.h"
+#include "tangerine_product.h"
 
 IDI_TANGERINE ICON "tangerine.ico"
 
 1 VERSIONINFO
-FILEVERSION 0,6,7,0
-PRODUCTVERSION 0,6,7,0
+FILEVERSION TS_VERSION_TUPLE
+PRODUCTVERSION TS_VERSION_TUPLE
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_DLL
 BEGIN
@@ -14,12 +15,12 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName", "COOLTRAINER"
-            VALUE "FileDescription", "Tangerine Stream Input Plugin"
-            VALUE "FileVersion", "0.6.7"
+            VALUE "FileDescription", TS_INPUT_FILE_DESCRIPTION
+            VALUE "FileVersion", TS_VERSION_STRING
             VALUE "InternalName", "in_tangerinestream"
             VALUE "OriginalFilename", "in_tangerinestream.dll"
-            VALUE "ProductName", "Tangerine Stream"
-            VALUE "ProductVersion", "0.6.7"
+            VALUE "ProductName", TS_PRODUCT_NAME
+            VALUE "ProductVersion", TS_VERSION_STRING
             VALUE "Comments", "By COOLTRAINER"
         END
     END

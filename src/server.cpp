@@ -1,4 +1,5 @@
 #include "server.hpp"
+#include "tangerine_product.h"
 
 #include <bcrypt.h>
 #include <algorithm>
@@ -389,7 +390,7 @@ std::string clientCapabilities(int kbps, const Targets& targets, bool directPlay
         direct += "{\"containers\":[" + jsonString(extraContainer) + "],\"protocols\":[\"http\"]}";
     }
     const auto bps = std::to_string(kbps * 1000);
-    return "{\"name\":\"Tangerine Stream\",\"platform\":\"WACUP\",\"maxAudioBitrate\":" + bps +
+    return "{\"name\":" + jsonString(TS_PRODUCT_NAME) + ",\"platform\":\"WACUP\",\"maxAudioBitrate\":" + bps +
         ",\"maxTranscodingAudioBitrate\":" + bps + ",\"directPlayProfiles\":[" + direct +
         "],\"transcodingProfiles\":[" + transcode + "],\"codecProfiles\":[]}";
 }
@@ -1060,7 +1061,7 @@ std::shared_ptr<void> HttpClient::connection(const std::wstring& host, INTERNET_
         return found->handle;
     }
     if (!session_) {
-        InternetHandle session(WinHttpOpen(L"ml_tangerinestream/0.1", WINHTTP_ACCESS_TYPE_NO_PROXY,
+        InternetHandle session(WinHttpOpen(L"ml_tangerinestream/" TS_VERSION_STRING, WINHTTP_ACCESS_TYPE_NO_PROXY,
                                            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
         if (!session || !WinHttpSetTimeouts(session.get(), 3000, 4000, 4000, 5000)) networkError();
         session_ = std::move(session);

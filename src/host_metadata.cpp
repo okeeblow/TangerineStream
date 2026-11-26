@@ -1,6 +1,7 @@
 #include "playback.hpp"
 #include "artwork.hpp"
 #include "host_metadata.hpp"
+#include "tangerine_product.h"
 
 #include "sdk_services.hpp"
 #include <api/service/waservicefactory.h>
@@ -136,7 +137,7 @@ public:
     int _dispatch(int message, void* result, void** args, int count) override {
         try {
             switch (message) {
-            case SVC_METATAG_GETNAME: return returnValue(result, L"Tangerine Stream");
+            case SVC_METATAG_GETNAME: return returnValue(result, TS_PRODUCT_NAME_W);
             case SVC_METATAG_GETGUID: return returnValue(result, tagGuid);
             case SVC_METATAG_GETFLAGS: return returnValue(result, 4); // METATAG_CACHE_DB
             case SVC_METATAG_ISOURFILE: case SVC_METATAG_OPEN: {
@@ -227,8 +228,8 @@ private:
 struct HostMetadataServices::Registration {
     Registration(api_service& services, Store& store, const Playback& playback, ArtworkLoader& artwork)
         : services(services), provider(store, playback, artwork),
-          factory(svc_albumArtProvider::getServiceType(), "Tangerine Stream Album Art", artworkGuid, [this] { return &provider; }),
-          tagFactory(svc_metaTag::getServiceType(), "Tangerine Stream Metadata", tagGuid,
+          factory(svc_albumArtProvider::getServiceType(), TS_PRODUCT_NAME " Album Art", artworkGuid, [this] { return &provider; }),
+          tagFactory(svc_metaTag::getServiceType(), TS_PRODUCT_NAME " Metadata", tagGuid,
               [&store, &playback, &artwork] { return new TagReader(store, playback, artwork); },
               [](Dispatchable* reader) { delete static_cast<TagReader*>(reader); }) {
         services.service_register(&tagFactory);

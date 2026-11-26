@@ -1,5 +1,6 @@
 #include "store.hpp"
 #include "server.hpp"
+#include "tangerine_product.h"
 
 #include <sqlite3.h>
 #include <wincrypt.h>
@@ -17,7 +18,7 @@ namespace {
 constexpr int defaultBudget = 1024;
 
 [[noreturn]] void databaseError(sqlite3* db) {
-    throw Error(std::string("Tangerine Stream storage: ") + (db ? sqlite3_errmsg(db) : "out of memory"));
+    throw Error(std::string(TS_PRODUCT_NAME " storage: ") + (db ? sqlite3_errmsg(db) : "out of memory"));
 }
 
 } // namespace
@@ -161,7 +162,7 @@ Track getTrack(const Statement& statement) {
 std::string protect(std::string password) {
     DATA_BLOB input{static_cast<DWORD>(password.size()), reinterpret_cast<BYTE*>(password.data())};
     DATA_BLOB output{};
-    if (!CryptProtectData(&input, L"Tangerine Stream", nullptr, nullptr, nullptr,
+    if (!CryptProtectData(&input, TS_PRODUCT_NAME_W, nullptr, nullptr, nullptr,
                           CRYPTPROTECT_UI_FORBIDDEN, &output))
         throw Error("Windows could not protect the saved password.");
     std::string result;
@@ -201,7 +202,7 @@ Store::Store(const std::filesystem::path& directory) : cache_(directory / L"cach
     lockFile_ = CreateFileW((directory / L"profile.lock").c_str(), GENERIC_WRITE, 0, nullptr,
                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (lockFile_ == INVALID_HANDLE_VALUE)
-        throw Error("The Tangerine Stream profile could not be opened exclusively.");
+        throw Error("The " TS_PRODUCT_NAME " profile could not be opened exclusively.");
     try {
         if (sqlite3_open_v2(utf8((directory / L"library.sqlite3").wstring()).c_str(), &db_,
                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) databaseError(db_);

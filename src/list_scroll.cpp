@@ -1,6 +1,7 @@
 #include "list_scroll.hpp"
 #include "dpi.hpp"
 #include "ml_sdk.hpp"
+#include "tangerine_product.h"
 
 #include <algorithm>
 #include <climits>
@@ -19,7 +20,7 @@ struct ListBars {
     HWND bars[2]{};
     HBITMAP skin{};
     bool pending = false;
-    UINT sync = RegisterWindowMessageW(L"Tangerine Stream.SyncListScrollbars");
+    UINT sync = RegisterWindowMessageW(TS_PRODUCT_NAME_W L".SyncListScrollbars");
 
     void loadSkin() {
         if (skin) DeleteObject(skin);

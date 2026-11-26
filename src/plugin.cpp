@@ -5,6 +5,7 @@
 #include "browse_sort.hpp"
 #include "host_metadata.hpp"
 #include "resources.h"
+#include "tangerine_product.h"
 #include "input_bridge.hpp"
 #include <fstream>
 #include <shared_mutex>
@@ -28,7 +29,7 @@
 namespace tangerine {
 namespace {
 
-constexpr wchar_t pluginName[] = L"Tangerine Stream";
+constexpr wchar_t pluginName[] = TS_PRODUCT_NAME_W;
 constexpr auto viewReady = WM_APP + 1;
 constexpr auto profilesChanged = WM_APP + 2;
 constexpr auto moreRequested = WM_APP + 4;
@@ -44,7 +45,7 @@ int init();
 void quit();
 INT_PTR message(int type, INT_PTR a, INT_PTR b, INT_PTR c);
 
-char description[] = "Tangerine Stream v0.6.7";
+char description[] = TS_PRODUCT_NAME " v" TS_VERSION_STRING;
 winampMediaLibraryPlugin plugin = [] {
     winampMediaLibraryPlugin descriptor{};
 #ifdef MLHDR_VER_OLD
@@ -1249,7 +1250,7 @@ void configure(HWND hwnd, Id preferred, bool add = false) {
     }
 }
 
-constexpr wchar_t listSkinProc[] = L"Tangerine Stream.ListSkinProc";
+constexpr wchar_t listSkinProc[] = TS_PRODUCT_NAME_W L".ListSkinProc";
 
 LRESULT CALLBACK libraryListProc(HWND list, UINT msg, WPARAM w, LPARAM l) {
     auto skinProc = reinterpret_cast<WNDPROC>(GetPropW(list, listSkinProc));
@@ -2312,7 +2313,7 @@ UINT_PTR addTreeItem(std::wstring label, std::wstring invariant, UINT_PTR parent
     item.hItem = MLNavCtrl_InsertItem(plugin.hwndLibraryParent, &insert);
     item.mask = NIMF_ITEMID;
     if (!item.hItem || !MLNavItem_GetInfo(plugin.hwndLibraryParent, &item))
-        throw Error("Tangerine Stream could not add its Media Library entry.");
+        throw Error(TS_PRODUCT_NAME " could not add its Media Library entry.");
     return item.id;
 }
 
@@ -2363,7 +2364,7 @@ void refreshNavigation() {
     while (const auto child = library(ML_IPC_TREEITEM_GETCHILD, rootHandle)) {
         library(ML_IPC_TREEITEM_DELETE, child);
         if (library(ML_IPC_TREEITEM_GETCHILD, rootHandle) == child)
-            throw Error("WACUP could not refresh the Tangerine Stream tree.");
+            throw Error("WACUP could not refresh the " TS_PRODUCT_NAME " tree.");
     }
     app->navigation.clear();
     app->navigation.emplace(root, Navigation{BrowseKind::albums, 0, true});

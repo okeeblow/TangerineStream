@@ -1,4 +1,5 @@
 #include "input_bridge.hpp"
+#include "tangerine_product.h"
 #include <algorithm>
 #include <climits>
 #include <mutex>
@@ -145,8 +146,8 @@ int play(const wchar_t* filename) {
 }
 
 void about(HWND w) {
-    MessageBoxW(w, L"Tangerine Stream input by COOLTRAINER. Configure servers in the Tangerine Stream Media Library view.",
-                L"Tangerine Stream", MB_OK);
+    MessageBoxW(w, TS_PRODUCT_NAME_W L" input by COOLTRAINER. Configure servers in the "
+                TS_PRODUCT_NAME_W L" Media Library view.", TS_PRODUCT_NAME_W, MB_OK);
 }
 }
 
@@ -159,14 +160,16 @@ extern "C" __declspec(dllexport) int winampGetExtendedFileInfoW(
 
 extern "C" __declspec(dllexport) In_Module* winampGetInModule2() {
     static const bool initialized = [] {
-        static char extensions[] = "TSTREAM\0Tangerine Stream track\0";
+        static char extensions[] = "TSTREAM\0" TS_PRODUCT_NAME " track\0";
 #ifdef IN_VER_RET
+        static wchar_t description[] = TS_PRODUCT_NAME_W L" Input v" TS_VERSION_STRING;
         input.version = IN_VER_RET;
-        input.description = reinterpret_cast<char*>(const_cast<wchar_t*>(L"Tangerine Stream Input v0.6.7"));
+        input.description = reinterpret_cast<char*>(description);
         input.Init = [] { return 0; };
 #else
+        static char description[] = TS_PRODUCT_NAME " Input v" TS_VERSION_STRING;
         input.version = IN_VER;
-        input.description = const_cast<char*>("Tangerine Stream Input v0.6.7");
+        input.description = description;
         input.Init = [] {};
 #endif
         input.FileExtensions = extensions;
