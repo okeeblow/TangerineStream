@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdlib>
 #include <commctrl.h>
 #include <memory>
 
@@ -21,7 +22,9 @@ struct ListBars {
     HWND surfaces[2]{};
     HBITMAP skin{};
     bool pending = false;
+    int wheelRemainder = 0;
     UINT sync = RegisterWindowMessageW(TS_PRODUCT_NAME_W L".SyncListScrollbars");
+    UINT directWheel = RegisterWindowMessageW(L"WINAMP_WM_DIRECT_MOUSE_WHEEL");
 
     void destroyControls() {
         for (auto surface : surfaces) if (surface) DestroyWindow(surface);
@@ -122,6 +125,33 @@ struct ListBars {
         update();
     }
 
+    void wheel(int delta) {
+        // The skin hides the list's standard bars. Scroll the native list
+        // directly so an inactive view can honor the system wheel setting.
+        UINT lines = 3;
+        SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+        if (!lines) return;
+
+        RECT client{};
+        GetClientRect(list, &client);
+        RECT item{};
+        if (!ListView_GetItemRect(list, 0, &item, LVIR_BOUNDS)) return;
+        const bool report = (GetWindowLongPtrW(list, GWL_STYLE) & LVS_TYPEMASK) == LVS_REPORT;
+        const int lineHeight = report ? std::max(1L, item.bottom - item.top)
+                                      : systemMetricForDpi(SM_CYVSCROLL, windowDpi(list));
+        const auto pageLines = static_cast<UINT>(std::max(1L, client.bottom / std::max(1, lineHeight)));
+        const bool page = lines >= pageLines;
+        const int distance = wheelRemainder + delta * static_cast<int>(page ? 1 : lines);
+        const int steps = distance / WHEEL_DELTA;
+        wheelRemainder = distance % WHEEL_DELTA;
+        if (page) {
+            for (int i = 0; i < std::abs(steps); ++i)
+                SendMessageW(list, WM_VSCROLL, steps > 0 ? SB_PAGEUP : SB_PAGEDOWN, 0);
+        } else if (steps) {
+            ListView_Scroll(list, 0, -steps * lineHeight);
+        }
+    }
+
     // The ScrollBar control supplies the same thumb rectangle to accessibility,
     // mouse tracking and painting, including Windows' minimum thumb size.
     bool paint(HWND bar, HDC dc) const {
@@ -190,7 +220,8 @@ LRESULT CALLBACK surfaceProc(HWND surface, UINT msg, WPARAM w, LPARAM l, UINT_PT
 
 LRESULT CALLBACK barProc(HWND bar, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR data) {
     auto& state = *reinterpret_cast<ListBars*>(data);
-    if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL) return SendMessageW(state.list, msg, w, l);
+    if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL || (state.directWheel && msg == state.directWheel))
+        return SendMessageW(state.list, msg, w, l);
     if (state.skin && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_CAPTURECHANGED))
         InvalidateRect(state.surfaces[bar == state.bars[SB_VERT] ? SB_VERT : SB_HORZ], nullptr, FALSE);
     return DefSubclassProc(bar, msg, w, l);
@@ -198,6 +229,12 @@ LRESULT CALLBACK barProc(HWND bar, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD
 
 LRESULT CALLBACK listProc(HWND list, UINT msg, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR data) {
     auto& state = *reinterpret_cast<ListBars*>(data);
+    const bool redirected = state.directWheel && msg == state.directWheel;
+    if (redirected || msg == WM_MOUSEWHEEL) {
+        state.wheel(GET_WHEEL_DELTA_WPARAM(w));
+        state.schedule();
+        return redirected ? TRUE : 0;
+    }
     if ((msg == WM_HSCROLL || msg == WM_VSCROLL) && l) {
         const int axis = msg == WM_VSCROLL ? SB_VERT : SB_HORZ;
         if (reinterpret_cast<HWND>(l) == state.bars[axis]) {
@@ -216,7 +253,7 @@ LRESULT CALLBACK listProc(HWND list, UINT msg, WPARAM w, LPARAM l, UINT_PTR id, 
         (msg == WM_ML_IPC && l == ML_IPC_SKINNEDWND_SKINCHANGED)) state.loadSkin();
     switch (msg) {
     case WM_PAINT: case WM_NCPAINT: case WM_WINDOWPOSCHANGED: case WM_STYLECHANGED:
-    case WM_VSCROLL: case WM_HSCROLL: case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+    case WM_VSCROLL: case WM_HSCROLL: case WM_MOUSEHWHEEL:
     case LVM_SCROLL: case LVM_ENSUREVISIBLE: case LVM_SETITEMCOUNT: case LVM_SETCOLUMNWIDTH:
         state.schedule();
     }
