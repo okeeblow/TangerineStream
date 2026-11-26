@@ -16,6 +16,11 @@ namespace tangerine {
 
 class Statement;
 
+struct CachedArtwork {
+    std::string data;
+    int requestedMaxEdgePx = 0;
+};
+
 class Store {
 public:
     explicit Store(const std::filesystem::path& directory);
@@ -47,10 +52,10 @@ public:
     BrowsePage cachedPage(Id server, const BrowseLocation& location, const std::string& query, int offset);
     Track track(Id key);
     std::string albumCover(Id server, const std::string& albumId);
-    std::string artwork(Id server, const LibraryItem& item);
+    CachedArtwork artwork(Id server, const LibraryItem& item);
     bool stageCover(const Track& track, const LibraryItem& song, const LibraryItem& album);
     void activeCover(Id key);
-    void saveArtwork(Id server, const LibraryItem& item, const std::string& data);
+    void saveArtwork(Id server, const LibraryItem& item, int requestedMaxEdgePx, const std::string& data);
     std::optional<Lyrics> lyrics(Id key, bool fresh = false);
     void saveLyrics(Id key, const Lyrics& lyrics);
     void pin(const std::vector<Track>& tracks, bool permanent);

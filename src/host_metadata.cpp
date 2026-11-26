@@ -106,10 +106,7 @@ private:
         if (!track.key) return 1;
         auto data = artwork_.trackArtwork(track);
         const auto* extension = artworkExtension(data);
-        if (!extension) {
-            if (store_.networkAvailable(track.server)) artwork_.requestTrack(key, true);
-            return 1;
-        }
+        if (!extension) return 1;
         const auto extensionSize = (std::wcslen(extension) + 1) * sizeof(wchar_t);
         auto buffer = memory_->sysMalloc(data.size());
         if (!buffer) return 1;

@@ -8,6 +8,8 @@
 namespace tangerine {
 namespace {
 
+constexpr int playbackCoverSize = 640;
+
 LibraryItem songArtwork(const Track& track) {
     return {{BrowseKind::song, track.id, track.title}, track.artist, track.coverId};
 }
@@ -17,14 +19,23 @@ LibraryItem albumArtwork(Store& store, const Track& track) {
         store.albumCover(track.server, track.albumId)};
 }
 
-std::string loadArtwork(Store& store, ServerApi& api, Id server, const LibraryItem& item) {
-    auto data = store.artwork(server, item);
-    if (!data.empty()) return data;
-    if (!store.networkAvailable(server) || localLocation(item.target)) return {};
-    data = api.cover(item, 640);
-    if (!artworkExtension(data)) return {};
-    store.saveArtwork(server, item, data);
-    return data;
+std::string loadArtwork(Store& store, HttpClient& http, Id server, const LibraryItem& item, int targetEdgePx) {
+    auto cached = store.artwork(server, item);
+    if (cached.requestedMaxEdgePx < targetEdgePx && !localLocation(item.target) && store.networkAvailable(server)) {
+        try {
+            auto api = http.connect(store.server(server));
+            auto data = api->cover(item, targetEdgePx);
+            if (artworkExtension(data)) {
+                store.saveArtwork(server, item, targetEdgePx, data);
+                return data;
+            }
+        } catch (const ConnectionError&) {
+            store.connectionFailed(server);
+        } catch (const Error&) {
+            if (cached.data.empty()) throw;
+        }
+    }
+    return std::move(cached.data);
 }
 
 template<class T> class Com {
@@ -68,15 +79,20 @@ std::vector<std::uint32_t> decode(IWICImagingFactory* factory, std::string& byte
     const auto longest = width > height ? width : height;
     width = std::max(1u, static_cast<UINT>(std::uint64_t(width) * size / longest));
     height = std::max(1u, static_cast<UINT>(std::uint64_t(height) * size / longest));
-    if (FAILED(factory->CreateBitmapScaler(scaler.out())) ||
-        FAILED(scaler->Initialize(frame.get(), width, height, WICBitmapInterpolationModeFant)) ||
-        FAILED(factory->CreateFormatConverter(converter.out())) ||
-        FAILED(converter->Initialize(scaler.get(), GUID_WICPixelFormat32bppPBGRA,
+    IWICBitmapSource* source = frame.get();
+    if (longest != size) {
+        if (FAILED(factory->CreateBitmapScaler(scaler.out())) ||
+            FAILED(scaler->Initialize(source, width, height, WICBitmapInterpolationModeFant))) return {};
+        source = scaler.get();
+    }
+    if (FAILED(factory->CreateFormatConverter(converter.out())) ||
+        FAILED(converter->Initialize(source, GUID_WICPixelFormat32bppPBGRA,
                     WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom))) return {};
     std::vector<std::uint32_t> scaled(width * height);
     if (FAILED(converter->CopyPixels(nullptr, width * sizeof(std::uint32_t),
                     static_cast<UINT>(scaled.size() * sizeof(std::uint32_t)),
                     reinterpret_cast<BYTE*>(scaled.data())))) return {};
+    if (width == size && height == size) return scaled;
     std::vector<std::uint32_t> pixels(size * size);
     auto start = ((size - height) / 2) * size + (size - width) / 2;
     for (UINT row = 0; row < height; ++row)
@@ -174,9 +190,12 @@ void ArtworkLoader::requestTrack(Id key, bool priority) {
 }
 
 std::string ArtworkLoader::trackArtwork(const Track& track) {
-    auto data = store_.artwork(track.server, songArtwork(track));
-    if (data.empty() && !track.albumId.empty()) data = store_.artwork(track.server, albumArtwork(store_, track));
-    return data;
+    auto cached = store_.artwork(track.server, songArtwork(track));
+    if (cached.data.empty() && !track.albumId.empty())
+        cached = store_.artwork(track.server, albumArtwork(store_, track));
+    if (cached.requestedMaxEdgePx < playbackCoverSize && store_.networkAvailable(track.server))
+        requestTrack(track.key, true);
+    return std::move(cached.data);
 }
 
 void ArtworkLoader::notifyPlayer(UINT message, Id key) {
@@ -196,23 +215,15 @@ void ArtworkLoader::stageCover(const Track& track) {
 void ArtworkLoader::loadTrack(Id key) {
     auto track = store_.track(key);
     if (!track.key || !store_.networkAvailable(track.server)) return;
-    auto connection = http_.connect(store_.server(track.server));
     try {
-        const auto item = songArtwork(track);
-        if (store_.artwork(track.server, item).empty()) {
-            auto data = loadArtwork(store_, *connection, track.server, item);
-            if (data.empty() && !track.albumId.empty()) {
-                auto album = albumArtwork(store_, track);
-                data = loadArtwork(store_, *connection, track.server, album);
-            }
-            if (!data.empty()) stageCover(track);
-        }
-    } catch (const ConnectionError&) {
-        store_.connectionFailed(track.server);
+        auto data = loadArtwork(store_, http_, track.server, songArtwork(track), playbackCoverSize);
+        if (data.empty() && !track.albumId.empty())
+            data = loadArtwork(store_, http_, track.server, albumArtwork(store_, track), playbackCoverSize);
+        if (!data.empty()) stageCover(track);
     } catch (const std::exception&) {}
     if (!store_.lyrics(key, true) && store_.networkAvailable(track.server)) {
         try {
-            auto lyrics = connection->lyrics(track);
+            auto lyrics = http_.connect(store_.server(track.server))->lyrics(track);
             store_.saveLyrics(key, lyrics);
             if (!lyrics.plain.empty()) notifyPlayer(lyricsReadyMessage, key);
         } catch (const ConnectionError&) {
@@ -252,15 +263,9 @@ void ArtworkLoader::load() {
         const Id server = request.item.target.server;
         try {
             if (factory.get()) {
-                auto bytes = store_.artwork(server, request.item);
-                if (bytes.empty() && store_.networkAvailable(server) && !localLocation(request.item.target)) {
-                    auto api = http_.connect(store_.server(server));
-                    bytes = loadArtwork(store_, *api, server, request.item);
-                }
+                auto bytes = loadArtwork(store_, http_, server, request.item, request.size);
                 thumbnail.pixels = decode(factory.get(), bytes, request.size);
             }
-        } catch (const ConnectionError&) {
-            store_.connectionFailed(server);
         } catch (const std::exception&) {
             // A missing or unreachable cover still leaves a usable tile.
         }

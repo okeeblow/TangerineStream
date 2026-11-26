@@ -112,6 +112,16 @@ void migrate(sqlite3* db) {
     if (schema < 0 || schema > latest)
         throw Error("Unsupported library database version " + std::to_string(schema) +
                     ". This plug-in supports versions 0 through " + std::to_string(latest) + ".");
+    // Keep covers already cached by preview builds that used the original column names.
+    if (schema >= 6 && schema <= 8) {
+        auto renameArtworkColumn = [db](const char* previous, const char* current) {
+            if (sqlite3_table_column_metadata(db, "main", "artwork", previous, nullptr, nullptr,
+                                              nullptr, nullptr, nullptr) != SQLITE_OK) return;
+            const auto sql = std::string("ALTER TABLE artwork RENAME COLUMN ") + previous + " TO " + current;
+            Statement(db, sql.c_str()).run();
+        };
+        renameArtworkColumn("requested_size", "requested_max_edge_px");
+    }
     for (; schema < latest; ++schema) {
         if (sqlite3_exec(db, migrations[schema], nullptr, nullptr, nullptr) != SQLITE_OK)
             throw Error("Library database migration " + std::to_string(schema + 1) +
@@ -671,16 +681,16 @@ std::string artworkKey(const LibraryItem& item) {
 
 } // namespace
 
-std::string Store::artwork(Id server, const LibraryItem& item) {
+CachedArtwork Store::artwork(Id server, const LibraryItem& item) {
     std::scoped_lock lock(mutex_);
     auto key = artworkKey(item);
-    auto artwork = prepare("SELECT data FROM artwork WHERE server=? AND cover_key=?");
+    auto artwork = prepare("SELECT data,requested_max_edge_px FROM artwork WHERE server=? AND cover_key=?");
     artwork.bind(server).bind(key);
     if (!artwork.row()) return {};
-    auto data = artwork.blob(0);
+    CachedArtwork cached{artwork.blob(0), static_cast<int>(artwork.integer(1))};
     prepare("UPDATE artwork SET last_use=? WHERE server=? AND cover_key=?")
         .bind(nowMs()).bind(server).bind(key).run();
-    return data;
+    return cached;
 }
 
 void Store::activeCover(Id key) {
@@ -766,15 +776,18 @@ bool Store::stageCover(const Track& track, const LibraryItem& song, const Librar
     return true;
 }
 
-void Store::saveArtwork(Id server, const LibraryItem& item, const std::string& data) {
+void Store::saveArtwork(Id server, const LibraryItem& item, int requestedMaxEdgePx, const std::string& data) {
     if (data.empty()) return;
     std::scoped_lock lock(mutex_);
     Transaction transaction(db_);
+    const auto key = artworkKey(item);
+    prepare("INSERT INTO artwork(server,cover_key,data,last_use,requested_max_edge_px) VALUES(?,?,?,?,?)"
+        " ON CONFLICT(server,cover_key) DO UPDATE SET data=excluded.data,last_use=excluded.last_use,"
+        " requested_max_edge_px=excluded.requested_max_edge_px WHERE excluded.requested_max_edge_px>artwork.requested_max_edge_px")
+        .bind(server).bind(key).bindBlob(data).bind(nowMs()).bind(requestedMaxEdgePx).run();
+    if (!sqlite3_changes(db_)) return;
     prepare("UPDATE playlist_covers SET cover_key='' WHERE cover_key=? AND track IN"
-        " (SELECT key FROM tracks WHERE server=?)").bind(artworkKey(item)).bind(server).run();
-    prepare("INSERT INTO artwork VALUES(?,?,?,?) ON CONFLICT(server,cover_key) DO UPDATE SET"
-        " data=excluded.data,last_use=excluded.last_use")
-        .bind(server).bind(artworkKey(item)).bindBlob(data).bind(nowMs()).run();
+        " (SELECT key FROM tracks WHERE server=?)").bind(key).bind(server).run();
     prepare("DELETE FROM artwork WHERE (server,cover_key) IN (SELECT server,cover_key FROM"
         " (SELECT server,cover_key,sum(length(data)) OVER (ORDER BY last_use DESC,server,cover_key"
         " ROWS UNBOUNDED PRECEDING) AS bytes FROM artwork) WHERE bytes>?)").bind(128 * MiB).run();
