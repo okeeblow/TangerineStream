@@ -11,7 +11,7 @@ HunterGate(
     SHA1 6498c5d0dec25d7fffb2b0574ebaf265179b894d
     LOCAL
 )
-project(ml_tangerinestream VERSION 0.6.10 LANGUAGES C CXX RC)
+project(ml_tangerinestream VERSION 0.6.11 LANGUAGES C CXX RC)
 set(TANGERINE_PRODUCT_NAME "Tangerine Stream")
 # Windows VERSIONINFO requires four components.
 string(REPLACE "." ";" version_components "${PROJECT_VERSION};0;0;0")

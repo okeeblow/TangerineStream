@@ -16,6 +16,7 @@ namespace tangerine {
 namespace {
 
 constexpr int defaultBudget = 1024;
+constexpr std::int64_t artworkBudget = 128 * MiB;
 
 [[noreturn]] void databaseError(sqlite3* db) {
     throw Error(std::string(TS_PRODUCT_NAME " storage: ") + (db ? sqlite3_errmsg(db) : "out of memory"));
@@ -781,17 +782,38 @@ void Store::saveArtwork(Id server, const LibraryItem& item, int requestedMaxEdge
     std::scoped_lock lock(mutex_);
     Transaction transaction(db_);
     const auto key = artworkKey(item);
+    std::int64_t previousBytes = 0;
+    {
+        auto old = prepare("SELECT requested_max_edge_px,length(data) FROM artwork WHERE server=? AND cover_key=?");
+        old.bind(server).bind(key);
+        if (old.row()) {
+            if (old.integer(0) >= requestedMaxEdgePx) return;
+            previousBytes = old.integer(1);
+        }
+    }
     prepare("INSERT INTO artwork(server,cover_key,data,last_use,requested_max_edge_px) VALUES(?,?,?,?,?)"
         " ON CONFLICT(server,cover_key) DO UPDATE SET data=excluded.data,last_use=excluded.last_use,"
-        " requested_max_edge_px=excluded.requested_max_edge_px WHERE excluded.requested_max_edge_px>artwork.requested_max_edge_px")
+        " requested_max_edge_px=excluded.requested_max_edge_px")
         .bind(server).bind(key).bindBlob(data).bind(nowMs()).bind(requestedMaxEdgePx).run();
-    if (!sqlite3_changes(db_)) return;
     prepare("UPDATE playlist_covers SET cover_key='' WHERE cover_key=? AND track IN"
         " (SELECT key FROM tracks WHERE server=?)").bind(key).bind(server).run();
-    prepare("DELETE FROM artwork WHERE (server,cover_key) IN (SELECT server,cover_key FROM"
-        " (SELECT server,cover_key,sum(length(data)) OVER (ORDER BY last_use DESC,server,cover_key"
-        " ROWS UNBOUNDED PRECEDING) AS bytes FROM artwork) WHERE bytes>?)").bind(128 * MiB).run();
+    std::int64_t bytes = 0;
+    if (artworkBytes_) {
+        bytes = *artworkBytes_ - previousBytes + static_cast<std::int64_t>(data.size());
+    } else {
+        auto total = prepare("SELECT coalesce(sum(length(data)),0) FROM artwork");
+        total.row();
+        bytes = total.integer(0);
+    }
+    while (bytes > artworkBudget) {
+        auto oldest = prepare("DELETE FROM artwork WHERE (server,cover_key)=(SELECT server,cover_key FROM artwork"
+            " ORDER BY last_use,server DESC,cover_key DESC LIMIT 1) RETURNING length(data)");
+        if (!oldest.row()) throw Error("Could not evict the oldest cover from the artwork cache.");
+        bytes -= oldest.integer(0);
+        oldest.run();
+    }
     transaction.commit();
+    artworkBytes_ = bytes;
 }
 
 std::optional<Lyrics> Store::lyrics(Id key, bool fresh) {

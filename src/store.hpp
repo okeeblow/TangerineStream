@@ -101,6 +101,7 @@ private:
     std::map<Id, std::int64_t> downloads_;
     std::map<Id, std::chrono::steady_clock::time_point> retryConnection_;
     std::int64_t budget_ = 0;
+    std::optional<std::int64_t> artworkBytes_;
     bool offline_ = false;
     Id activeCover_ = 0;
 };
