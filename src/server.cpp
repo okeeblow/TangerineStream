@@ -939,12 +939,15 @@ SortTags decodeSortTags(const std::string& text) {
     return tags;
 }
 
-bool matches(const std::string& value, const std::wstring& query) {
+bool matches(std::wstring_view text, std::wstring_view query) {
     if (query.empty()) return true;
-    auto text = wide(value);
     return !text.empty() && FindNLSStringEx(LOCALE_NAME_INVARIANT,
         FIND_FROMSTART | NORM_IGNORECASE, text.data(), static_cast<int>(text.size()),
         query.data(), static_cast<int>(query.size()), nullptr, nullptr, nullptr, 0) >= 0;
+}
+
+bool matches(const std::string& value, const std::wstring& query) {
+    return query.empty() || matches(wide(value), query);
 }
 
 std::string playlistTitle(const Track& track) {

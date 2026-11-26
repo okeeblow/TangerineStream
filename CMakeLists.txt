@@ -28,7 +28,7 @@ hunter_private_data(
 )
 add_library(tangerine_sqlite STATIC "${sqlite_source}/sqlite3.c")
 target_include_directories(tangerine_sqlite PUBLIC "${sqlite_source}")
-target_compile_definitions(tangerine_sqlite PRIVATE SQLITE_OMIT_LOAD_EXTENSION)
+target_compile_definitions(tangerine_sqlite PRIVATE SQLITE_OMIT_LOAD_EXTENSION SQLITE_ENABLE_FTS5)
 if(MSVC)
     set_property(TARGET tangerine_sqlite PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()

@@ -84,6 +84,29 @@ constexpr char trackColumns[] =
     "key,server,remote_id,title,artist,album,suffix,mime,duration,pinned,favorite,bytes,"
     "cover_id,album_id,artist_id,album_artist_id,album_artist,genre,disc_number,track_number,year,sort_tags,cached_format";
 
+// Windows linguistic search can equate text with different Unicode spellings.
+constexpr char linguisticRows[] =
+    "title GLOB '*[^ -~]*' OR artist GLOB '*[^ -~]*' OR album GLOB '*[^ -~]*'";
+
+void sqliteContains(sqlite3_context* context, int, sqlite3_value** args) {
+    auto text = static_cast<const wchar_t*>(sqlite3_value_text16(args[0]));
+    auto query = static_cast<const wchar_t*>(sqlite3_value_text16(args[1]));
+    if (!text || !query) { sqlite3_result_error_nomem(context); return; }
+    const auto length = static_cast<std::size_t>(sqlite3_value_bytes16(args[1])) / sizeof(wchar_t);
+    sqlite3_result_int(context, matches(std::wstring_view{text}, std::wstring_view{query, length}));
+}
+
+std::string trigramPhrase(const std::string& query) {
+    if (query.size() < 3 || !std::all_of(query.begin(), query.end(),
+        [](unsigned char ch) { return ch >= 0x20 && ch <= 0x7e; })) return {};
+    std::string phrase = "\"";
+    for (char ch : query) {
+        if (ch == '"') phrase += '"';
+        phrase += ch;
+    }
+    return phrase + '"';
+}
+
 Track getTrack(const Statement& statement) {
     return {statement.integer(0), statement.integer(1), statement.text(2), statement.text(3),
             statement.text(4), statement.text(5), statement.text(6), statement.text(7),
@@ -142,6 +165,8 @@ Store::Store(const std::filesystem::path& directory) : cache_(directory / L"cach
         if (sqlite3_open_v2(utf8((directory / L"library.sqlite3").wstring()).c_str(), &db_,
                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) databaseError(db_);
         if (sqlite3_busy_timeout(db_, 2000) != SQLITE_OK) databaseError(db_);
+        if (sqlite3_create_function_v2(db_, "ts_contains", 2, SQLITE_UTF16 | SQLITE_DETERMINISTIC,
+                nullptr, sqliteContains, nullptr, nullptr, nullptr) != SQLITE_OK) databaseError(db_);
         Statement(db_, "PRAGMA foreign_keys=ON").run();
         Statement(db_, "PRAGMA journal_mode=WAL").run();
         Statement(db_, "PRAGMA synchronous=FULL").run();
@@ -207,6 +232,25 @@ Store::Store(const std::filesystem::path& directory) : cache_(directory / L"cach
             "plain TEXT NOT NULL,structured TEXT NOT NULL,checked INTEGER NOT NULL)").run();
         Statement(db_, "CREATE TABLE IF NOT EXISTS playlist_covers (track INTEGER PRIMARY KEY,"
             "cover_key TEXT NOT NULL,ext TEXT NOT NULL,bytes INTEGER NOT NULL,last_use INTEGER NOT NULL)").run();
+        if (schema < 4) {
+            Statement(db_, "CREATE VIRTUAL TABLE track_search USING fts5(title,artist,album,"
+                "content='tracks',content_rowid='key',tokenize='trigram',columnsize=0)").run();
+            Statement(db_, "INSERT INTO track_search(track_search) VALUES('rebuild')").run();
+            Statement(db_, "CREATE TRIGGER track_search_insert AFTER INSERT ON tracks BEGIN "
+                "INSERT INTO track_search(rowid,title,artist,album) VALUES(new.key,new.title,new.artist,new.album); END").run();
+            Statement(db_, "CREATE TRIGGER track_search_delete AFTER DELETE ON tracks BEGIN "
+                "INSERT INTO track_search(track_search,rowid,title,artist,album) "
+                "VALUES('delete',old.key,old.title,old.artist,old.album); END").run();
+            Statement(db_, "CREATE TRIGGER track_search_update AFTER UPDATE OF title,artist,album ON tracks "
+                "WHEN old.title!=new.title OR old.artist!=new.artist OR old.album!=new.album BEGIN "
+                "INSERT INTO track_search(track_search,rowid,title,artist,album) VALUES('delete',old.key,old.title,old.artist,old.album); "
+                "INSERT INTO track_search(rowid,title,artist,album) VALUES(new.key,new.title,new.artist,new.album); END").run();
+            const auto index = std::string("CREATE INDEX tracks_linguistic ON tracks(server) WHERE ") + linguisticRows;
+            Statement(db_, index.c_str()).run();
+            Statement(db_, "CREATE INDEX tracks_browse_order ON tracks(server,artist COLLATE NOCASE,"
+                "album COLLATE NOCASE,title COLLATE NOCASE,key)").run();
+            Statement(db_, "PRAGMA user_version=4").run();
+        }
         migration.commit();
         auto budget = setting("rolling_mib");
         budget_ = (budget.empty() ? defaultBudget : std::stoi(budget)) * MiB;
@@ -481,39 +525,44 @@ BrowsePage Store::cachedPage(Id server, const BrowseLocation& location, const st
     const auto kind = location.kind;
     const auto filter = wide(query);
     BrowsePage result;
-    auto addTrack = [&](Track track) {
-        if (!track.key || (!matches(track.title, filter) && !matches(track.artist, filter) &&
-                          !matches(track.album, filter))) return;
-        if (offset > 0) --offset;
-        else if (result.tracks.size() == pageSize) result.more = true;
-        else result.tracks.push_back(std::move(track));
-    };
-    if (kind == BrowseKind::playlistTracks) {
-        Statement entries(db_, "SELECT track_key FROM catalog WHERE server=? AND parent_kind=?"
-            " AND parent_id=? AND track_key>0 ORDER BY slot");
-        entries.bind(server).bind(static_cast<int>(kind)).bind(location.id);
-        while (!result.more && entries.row()) addTrack(loadTrack(entries.integer(0)));
-    } else if (trackView(kind)) {
-        auto sql = std::string("SELECT ") + trackColumns + " FROM tracks WHERE server=?";
+    if (trackView(kind)) {
+        const bool playlist = kind == BrowseKind::playlistTracks;
+        auto sql = std::string("SELECT ") + trackColumns + " FROM tracks";
+        if (playlist) sql += " JOIN (SELECT track_key,slot FROM catalog WHERE server=? AND parent_kind=?"
+            " AND parent_id=?) AS playlist ON track_key=key";
+        sql += " WHERE server=?";
         if (kind == BrowseKind::offline) sql += " AND (bytes>0 OR pinned=1 OR favorite=1)";
         if (kind == BrowseKind::song) sql += " AND remote_id=?";
         if (kind == BrowseKind::albumTracks)
             sql += localLocation(location) ?
                 " AND album_id='' AND album||char(31)||coalesce(nullif(album_artist,''),artist)=?" :
                 " AND (album_id=? OR (album_id='' AND album=?))";
-        if (kind == BrowseKind::albumTracks) sql += " ORDER BY disc_number,track_number,title COLLATE NOCASE,key";
+        const auto phrase = trigramPhrase(query);
+        if (!phrase.empty()) {
+            sql += " AND key IN (SELECT rowid FROM track_search(?) UNION ALL SELECT key FROM tracks"
+                   " WHERE server=? AND (";
+            sql += linguisticRows;
+            sql += "))";
+        }
+        if (!query.empty()) sql += " AND (ts_contains(title,:needle) OR ts_contains(artist,:needle)"
+                                   " OR ts_contains(album,:needle))";
+        if (playlist) sql += " ORDER BY slot";
+        else if (kind == BrowseKind::albumTracks) sql += " ORDER BY disc_number,track_number,title COLLATE NOCASE,key";
         else sql += " ORDER BY artist COLLATE NOCASE,album COLLATE NOCASE,title COLLATE NOCASE,key";
-        if (query.empty()) sql += " LIMIT ? OFFSET ?";
+        sql += " LIMIT ? OFFSET ?";
         Statement entries(db_, sql.c_str());
+        if (playlist) entries.bind(server).bind(static_cast<int>(kind)).bind(location.id);
         entries.bind(server);
         if (kind == BrowseKind::song || kind == BrowseKind::albumTracks)
             entries.bind(localLocation(location) ? location.id.substr(1) : location.id);
         if (kind == BrowseKind::albumTracks && !localLocation(location)) entries.bind(location.title);
-        if (query.empty()) {
-            entries.bind(pageSize + 1).bind(offset);
-            offset = 0;
+        if (!phrase.empty()) entries.bind(phrase).bind(server);
+        if (!query.empty()) entries.bind(query);
+        entries.bind(pageSize + 1).bind(offset);
+        while (entries.row()) {
+            if (result.tracks.size() == pageSize) { result.more = true; break; }
+            result.tracks.push_back(getTrack(entries));
         }
-        while (!result.more && entries.row()) addTrack(getTrack(entries));
     } else {
         std::set<std::pair<BrowseKind, std::string>> seen;
         auto addItem = [&](LibraryItem item) {
