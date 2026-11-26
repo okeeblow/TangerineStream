@@ -30,7 +30,7 @@ public:
     Generation reset(HWND view);
     void cancel(Generation generation);
     void setViewport(Generation generation, int size, const std::vector<LibraryItem>& items,
-                     const std::vector<int>& rowsInPriorityOrder);
+                     const std::vector<int>& rowsInPriorityOrder, std::size_t visibleCount);
     std::vector<Thumbnail> take(Generation generation);
     void requestTrack(Id key, bool priority = false);
     void stageCover(const Track& track);
@@ -52,6 +52,8 @@ private:
     std::vector<std::thread> workers_;
     std::deque<Request> requests_;
     std::set<int> startedRows_; // In flight or waiting for the view to collect.
+    std::set<int> visibleRows_; // Missing visible tiles, until collected by the view.
+    unsigned backgroundLoads_ = 0;
     struct TrackRequest { Id key; bool priority; };
     std::deque<TrackRequest> tracks_;
     std::set<Id> pendingTracks_;
@@ -61,6 +63,7 @@ private:
     bool stopping_ = false;
 
     void load();
+    bool workAvailable() const;
     void loadTrack(Id key);
     void notifyPlayer(UINT message, Id key);
     void stop();

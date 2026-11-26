@@ -1738,11 +1738,12 @@ void View::updateArtworkViewport() {
         if (!slotForRow.count(row) && !missingArt.count(row)) rows.push_back(row);
     };
     for (int row = visible.first; row < visible.end; ++row) add(row);
+    const auto visibleCount = rows.size();
     for (int i = 0; i < margin; ++i) {
         if (i < visible.first - nearby.first) add(visible.first - 1 - i);
         if (i < nearby.end - visible.end) add(visible.end + i);
     }
-    app->artwork.setViewport(artGeneration, tileSize, items, rows);
+    app->artwork.setViewport(artGeneration, tileSize, items, rows, visibleCount);
 }
 
 void View::receiveArtwork() {

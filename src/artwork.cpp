@@ -9,6 +9,8 @@ namespace tangerine {
 namespace {
 
 constexpr int playbackCoverSize = 640;
+constexpr int artworkWorkers = 6;
+constexpr unsigned maxBackgroundLoads = 2;
 
 LibraryItem songArtwork(const Track& track) {
     return {{BrowseKind::song, track.id, track.title}, track.artist, track.coverId};
@@ -107,7 +109,7 @@ ArtworkLoader::ArtworkLoader(Store& store, HttpClient& http, HWND player)
       lyricsReadyMessage(RegisterWindowMessageW(L"ml_tangerinestream.lyricsReady")),
       store_(store), http_(http), player_(player) {
     try {
-        for (int i = 0; i < 3; ++i) workers_.emplace_back([this] { load(); });
+        for (int i = 0; i < artworkWorkers; ++i) workers_.emplace_back([this] { load(); });
     } catch (...) {
         stop();
         throw;
@@ -130,7 +132,9 @@ ArtworkLoader::Generation ArtworkLoader::reset(HWND view) {
     view_ = view;
     requests_.clear();
     startedRows_.clear();
+    visibleRows_.clear();
     complete_.clear();
+    ready_.notify_all();
     return ++generation_;
 }
 
@@ -140,15 +144,19 @@ void ArtworkLoader::cancel(Generation generation) {
     view_ = nullptr;
     requests_.clear();
     startedRows_.clear();
+    visibleRows_.clear();
     complete_.clear();
+    ready_.notify_all();
 }
 
 void ArtworkLoader::setViewport(Generation generation, int size, const std::vector<LibraryItem>& items,
-                                const std::vector<int>& rowsInPriorityOrder) {
+                                const std::vector<int>& rowsInPriorityOrder, std::size_t visibleCount) {
     {
         std::scoped_lock lock(mutex_);
         if (!view_ || generation != generation_) return;
         requests_.clear();
+        visibleRows_.clear();
+        visibleRows_.insert(rowsInPriorityOrder.begin(), rowsInPriorityOrder.begin() + visibleCount);
         for (int row : rowsInPriorityOrder) {
             if (startedRows_.count(row)) continue;
             const auto& item = items[row];
@@ -161,7 +169,11 @@ void ArtworkLoader::setViewport(Generation generation, int size, const std::vect
 std::vector<Thumbnail> ArtworkLoader::take(Generation generation) {
     std::scoped_lock lock(mutex_);
     if (generation != generation_) return {};
-    for (const auto& thumbnail : complete_) startedRows_.erase(thumbnail.row);
+    for (const auto& thumbnail : complete_) {
+        startedRows_.erase(thumbnail.row);
+        visibleRows_.erase(thumbnail.row);
+    }
+    if (!complete_.empty() && visibleRows_.empty()) ready_.notify_all();
     return std::exchange(complete_, {});
 }
 
@@ -232,6 +244,13 @@ void ArtworkLoader::loadTrack(Id key) {
     }
 }
 
+bool ArtworkLoader::workAvailable() const {
+    if (!tracks_.empty() && tracks_.front().priority) return true;
+    if (!requests_.empty() && visibleRows_.count(requests_.front().row)) return true;
+    return visibleRows_.empty() && backgroundLoads_ < maxBackgroundLoads &&
+           (!requests_.empty() || !tracks_.empty());
+}
+
 void ArtworkLoader::load() {
     ComApartment apartment;
     Com<IWICImagingFactory> factory;
@@ -240,39 +259,48 @@ void ArtworkLoader::load() {
     for (;;) {
         Request request;
         Id track = 0;
+        bool background;
         {
             std::unique_lock lock(mutex_);
-            ready_.wait(lock, [this] { return stopping_ || !requests_.empty() || !tracks_.empty(); });
+            ready_.wait(lock, [this] { return stopping_ || workAvailable(); });
             if (stopping_) return;
             if (!tracks_.empty() && (tracks_.front().priority || requests_.empty())) {
                 track = tracks_.front().key;
+                background = !tracks_.front().priority;
                 tracks_.pop_front();
             } else {
                 request = std::move(requests_.front());
                 requests_.pop_front();
                 startedRows_.insert(request.row);
+                background = !visibleRows_.count(request.row);
             }
+            if (background) ++backgroundLoads_;
         }
         if (track) {
             try { loadTrack(track); } catch (const std::exception&) {}
             std::scoped_lock lock(mutex_);
             pendingTracks_.erase(track);
-            continue;
-        }
-        Thumbnail thumbnail{request.row, {}};
-        const Id server = request.item.target.server;
-        try {
-            if (factory.get()) {
-                auto bytes = loadArtwork(store_, http_, server, request.item, request.size);
-                thumbnail.pixels = decode(factory.get(), bytes, request.size);
+        } else {
+            Thumbnail thumbnail{request.row, {}};
+            const Id server = request.item.target.server;
+            try {
+                if (factory.get()) {
+                    auto bytes = loadArtwork(store_, http_, server, request.item, request.size);
+                    thumbnail.pixels = decode(factory.get(), bytes, request.size);
+                }
+            } catch (const std::exception&) {
+                // A missing or unreachable cover still leaves a usable tile.
             }
-        } catch (const std::exception&) {
-            // A missing or unreachable cover still leaves a usable tile.
+            std::scoped_lock lock(mutex_);
+            if (!stopping_ && view_ && generation_ == request.generation) {
+                complete_.push_back(std::move(thumbnail));
+                PostMessageW(view_, readyMessage, 0, 0);
+            }
         }
-        std::scoped_lock lock(mutex_);
-        if (!stopping_ && view_ && generation_ == request.generation) {
-            complete_.push_back(std::move(thumbnail));
-            PostMessageW(view_, readyMessage, 0, 0);
+        if (background) {
+            std::scoped_lock lock(mutex_);
+            --backgroundLoads_;
+            ready_.notify_one();
         }
     }
 }
