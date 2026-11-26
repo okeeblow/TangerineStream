@@ -13,6 +13,10 @@ HunterGate(
 )
 project(ml_tangerinestream VERSION 0.6.2 LANGUAGES C CXX RC)
 
+if(MSVC_VERSION GREATER_EQUAL 1950)
+    message(FATAL_ERROR "The v145 runtime requires Windows 10. Select MSVC v143 to target Windows 7.")
+endif()
+
 hunter_add_package(date)
 find_package(date CONFIG REQUIRED)
 hunter_add_package(simdjson)
@@ -30,7 +34,7 @@ hunter_private_data(
 )
 add_library(tangerine_sqlite STATIC "${sqlite_source}/sqlite3.c")
 target_include_directories(tangerine_sqlite PUBLIC "${sqlite_source}")
-target_compile_definitions(tangerine_sqlite PRIVATE SQLITE_OMIT_LOAD_EXTENSION SQLITE_ENABLE_FTS5)
+target_compile_definitions(tangerine_sqlite PRIVATE WINVER=0x0601 _WIN32_WINNT=0x0601 SQLITE_OMIT_LOAD_EXTENSION SQLITE_ENABLE_FTS5)
 if(MSVC)
     set_property(TARGET tangerine_sqlite PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
@@ -102,7 +106,7 @@ function(add_wacup_plugin target)
     add_library(${target} MODULE ${ARGN})
     set_target_properties(${target} PROPERTIES PREFIX "")
     target_compile_features(${target} PRIVATE cxx_std_17)
-    target_compile_definitions(${target} PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_definitions(${target} PRIVATE WINVER=0x0601 _WIN32_WINNT=0x0601 UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_include_directories(${target} SYSTEM PRIVATE "${sdk_directory}")
     if(MINGW)
         target_link_options(${target} PRIVATE -static -static-libgcc -static-libstdc++)
@@ -125,7 +129,6 @@ target_link_libraries(in_tangerinestream PRIVATE user32)
 add_wacup_plugin(ml_tangerinestream
     src/plugin.cpp src/list_scroll.cpp src/server.cpp src/store.cpp src/playback.cpp src/artwork.cpp src/browse_sort.cpp
     src/host_metadata.cpp src/plugin.rc)
-target_compile_definitions(ml_tangerinestream PRIVATE _WIN32_WINNT=0x0A00)
 # The 5.666 package omits the Wasabi art and metadata service headers.
 target_include_directories(ml_tangerinestream SYSTEM PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Wasabi"

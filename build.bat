@@ -62,19 +62,25 @@ set "ts_vswhere=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.ex
 if not exist "%ts_vswhere%" set "ts_vswhere=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "ts_vsdir="
 if exist "%ts_vswhere%" (
-    for /f "usebackq delims=" %%I in (`"%ts_vswhere%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "ts_vsdir=%%I"
+    for /f "usebackq delims=" %%I in (`"%ts_vswhere%" -products * -property installationPath`) do (
+        for /d %%T in ("%%I\VC\Tools\MSVC\14.44.*") do (
+            if not defined ts_vsdir if exist "%%T\bin\Hostx86\x86\cl.exe" set "ts_vsdir=%%I"
+        )
+    )
 )
 if not defined ts_vsdir (
-    echo Visual Studio with the MSVC x86 C++ tools was not found.
+    echo Install the MSVC v143 14.44 x64/x86 build tools in Visual Studio Installer.
     goto finish
 )
-call "%ts_vsdir%\VC\Auxiliary\Build\vcvars32.bat"
+call "%ts_vsdir%\VC\Auxiliary\Build\vcvars32.bat" -vcvars_ver=14.44
 if errorlevel 1 goto finish
+rem Hunter locates v143 through the VS 2022 tools variable even inside a newer IDE.
+set "VS170COMNTOOLS=%ts_vsdir%\Common7\Tools\"
 set "CC=cl.exe"
 set "CXX=cl.exe"
 where /q cmake.exe
 if errorlevel 1 goto missing_cmake
-set "ts_build=build-vs"
+set "ts_build=build-vs-v143"
 set "ts_parallel="
 cmake.exe -S . -B "%ts_build%" -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
 goto build

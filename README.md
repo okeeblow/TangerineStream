@@ -1,6 +1,6 @@
 # Tangerine Stream
 
-Play music from Navidrome and other OpenSubsonic servers in the Media Library of 32-bit WACUP on Windows 10 or later. Browse by cover art, drag albums onto the Playlist Editor, and follow along in WACUP’s Album Art and Lyrics windows.
+Play music from Navidrome and other OpenSubsonic servers in the Media Library of 32-bit WACUP. Browse by cover art, drag albums onto the Playlist Editor, and follow along in WACUP’s Album Art and Lyrics windows.
 
 ## Install
 
@@ -12,7 +12,7 @@ To build from source, install the tools in the MSYS2 **MINGW32** shell.
 pacman -S --needed mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-ninja
 ```
 
-Double-click [build-and-install.bat](build-and-install.bat) to build and copy both DLLs. For portable WACUP, set `WACUP_PLUGINS_DIR` to its `Plugins` folder first. For Visual Studio’s x86 C++ tools, run `build-and-install.bat vs` from Command Prompt.
+Double-click [build-and-install.bat](build-and-install.bat) to build and copy both DLLs. For portable WACUP, set `WACUP_PLUGINS_DIR` to its `Plugins` folder first. To build with Visual Studio, install the **MSVC v143 14.44 x64/x86 build tools** and run `build-and-install.bat vs` from Command Prompt.
 
 ## Connect a server
 
