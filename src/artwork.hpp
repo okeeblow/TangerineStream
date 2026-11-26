@@ -29,7 +29,8 @@ public:
 
     Generation reset(HWND view);
     void cancel(Generation generation);
-    bool request(Generation generation, Id server, int row, int size, const LibraryItem& item);
+    void setViewport(Generation generation, int size, const std::vector<LibraryItem>& items,
+                     const std::vector<int>& rowsInPriorityOrder);
     std::vector<Thumbnail> take(Generation generation);
     void requestTrack(Id key, bool priority = false);
     void stageCover(const Track& track);
@@ -38,7 +39,6 @@ public:
 private:
     struct Request {
         Generation generation;
-        Id server;
         int row;
         int size;
         LibraryItem item;
@@ -51,7 +51,9 @@ private:
     std::condition_variable ready_;
     std::vector<std::thread> workers_;
     std::deque<Request> requests_;
-    std::deque<Id> tracks_;
+    std::set<int> startedRows_; // In flight or waiting for the view to collect.
+    struct TrackRequest { Id key; bool priority; };
+    std::deque<TrackRequest> tracks_;
     std::set<Id> pendingTracks_;
     std::vector<Thumbnail> complete_;
     HWND view_ = nullptr;

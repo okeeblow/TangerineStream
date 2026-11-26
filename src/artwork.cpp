@@ -113,6 +113,7 @@ ArtworkLoader::Generation ArtworkLoader::reset(HWND view) {
     std::scoped_lock lock(mutex_);
     view_ = view;
     requests_.clear();
+    startedRows_.clear();
     complete_.clear();
     return ++generation_;
 }
@@ -122,22 +123,29 @@ void ArtworkLoader::cancel(Generation generation) {
     if (generation_ != generation) return;
     view_ = nullptr;
     requests_.clear();
+    startedRows_.clear();
     complete_.clear();
 }
 
-bool ArtworkLoader::request(Generation generation, Id server, int row, int size, const LibraryItem& item) {
+void ArtworkLoader::setViewport(Generation generation, int size, const std::vector<LibraryItem>& items,
+                                const std::vector<int>& rowsInPriorityOrder) {
     {
         std::scoped_lock lock(mutex_);
-        if (!view_ || generation != generation_ || requests_.size() >= 48) return false;
-        requests_.push_back({generation, server, row, size, item});
+        if (!view_ || generation != generation_) return;
+        requests_.clear();
+        for (int row : rowsInPriorityOrder) {
+            if (startedRows_.count(row)) continue;
+            const auto& item = items[row];
+            requests_.push_back({generation, row, size, {item.target, {}, item.coverId}});
+        }
     }
-    ready_.notify_one();
-    return true;
+    ready_.notify_all();
 }
 
 std::vector<Thumbnail> ArtworkLoader::take(Generation generation) {
     std::scoped_lock lock(mutex_);
     if (generation != generation_) return {};
+    for (const auto& thumbnail : complete_) startedRows_.erase(thumbnail.row);
     return std::exchange(complete_, {});
 }
 
@@ -147,19 +155,20 @@ void ArtworkLoader::requestTrack(Id key, bool priority) {
         if (stopping_ || !key) return;
         if (pendingTracks_.count(key)) {
             if (!priority) return;
-            auto queued = std::find(tracks_.begin(), tracks_.end(), key);
+            auto queued = std::find_if(tracks_.begin(), tracks_.end(),
+                [key](const TrackRequest& request) { return request.key == key; });
             if (queued == tracks_.end()) return;
             tracks_.erase(queued);
         } else {
             if (tracks_.size() >= 64) {
                 if (!priority) return;
-                pendingTracks_.erase(tracks_.back());
+                pendingTracks_.erase(tracks_.back().key);
                 tracks_.pop_back();
             }
             pendingTracks_.insert(key);
         }
-        if (priority) tracks_.push_front(key);
-        else tracks_.push_back(key);
+        if (priority) tracks_.push_front({key, true});
+        else tracks_.push_back({key, false});
     }
     ready_.notify_one();
 }
@@ -224,12 +233,13 @@ void ArtworkLoader::load() {
             std::unique_lock lock(mutex_);
             ready_.wait(lock, [this] { return stopping_ || !requests_.empty() || !tracks_.empty(); });
             if (stopping_) return;
-            if (!tracks_.empty()) {
-                track = tracks_.front();
+            if (!tracks_.empty() && (tracks_.front().priority || requests_.empty())) {
+                track = tracks_.front().key;
                 tracks_.pop_front();
             } else {
                 request = std::move(requests_.front());
                 requests_.pop_front();
+                startedRows_.insert(request.row);
             }
         }
         if (track) {
@@ -239,17 +249,18 @@ void ArtworkLoader::load() {
             continue;
         }
         Thumbnail thumbnail{request.row, {}};
+        const Id server = request.item.target.server;
         try {
             if (factory.get()) {
-                auto bytes = store_.artwork(request.server, request.item);
-                if (bytes.empty() && store_.networkAvailable(request.server) && !localLocation(request.item.target)) {
-                    auto api = http_.connect(store_.server(request.server));
-                    bytes = loadArtwork(store_, *api, request.server, request.item);
+                auto bytes = store_.artwork(server, request.item);
+                if (bytes.empty() && store_.networkAvailable(server) && !localLocation(request.item.target)) {
+                    auto api = http_.connect(store_.server(server));
+                    bytes = loadArtwork(store_, *api, server, request.item);
                 }
                 thumbnail.pixels = decode(factory.get(), bytes, request.size);
             }
         } catch (const ConnectionError&) {
-            store_.connectionFailed(request.server);
+            store_.connectionFailed(server);
         } catch (const std::exception&) {
             // A missing or unreachable cover still leaves a usable tile.
         }

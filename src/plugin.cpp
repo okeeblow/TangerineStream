@@ -34,6 +34,7 @@ constexpr auto viewReady = WM_APP + 1;
 constexpr auto profilesChanged = WM_APP + 2;
 constexpr auto moreRequested = WM_APP + 4;
 constexpr auto selectionChanged = WM_APP + 5;
+constexpr auto artworkViewportChanged = WM_APP + 6;
 constexpr UINT_PTR playbackTimer = 0x7151;
 constexpr UINT_PTR viewTimer = 1;
 constexpr UINT_PTR searchTimer = 2;
@@ -1317,6 +1318,11 @@ public:
     void populateServers();
     void receive(SearchResult result);
     void receiveArtwork();
+    void scheduleArtwork() {
+        if (!artworkUpdatePosted)
+            artworkUpdatePosted = PostMessageW(hwnd, artworkViewportChanged, 0, 0) != FALSE;
+    }
+    void updateArtworkViewport();
     void fetchMore();
     void display(NMLVDISPINFOW& display);
     void activate(int index);
@@ -1358,6 +1364,11 @@ private:
         int row;
         std::uint64_t read;
     };
+    struct TileRange {
+        int first = 0, end = 0;
+        int count() const { return end - first; }
+        bool contains(int row) const { return row >= first && row < end; }
+    };
 
     BrowseKind category;
     BrowseLocation location;
@@ -1390,9 +1401,14 @@ private:
     ArtworkLoader::Generation artGeneration = 0;
     std::vector<ImageSlot> slots;
     std::map<int, int> slotForRow;
-    std::set<int> pendingArt, missingArt;
+    std::set<int> missingArt;
     std::uint64_t artRead = 0;
-    bool artQueueFull = false;
+    bool artworkUpdatePosted = false;
+    TileRange visibleArt, nearbyArt;
+    TileRange visibleTileRows() const;
+    int imageBudget() const {
+        return std::min(192, static_cast<int>(24 * MiB / (tileSize * tileSize * 4)));
+    }
 
     bool showTracks() const { return trackView(location.kind); }
     bool albumActions() const {
@@ -1512,6 +1528,7 @@ void View::updateRowCount() {
     const int previousWidth = listViewportWidth(list);
     ListView_SetItemCountEx(list, rowCount(), LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
     if (listViewportWidth(list) != previousWidth) resizeColumns();
+    scheduleArtwork();
     InvalidateRect(list, nullptr, FALSE);
     updateSelection();
 }
@@ -1645,16 +1662,15 @@ void View::display(NMLVDISPINFOW& display) {
         if (item.pszText && item.cchTextMax > 0) lstrcpynW(item.pszText, text.c_str(), item.cchTextMax);
     }
     if (item.mask & LVIF_IMAGE) item.iImage = showTiles() ? imageFor(row) : I_IMAGENONE;
-    if (row >= rowCount() - 12) scheduleMore();
+    if ((!showTiles() || !images) && row >= rowCount() - 12) scheduleMore();
 }
 
 void View::resetImages() {
     artGeneration = app->artwork.reset(hwnd);
-    pendingArt.clear();
+    visibleArt = nearbyArt = {};
     missingArt.clear();
     slots.clear();
     slotForRow.clear();
-    artQueueFull = false;
     artRead = 0;
     if (images) {
         ListView_SetImageList(list, nullptr, LVSIL_NORMAL);
@@ -1665,24 +1681,74 @@ void View::resetImages() {
 
 int View::imageFor(int row) {
     if (!images) return I_IMAGENONE;
+    scheduleArtwork();
     auto existing = slotForRow.find(row);
     if (existing != slotForRow.end()) {
         slots[existing->second - 1].read = ++artRead;
         return existing->second;
     }
-    if (!pendingArt.count(row) && !missingArt.count(row)) {
-        if (app->artwork.request(artGeneration, items[row].target.server, row, tileSize, items[row]))
-            pendingArt.insert(row);
-        else artQueueFull = true;
-    }
     return 0;
 }
 
+View::TileRange View::visibleTileRows() const {
+    if (!images || !showTiles() || !IsWindowVisible(list)) return {};
+    const int count = std::min(rowCount(), ListView_GetItemCount(list));
+    RECT client{};
+    GetClientRect(list, &client);
+    if (HWND header = ListView_GetHeader(list); header && IsWindowVisible(header)) {
+        RECT bounds{};
+        GetWindowRect(header, &bounds);
+        MapWindowPoints(nullptr, list, reinterpret_cast<POINT*>(&bounds), 2);
+        client.top = std::max(client.top, bounds.bottom);
+    }
+    if (!count || IsRectEmpty(&client)) return {};
+
+    // GetTopIndex only supports report/list views. Auto-arranged icons have
+    // the same bounds along the vertical axis within each grid row.
+    auto firstMatching = [&](auto matches) {
+        int low = 0, high = count;
+        while (low < high) {
+            const int mid = low + (high - low) / 2;
+            RECT icon{};
+            if (!ListView_GetItemRect(list, mid, &icon, LVIR_ICON)) return count;
+            if (matches(icon)) high = mid;
+            else low = mid + 1;
+        }
+        return low;
+    };
+    const int first = firstMatching([&](const RECT& icon) { return icon.bottom > client.top; });
+    const int end = firstMatching([&](const RECT& icon) { return icon.top >= client.bottom; });
+    return {first, std::max(first, end)};
+}
+
+void View::updateArtworkViewport() {
+    const auto visible = visibleTileRows();
+    artworkUpdatePosted = false;
+    const int margin = std::min(visible.count(), std::max(1, (imageBudget() - visible.count()) / 2));
+    const TileRange nearby{std::max(0, visible.first - margin),
+                           visible.end + std::min(margin, rowCount() - visible.end)};
+    if (visible.count() && nearby.end == rowCount()) scheduleMore();
+    if (visible.first == visibleArt.first && visible.end == visibleArt.end &&
+        nearby.first == nearbyArt.first && nearby.end == nearbyArt.end) return;
+    visibleArt = visible;
+    nearbyArt = nearby;
+    std::vector<int> rows;
+    rows.reserve(nearby.count());
+    auto add = [&](int row) {
+        if (!slotForRow.count(row) && !missingArt.count(row)) rows.push_back(row);
+    };
+    for (int row = visible.first; row < visible.end; ++row) add(row);
+    for (int i = 0; i < margin; ++i) {
+        if (i < visible.first - nearby.first) add(visible.first - 1 - i);
+        if (i < nearby.end - visible.end) add(visible.end + i);
+    }
+    app->artwork.setViewport(artGeneration, tileSize, items, rows);
+}
+
 void View::receiveArtwork() {
-    const std::size_t maxImages = std::min<std::size_t>(192, 24 * MiB / (tileSize * tileSize * 4));
+    const auto maxImages = static_cast<std::size_t>(std::max(imageBudget(), nearbyArt.count()));
     for (const auto& thumbnail : app->artwork.take(artGeneration)) {
-        pendingArt.erase(thumbnail.row);
-        if (!images) continue;
+        if (!images || !nearbyArt.contains(thumbnail.row)) continue;
         auto bitmap = thumbnailBitmap(tileSize, thumbnail.pixels);
         if (!bitmap) {
             missingArt.insert(thumbnail.row);
@@ -1694,7 +1760,10 @@ void View::receiveArtwork() {
             if (index > 0) slots.push_back({thumbnail.row, ++artRead});
         } else {
             auto oldest = std::min_element(slots.begin(), slots.end(),
-                [](const ImageSlot& a, const ImageSlot& b) { return a.read < b.read; });
+                [this](const ImageSlot& a, const ImageSlot& b) {
+                    return std::make_pair(nearbyArt.contains(a.row), a.read) <
+                           std::make_pair(nearbyArt.contains(b.row), b.read);
+                });
             int candidate = static_cast<int>(oldest - slots.begin()) + 1;
             if (ImageList_Replace(images, candidate, bitmap, nullptr)) {
                 slotForRow.erase(oldest->row);
@@ -1705,12 +1774,11 @@ void View::receiveArtwork() {
         DeleteObject(bitmap);
         if (index > 0) {
             slotForRow[thumbnail.row] = index;
-            if (showTiles()) ListView_RedrawItems(list, thumbnail.row, thumbnail.row);
+            if (visibleArt.contains(thumbnail.row)) ListView_RedrawItems(list, thumbnail.row, thumbnail.row);
         } else {
             missingArt.insert(thumbnail.row);
         }
     }
-    if (std::exchange(artQueueFull, false) && showTiles()) InvalidateRect(list, nullptr, FALSE);
 }
 
 void View::changePresentation() {
@@ -2172,6 +2240,7 @@ void View::layout(int width, int height) {
     SelectObject(dc, previous);
     ReleaseDC(hwnd, dc);
     resizeColumns();
+    scheduleArtwork();
 }
 
 void View::resizeColumns() {
@@ -2227,10 +2296,13 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         case WM_CANCELMODE: case WM_CAPTURECHANGED: view->cancelDrag(); break;
         case WM_KEYDOWN: if (w == VK_ESCAPE) view->cancelDrag(); break;
         case WM_SIZE: view->layout(LOWORD(l), HIWORD(l)); return TRUE;
+        case WM_SHOWWINDOW: view->scheduleArtwork(); break;
         case WM_COMMAND: view->command(LOWORD(w), HIWORD(w)); return TRUE;
         case WM_NOTIFY: {
             auto notification = reinterpret_cast<NMHDR*>(l);
             if (notification->idFrom != IDC_TRACKS) break;
+            if (notification->code == LVN_ODCACHEHINT || notification->code == LVN_ENDSCROLL)
+                view->scheduleArtwork();
             if (notification->code == LVN_BEGINDRAG) {
                 view->beginDrag(*reinterpret_cast<NMLISTVIEW*>(l));
                 return TRUE;
@@ -2267,6 +2339,7 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             if (auto result = app->takeResult(hwnd)) view->receive(std::move(*result));
             return TRUE;
         case ArtworkLoader::readyMessage: view->receiveArtwork(); return TRUE;
+        case artworkViewportChanged: view->updateArtworkViewport(); return TRUE;
         case moreRequested: view->fetchMore(); return TRUE;
         case selectionChanged: view->updateSelection(); return TRUE;
         case WM_DESTROY:
