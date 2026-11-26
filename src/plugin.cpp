@@ -1,5 +1,6 @@
 #include "playback.hpp"
 #include "list_scroll.hpp"
+#include "dpi.hpp"
 #include "artwork.hpp"
 #include "browse_sort.hpp"
 #include "host_metadata.hpp"
@@ -1209,7 +1210,7 @@ public:
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_STATIC);
         for (int id : {IDC_VIEW_MENU, IDC_SOURCE_MENU, IDC_ADD_SERVER, IDC_BACK, IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_CACHE_MENU})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_BUTTON);
-        tileSize = std::clamp(MulDiv(160, GetDpiForWindow(hwnd), 96), 96, 384);
+        tileSize = std::clamp(MulDiv(160, windowDpi(hwnd), 96), 96, 384);
         SetTimer(hwnd, viewTimer, 2000, nullptr);
         SendDlgItemMessageW(hwnd, IDC_QUERY, EM_SETLIMITTEXT, 256, 0);
         textList = app->store.textCatalog();
@@ -1676,7 +1677,7 @@ void View::changePresentation() {
         GetTextMetricsW(dc, &metrics);
         SelectObject(dc, previous);
         ReleaseDC(list, dc);
-        const int gap = MulDiv(4, GetDpiForWindow(hwnd), 96);
+        const int gap = MulDiv(4, windowDpi(hwnd), 96);
         ListView_SetIconSpacing(list, tileSize + gap, tileSize + 2 * metrics.tmHeight + gap);
     }
     SendDlgItemMessageW(hwnd, IDC_QUERY, EM_SETCUEBANNER, FALSE,
@@ -2019,7 +2020,7 @@ void View::command(int id, int notification) {
 }
 
 void View::layout(int width, int height) {
-    const int dpi = GetDpiForWindow(hwnd);
+    const int dpi = windowDpi(hwnd);
     const int gap = std::max(1, MulDiv(3, dpi, 96));
     HDC dc = GetDC(hwnd);
     auto previous = SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(list, WM_GETFONT, 0, 0)));

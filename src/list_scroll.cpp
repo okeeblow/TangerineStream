@@ -1,4 +1,5 @@
 #include "list_scroll.hpp"
+#include "dpi.hpp"
 #include "ml_sdk.hpp"
 
 #include <algorithm>
@@ -48,9 +49,9 @@ struct ListBars {
             auto& horizontal = range[SB_HORZ];
             horizontal.nMax = std::max(0L, extent.right + horizontal.nPos - 1);
         }
-        const auto dpi = GetDpiForWindow(list);
-        const int right = client.right - (scrollable(range[SB_VERT]) ? GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) : 0);
-        const int bottom = client.bottom - (scrollable(range[SB_HORZ]) ? GetSystemMetricsForDpi(SM_CYHSCROLL, dpi) : 0);
+        const auto dpi = windowDpi(list);
+        const int right = client.right - (scrollable(range[SB_VERT]) ? systemMetricForDpi(SM_CXVSCROLL, dpi) : 0);
+        const int bottom = client.bottom - (scrollable(range[SB_HORZ]) ? systemMetricForDpi(SM_CYHSCROLL, dpi) : 0);
         for (int axis : {SB_HORZ, SB_VERT}) {
             const HWND bar = bars[axis];
             const RECT strip = axis == SB_VERT ? RECT{right, 0, client.right, bottom}
@@ -203,7 +204,7 @@ int listViewportWidth(HWND list) {
     // paint a narrower scrollbar in that same window.
     int width = outer.right - outer.left;
     if (GetScrollInfo(list, SB_VERT, &vertical) && scrollable(vertical))
-        width -= GetSystemMetricsForDpi(SM_CXVSCROLL, GetDpiForWindow(list));
+        width -= systemMetricForDpi(SM_CXVSCROLL, windowDpi(list));
     return std::max(0, std::min<int>(client.right, width));
 }
 
