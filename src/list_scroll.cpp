@@ -41,17 +41,24 @@ struct ListBars {
             range[axis].fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
             GetScrollInfo(list, axis, &range[axis]);
         }
-        // Icon view can retain the previous header width as its horizontal
-        // range after reflow. Its view rectangle contains the current extent.
-        RECT extent{};
-        if ((GetWindowLongPtrW(list, GWL_STYLE) & LVS_TYPEMASK) == LVS_ICON &&
-            ListView_GetViewRect(list, &extent)) {
-            auto& horizontal = range[SB_HORZ];
-            horizontal.nMax = std::max(0L, extent.right + horizontal.nPos - 1);
-        }
         const auto dpi = windowDpi(list);
-        const int right = client.right - (scrollable(range[SB_VERT]) ? systemMetricForDpi(SM_CXVSCROLL, dpi) : 0);
-        const int bottom = client.bottom - (scrollable(range[SB_HORZ]) ? systemMetricForDpi(SM_CYHSCROLL, dpi) : 0);
+        const int right = std::max(0L, client.right -
+            (scrollable(range[SB_VERT]) ? systemMetricForDpi(SM_CXVSCROLL, dpi) : 0));
+        // The skinned list can keep a horizontal page from before the window
+        // was resized. The visible page is the space beside our vertical bar.
+        auto& horizontal = range[SB_HORZ];
+        horizontal.nPage = static_cast<UINT>(right);
+        RECT extent{};
+        const auto view = GetWindowLongPtrW(list, GWL_STYLE) & LVS_TYPEMASK;
+        if (view == LVS_ICON && ListView_GetViewRect(list, &extent)) {
+            horizontal.nMax = std::max(0L, extent.right + horizontal.nPos - 1);
+        } else if (view == LVS_REPORT) {
+            const int columns = Header_GetItemCount(ListView_GetHeader(list));
+            int width = 0;
+            for (int i = 0; i < columns; ++i) width += ListView_GetColumnWidth(list, i);
+            horizontal.nMax = std::max(0, width - 1);
+        }
+        const int bottom = client.bottom - (scrollable(horizontal) ? systemMetricForDpi(SM_CYHSCROLL, dpi) : 0);
         for (int axis : {SB_HORZ, SB_VERT}) {
             const HWND bar = bars[axis];
             const RECT strip = axis == SB_VERT ? RECT{right, 0, client.right, bottom}
