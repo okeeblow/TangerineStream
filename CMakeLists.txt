@@ -11,7 +11,7 @@ HunterGate(
     SHA1 6498c5d0dec25d7fffb2b0574ebaf265179b894d
     LOCAL
 )
-project(ml_tangerinestream VERSION 0.6.5 LANGUAGES C CXX RC)
+project(ml_tangerinestream VERSION 0.6.6 LANGUAGES C CXX RC)
 
 if(MSVC_VERSION GREATER_EQUAL 1950)
     message(FATAL_ERROR "The v145 runtime requires Windows 10. Select MSVC v143 to target Windows 7.")

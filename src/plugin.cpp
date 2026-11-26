@@ -44,7 +44,7 @@ int init();
 void quit();
 INT_PTR message(int type, INT_PTR a, INT_PTR b, INT_PTR c);
 
-char description[] = "Tangerine Stream v0.6.5";
+char description[] = "Tangerine Stream v0.6.6";
 winampMediaLibraryPlugin plugin = [] {
     winampMediaLibraryPlugin descriptor{};
 #ifdef MLHDR_VER_OLD
@@ -2298,12 +2298,21 @@ std::filesystem::path settingsDirectory() {
     throw Error("WACUP did not provide its profile directory.");
 }
 
-UINT_PTR addTreeItem(const wchar_t* title, UINT_PTR parent, bool branch) {
-    std::wstring label = title;
-    MLTREEITEMW item{sizeof(item), 0, parent, label.data(), 0, branch,
-                    branch ? MLTREEIMAGE_BRANCH : MLTREEIMAGE_DEFAULT};
-    library(ML_IPC_TREEITEM_ADDW, reinterpret_cast<WPARAM>(&item));
-    if (!item.id) throw Error("Tangerine Stream could not add its Media Library entry.");
+UINT_PTR addTreeItem(std::wstring label, std::wstring invariant, UINT_PTR parent, bool branch) {
+    NAVINSERTSTRUCT insert{};
+    insert.hParent = parent ? MLNavCtrl_FindItemById(plugin.hwndLibraryParent, parent) : nullptr;
+    insert.hInsertAfter = NCI_LAST;
+    auto& item = insert.item;
+    item.cbSize = sizeof(item);
+    item.mask = NIMF_TEXT | NIMF_TEXTINVARIANT | NIMF_STYLE;
+    item.pszText = label.data();
+    item.pszInvariant = invariant.data();
+    item.styleMask = NIS_HASCHILDREN | NIS_DEFAULTIMAGE;
+    item.style = NIS_DEFAULTIMAGE | (branch ? NIS_HASCHILDREN : 0);
+    item.hItem = MLNavCtrl_InsertItem(plugin.hwndLibraryParent, &insert);
+    item.mask = NIMF_ITEMID;
+    if (!item.hItem || !MLNavItem_GetInfo(plugin.hwndLibraryParent, &item))
+        throw Error("Tangerine Stream could not add its Media Library entry.");
     return item.id;
 }
 
@@ -2360,11 +2369,11 @@ void refreshNavigation() {
     app->navigation.emplace(root, Navigation{BrowseKind::albums, 0, true});
     auto addCategories = [&](UINT_PTR parent, Id server) {
         for (const auto& entry : categories)
-            app->navigation.emplace(addTreeItem(entry.name, parent, false), Navigation{entry.kind, server, false});
+            app->navigation.emplace(addTreeItem(entry.name, entry.name, parent, false), Navigation{entry.kind, server, false});
     };
     if (branches.empty()) addCategories(root, 0);
     for (const auto& [server, name] : branches) {
-        const auto parent = addTreeItem(wide(name).c_str(), root, true);
+        const auto parent = addTreeItem(wide(name), L"server-" + std::to_wstring(server), root, true);
         app->navigation.emplace(parent, Navigation{BrowseKind::albums, server, true});
         addCategories(parent, server);
     }
@@ -2383,7 +2392,7 @@ int init() {
         app->attached = true;
         if (!SetTimer(plugin.hwndWinampParent, playbackTimer, 350, nullptr))
             throw Error("WACUP playback tracking could not start.");
-        app->treeId = addTreeItem(pluginName, 0, true);
+        app->treeId = addTreeItem(pluginName, pluginName, 0, true);
         refreshNavigation();
         // WACUP reads the second line of its Preferences row from this per-profile catalog.
         const auto descriptions = settings / L"plugin_descriptions.ini";
