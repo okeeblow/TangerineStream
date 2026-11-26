@@ -162,11 +162,11 @@ extern "C" __declspec(dllexport) In_Module* winampGetInModule2() {
         static char extensions[] = "TSTREAM\0Tangerine Stream track\0";
 #ifdef IN_VER_RET
         input.version = IN_VER_RET;
-        input.description = reinterpret_cast<char*>(const_cast<wchar_t*>(L"Tangerine Stream Input v0.6.2"));
+        input.description = reinterpret_cast<char*>(const_cast<wchar_t*>(L"Tangerine Stream Input v0.6.3"));
         input.Init = [] { return 0; };
 #else
         input.version = IN_VER;
-        input.description = const_cast<char*>("Tangerine Stream Input v0.6.2");
+        input.description = const_cast<char*>("Tangerine Stream Input v0.6.3");
         input.Init = [] {};
 #endif
         input.FileExtensions = extensions;

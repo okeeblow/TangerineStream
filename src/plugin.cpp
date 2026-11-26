@@ -44,7 +44,7 @@ int init();
 void quit();
 INT_PTR message(int type, INT_PTR a, INT_PTR b, INT_PTR c);
 
-char description[] = "Tangerine Stream v0.6.2";
+char description[] = "Tangerine Stream v0.6.3";
 winampMediaLibraryPlugin plugin = [] {
     winampMediaLibraryPlugin descriptor{};
 #ifdef MLHDR_VER_OLD
@@ -921,6 +921,7 @@ struct Settings {
     std::vector<Id> removed{};
     std::future<std::vector<Server>> saving{};
     size_t savedSelection = 0;
+    INT_PTR (__cdecl *skinDialogMessage)(HWND, UINT, WPARAM, LPARAM) = nullptr;
 
     bool sameAccount(Id id, const std::string& url, const std::string& user) const {
         if (!id) return false;
@@ -1050,6 +1051,9 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_INITDIALOG) {
         settings = reinterpret_cast<Settings*>(l);
         SetWindowLongPtrW(hwnd, DWLP_USER, l);
+        const auto skinMessage = library(ML_IPC_SKIN_WADLG_GETFUNC, 2);
+        if (static_cast<UINT_PTR>(skinMessage) > 1)
+            settings->skinDialogMessage = reinterpret_cast<decltype(settings->skinDialogMessage)>(skinMessage);
         skinWindow(hwnd, SKINNEDWND_TYPE_DIALOG);
         for (HWND control = GetWindow(hwnd, GW_CHILD); control; control = GetWindow(control, GW_HWNDNEXT)) {
             switch (GetDlgCtrlID(control)) {
@@ -1067,7 +1071,8 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                 SendMessageW(control, EM_SETLIMITTEXT, 5, 0);
                 [[fallthrough]];
             case IDC_NAME: case IDC_URL: case IDC_USERNAME: case IDC_PASSWORD: case IDC_BUDGET:
-                skinWindow(control, SKINNEDWND_TYPE_EDIT, SWES_VCENTER);
+                // Use the skin font while EDIT paints text, selection, password masks and the caret together.
+                skinWindow(control, SKINNEDWND_TYPE_WINDOW);
                 break;
             case IDC_UPGRADE_FAVORITES:
             case IDC_UNIFIED: case IDC_NATIVE: case IDC_FAVORITES: case IDC_ADD_SERVER: case IDC_REMOVE_SERVER:
@@ -1087,6 +1092,9 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         return TRUE;
     }
     if (!settings) return FALSE;
+    if (settings->skinDialogMessage && (msg == WM_CTLCOLOREDIT ||
+        (msg == WM_CTLCOLORSTATIC && !IsWindowEnabled(reinterpret_cast<HWND>(l)))))
+        return settings->skinDialogMessage(hwnd, msg, w, l);
     if (settings->saving.valid()) {
         if (msg == WM_TIMER && w == 1 &&
             settings->saving.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
