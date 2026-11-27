@@ -2516,6 +2516,11 @@ int init() {
         { std::unique_lock lock(inputMutex); inputProfile = app.get(); }
         return 0;
     } catch (const std::exception& error) {
+        // Roll back a failed registration. At normal shutdown WACUP saves the tree order itself.
+        if (app && app->treeId) {
+            auto handle = library(ML_IPC_TREEITEM_GETHANDLE, app->treeId);
+            if (handle) library(ML_IPC_TREEITEM_DELETE, handle);
+        }
         quit();
         showError(plugin.hwndLibraryParent, error);
         return 1;
@@ -2528,10 +2533,6 @@ void quit() {
     if (app->attached) {
         KillTimer(plugin.hwndWinampParent, playbackTimer);
         RemoveWindowSubclass(plugin.hwndWinampParent, playerProc, playerSubclass);
-    }
-    if (app->treeId) {
-        auto handle = library(ML_IPC_TREEITEM_GETHANDLE, app->treeId);
-        if (handle) library(ML_IPC_TREEITEM_DELETE, handle);
     }
     if (app->activeView && IsWindow(app->activeView)) DestroyWindow(app->activeView);
     app.reset();
