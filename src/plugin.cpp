@@ -1064,7 +1064,7 @@ INT_PTR CALLBACK settingsFormProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             switch (GetDlgCtrlID(control)) {
             case IDC_SERVERS: {
                 skinWindow(control, SKINNEDWND_TYPE_LISTVIEW, SWLVS_FULLROWSELECT | SWLVS_SELALWAYS | SWLVS_DOUBLEBUFFER);
-                attachListScrollbars(control, plugin.hwndWinampParent);
+                attachListScrollbars(control);
                 LVCOLUMNW column{};
                 ListView_InsertColumn(control, 0, &column);
                 break;
@@ -1295,7 +1295,7 @@ public:
         if (SetPropW(list, listSkinProc, reinterpret_cast<HANDLE>(proc)) &&
             !SetWindowLongPtrW(list, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(libraryListProc)))
             RemovePropW(list, listSkinProc);
-        attachListScrollbars(list, plugin.hwndWinampParent);
+        attachListScrollbars(list);
         skinWindow(GetDlgItem(hwnd, IDC_QUERY), SKINNEDWND_TYPE_EDIT, SWES_VCENTER);
         for (int id : {IDC_SEARCH_LABEL, IDC_STATUS})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_STATIC);
