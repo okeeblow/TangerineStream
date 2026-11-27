@@ -6,6 +6,9 @@
 #include <set>
 #include <thread>
 
+struct IWICImagingFactory;
+class api_service;
+
 namespace tangerine {
 
 struct Thumbnail {
@@ -22,7 +25,7 @@ public:
     const UINT lyricsReadyMessage;
     using Generation = std::uint64_t;
 
-    ArtworkLoader(Store& store, HttpClient& http, HWND player);
+    ArtworkLoader(Store& store, HttpClient& http, HWND player, api_service* services);
     ~ArtworkLoader();
     ArtworkLoader(const ArtworkLoader&) = delete;
     ArtworkLoader& operator=(const ArtworkLoader&) = delete;
@@ -47,6 +50,7 @@ private:
     Store& store_;
     HttpClient& http_;
     const HWND player_;
+    api_service* const services_;
     std::mutex mutex_;
     std::condition_variable ready_;
     std::vector<std::thread> workers_;
@@ -64,7 +68,7 @@ private:
 
     void load();
     bool workAvailable() const;
-    void loadTrack(Id key);
+    void loadTrack(Id key, IWICImagingFactory* factory);
     void notifyPlayer(UINT message, Id key);
     void stop();
 };

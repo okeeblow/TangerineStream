@@ -122,6 +122,7 @@ void migrate(sqlite3* db) {
             Statement(db, sql.c_str()).run();
         };
         renameArtworkColumn("requested_size", "requested_max_edge_px");
+        renameArtworkColumn("pixel_size", "cached_longest_edge_px");
     }
     for (; schema < latest; ++schema) {
         if (sqlite3_exec(db, migrations[schema], nullptr, nullptr, nullptr) != SQLITE_OK)
@@ -389,6 +390,19 @@ bool Store::textCatalog() {
 void Store::saveTextCatalog(bool text) {
     std::scoped_lock lock(mutex_);
     setSetting("text_catalog", text ? "1" : "0");
+}
+
+int Store::coverSize() {
+    std::scoped_lock lock(mutex_);
+    auto size = prepare("SELECT value FROM settings WHERE name='cover_size'");
+    if (!size.row()) return 0;
+    const auto pixels = size.integer(0);
+    return pixels >= 100 && pixels <= 600 ? static_cast<int>(pixels) : 0;
+}
+
+void Store::saveCoverSize(int size) {
+    std::scoped_lock lock(mutex_);
+    setSetting("cover_size", std::to_string(size));
 }
 
 bool Store::offlineMode() {
@@ -685,10 +699,10 @@ std::string artworkKey(const LibraryItem& item) {
 CachedArtwork Store::artwork(Id server, const LibraryItem& item) {
     std::scoped_lock lock(mutex_);
     auto key = artworkKey(item);
-    auto artwork = prepare("SELECT data,requested_max_edge_px FROM artwork WHERE server=? AND cover_key=?");
+    auto artwork = prepare("SELECT data,requested_max_edge_px,cached_longest_edge_px FROM artwork WHERE server=? AND cover_key=?");
     artwork.bind(server).bind(key);
     if (!artwork.row()) return {};
-    CachedArtwork cached{artwork.blob(0), static_cast<int>(artwork.integer(1))};
+    CachedArtwork cached{artwork.blob(0), static_cast<int>(artwork.integer(1)), static_cast<int>(artwork.integer(2))};
     prepare("UPDATE artwork SET last_use=? WHERE server=? AND cover_key=?")
         .bind(nowMs()).bind(server).bind(key).run();
     return cached;
@@ -777,24 +791,43 @@ bool Store::stageCover(const Track& track, const LibraryItem& song, const Librar
     return true;
 }
 
-void Store::saveArtwork(Id server, const LibraryItem& item, int requestedMaxEdgePx, const std::string& data) {
-    if (data.empty()) return;
+void Store::recordCachedCoverEdge(Id server, const LibraryItem& item, int requestedMaxEdgePx, int cachedLongestEdgePx) {
+    std::scoped_lock lock(mutex_);
+    prepare("UPDATE artwork SET cached_longest_edge_px=? WHERE server=? AND cover_key=? AND requested_max_edge_px=? AND cached_longest_edge_px=0")
+        .bind(cachedLongestEdgePx).bind(server).bind(artworkKey(item)).bind(requestedMaxEdgePx).run();
+}
+
+std::string Store::saveArtwork(Id server, const LibraryItem& item, int requestedMaxEdgePx, int cachedLongestEdgePx, std::string data) {
     std::scoped_lock lock(mutex_);
     Transaction transaction(db_);
     const auto key = artworkKey(item);
     std::int64_t previousBytes = 0;
     {
-        auto old = prepare("SELECT requested_max_edge_px,length(data) FROM artwork WHERE server=? AND cover_key=?");
+        auto old = prepare("SELECT requested_max_edge_px,cached_longest_edge_px,length(data) FROM artwork WHERE server=? AND cover_key=?");
         old.bind(server).bind(key);
         if (old.row()) {
-            if (old.integer(0) >= requestedMaxEdgePx) return;
-            previousBytes = old.integer(1);
+            const int previousRequestedMaxEdgePx = static_cast<int>(old.integer(0));
+            const int previousCachedEdgePx = static_cast<int>(old.integer(1));
+            previousBytes = old.integer(2);
+            const bool keepCachedCover = (previousCachedEdgePx || cachedLongestEdgePx)
+                ? previousCachedEdgePx >= cachedLongestEdgePx : previousRequestedMaxEdgePx >= requestedMaxEdgePx;
+            if (!cachedLongestEdgePx && previousCachedEdgePx) requestedMaxEdgePx = previousRequestedMaxEdgePx;
+            requestedMaxEdgePx = std::max(requestedMaxEdgePx, previousRequestedMaxEdgePx);
+            if (keepCachedCover) {
+                auto kept = prepare("UPDATE artwork SET requested_max_edge_px=?,last_use=? WHERE server=? AND cover_key=? RETURNING data");
+                kept.bind(requestedMaxEdgePx).bind(nowMs()).bind(server).bind(key);
+                kept.row();
+                data = kept.blob(0);
+                kept.run();
+                transaction.commit();
+                return data;
+            }
         }
     }
-    prepare("INSERT INTO artwork(server,cover_key,data,last_use,requested_max_edge_px) VALUES(?,?,?,?,?)"
+    prepare("INSERT INTO artwork(server,cover_key,data,last_use,requested_max_edge_px,cached_longest_edge_px) VALUES(?,?,?,?,?,?)"
         " ON CONFLICT(server,cover_key) DO UPDATE SET data=excluded.data,last_use=excluded.last_use,"
-        " requested_max_edge_px=excluded.requested_max_edge_px")
-        .bind(server).bind(key).bindBlob(data).bind(nowMs()).bind(requestedMaxEdgePx).run();
+        " requested_max_edge_px=excluded.requested_max_edge_px,cached_longest_edge_px=excluded.cached_longest_edge_px")
+        .bind(server).bind(key).bindBlob(data).bind(nowMs()).bind(requestedMaxEdgePx).bind(cachedLongestEdgePx).run();
     prepare("UPDATE playlist_covers SET cover_key='' WHERE cover_key=? AND track IN"
         " (SELECT key FROM tracks WHERE server=?)").bind(key).bind(server).run();
     std::int64_t bytes = 0;
@@ -814,6 +847,7 @@ void Store::saveArtwork(Id server, const LibraryItem& item, int requestedMaxEdge
     }
     transaction.commit();
     artworkBytes_ = bytes;
+    return data;
 }
 
 std::optional<Lyrics> Store::lyrics(Id key, bool fresh) {

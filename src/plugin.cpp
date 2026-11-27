@@ -184,9 +184,9 @@ struct AlbumJob {
 
 class App {
 public:
-    explicit App(const std::filesystem::path& profile)
-        : store(profile), playback(store, profile), artwork(store, http, plugin.hwndWinampParent),
-          hostMetadata(reinterpret_cast<void*>(player(IPC_GET_API_SERVICE)), store, playback, artwork) {
+    App(const std::filesystem::path& profile, api_service* services)
+        : store(profile), playback(store, profile), artwork(store, http, plugin.hwndWinampParent, services),
+          hostMetadata(services, store, playback, artwork) {
         try {
             refreshInputs();
             browser = std::thread([this] { browse(); });
@@ -863,6 +863,8 @@ void selectCategory(BrowseKind category, Id server);
 constexpr UINT allServersCommand = 2000;
 constexpr int sortCommand = 1500;
 constexpr int directionCommand = 1499;
+constexpr int coverSizeCommand = 1600;
+constexpr int coverSizes[] = {0, 100, 200, 300, 400, 600}; // 0 follows display DPI.
 
 LRESULT CALLBACK playerProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
     if (app && msg && msg == app->navigationChanged) {
@@ -1299,7 +1301,8 @@ public:
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_STATIC);
         for (int id : {IDC_VIEW_MENU, IDC_SOURCE_MENU, IDC_ADD_SERVER, IDC_BACK, IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_CACHE_MENU})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_BUTTON);
-        tileSize = std::clamp(MulDiv(160, windowDpi(hwnd), 96), 96, 384);
+        preferredCoverSize = app->store.coverSize();
+        tileSize = preferredCoverSize ? preferredCoverSize : automaticCoverSize();
         SetTimer(hwnd, viewTimer, 2000, nullptr);
         SendDlgItemMessageW(hwnd, IDC_QUERY, EM_SETLIMITTEXT, 256, 0);
         textList = app->store.textCatalog();
@@ -1396,6 +1399,10 @@ private:
     const Id treeServer;
     Id currentServer = 0;
     int tileSize = 160;
+    int preferredCoverSize = 0;
+    int automaticCoverSize() const {
+        return std::clamp(MulDiv(160, windowDpi(hwnd), 96), 96, 384);
+    }
     bool textList = false;
     HIMAGELIST images = nullptr;
     ArtworkLoader::Generation artGeneration = 0;
@@ -2108,6 +2115,17 @@ void View::popup(int button) {
             AppendMenuW(menu, MF_STRING | (descending ? MF_CHECKED : 0), directionCommand, L"Descending");
         if (!showTracks()) {
             AppendMenuW(menu, MF_STRING | (textList ? MF_CHECKED : 0), IDC_TEXT_LIST, L"Text list");
+            if (HMENU sizes = CreatePopupMenu()) {
+                for (size_t i = 0; i < std::size(coverSizes); ++i) {
+                    const int size = coverSizes[i];
+                    auto label = size ? std::to_wstring(size) + L" px" :
+                        L"Automatic (" + std::to_wstring(automaticCoverSize()) + L" px)";
+                    AppendMenuW(sizes, MF_STRING | (size == preferredCoverSize ? MF_CHECKED : 0),
+                                coverSizeCommand + i, label.c_str());
+                }
+                AppendMenuW(menu, MF_POPUP | (textList ? MF_GRAYED : 0),
+                            reinterpret_cast<UINT_PTR>(sizes), L"Cover size");
+            }
         }
         AppendMenuW(menu, MF_STRING | (app->store.offlineMode() ? MF_CHECKED : 0), IDC_OFFLINE, L"Work offline");
     } else {
@@ -2144,6 +2162,22 @@ void View::command(int id, int notification) {
         return;
     }
     const auto& choices = sortChoices(location.kind);
+    if (id >= coverSizeCommand && static_cast<size_t>(id - coverSizeCommand) < std::size(coverSizes)) {
+        const int size = coverSizes[id - coverSizeCommand];
+        if (size == preferredCoverSize) return;
+        app->store.saveCoverSize(size);
+        preferredCoverSize = size;
+        const int pixels = size ? size : automaticCoverSize();
+        if (pixels != tileSize) {
+            const auto anchor = visibleTileRows();
+            tileSize = pixels;
+            resetImages();
+            changePresentation();
+            if (anchor.count()) ListView_EnsureVisible(list, anchor.first, FALSE);
+            scheduleArtwork();
+        }
+        return;
+    }
     if (id >= sortCommand && static_cast<size_t>(id - sortCommand) < choices.size()) {
         const auto& choice = choices[id - sortCommand];
         chooseOrder(choice, choice.descending);
@@ -2461,7 +2495,9 @@ int init() {
         INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
         if (!InitCommonControlsEx(&controls)) throw Error("Windows could not initialize Media Library controls.");
         const auto settings = settingsDirectory();
-        app = std::make_unique<App>(settings / L"Plugins" / pluginName);
+        const auto services = static_cast<UINT_PTR>(player(IPC_GET_API_SERVICE));
+        app = std::make_unique<App>(settings / L"Plugins" / pluginName,
+                                    services > 1 ? reinterpret_cast<api_service*>(services) : nullptr);
         if (!SetWindowSubclass(plugin.hwndWinampParent, playerProc, playerSubclass, 0))
             throw Error("WACUP playback notifications could not be attached.");
         app->attached = true;

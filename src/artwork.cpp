@@ -1,8 +1,12 @@
 #include "artwork.hpp"
 #include "server.hpp"
+#include "sdk_services.hpp"
 
 #include <wincodec.h>
+#include <api/service/svcs/svc_imgload.h>
+#include <api/service/waservicefactory.h>
 #include <algorithm>
+#include <climits>
 #include <utility>
 
 namespace tangerine {
@@ -19,25 +23,6 @@ LibraryItem songArtwork(const Track& track) {
 LibraryItem albumArtwork(Store& store, const Track& track) {
     return {{BrowseKind::albumTracks, track.albumId, track.album}, track.artist,
         store.albumCover(track.server, track.albumId)};
-}
-
-std::string loadArtwork(Store& store, HttpClient& http, Id server, const LibraryItem& item, int targetEdgePx) {
-    auto cached = store.artwork(server, item);
-    if (cached.requestedMaxEdgePx < targetEdgePx && !localLocation(item.target) && store.networkAvailable(server)) {
-        try {
-            auto api = http.connect(store.server(server));
-            auto data = api->cover(item, targetEdgePx);
-            if (artworkExtension(data)) {
-                store.saveArtwork(server, item, targetEdgePx, data);
-                return data;
-            }
-        } catch (const ConnectionError&) {
-            store.connectionFailed(server);
-        } catch (const Error&) {
-            if (cached.data.empty()) throw;
-        }
-    }
-    return std::move(cached.data);
 }
 
 template<class T> class Com {
@@ -64,24 +49,84 @@ private:
     bool initialized_;
 };
 
-std::vector<std::uint32_t> decode(IWICImagingFactory* factory, std::string& bytes, UINT size) {
-    if (!factory || bytes.empty()) return {};
+struct CoverFrame {
     Com<IWICStream> stream;
     Com<IWICBitmapDecoder> decoder;
     Com<IWICBitmapFrameDecode> frame;
+    UINT width = 0, height = 0;
+
+    HRESULT open(IWICImagingFactory* factory, std::string& bytes) {
+        if (!factory || bytes.empty()) return E_FAIL;
+        HRESULT hr = factory->CreateStream(stream.out());
+        if (SUCCEEDED(hr)) hr = stream->InitializeFromMemory(reinterpret_cast<BYTE*>(bytes.data()), static_cast<DWORD>(bytes.size()));
+        if (SUCCEEDED(hr)) hr = factory->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnDemand, decoder.out());
+        if (SUCCEEDED(hr)) hr = decoder->GetFrame(0, frame.out());
+        if (SUCCEEDED(hr)) hr = frame->GetSize(&width, &height);
+        if (SUCCEEDED(hr) && (!width || !height || std::max(width, height) > INT_MAX)) return E_FAIL;
+        return hr;
+    }
+};
+
+// An empty optional denotes unreadable data. Zero means neither Windows nor the
+// host reported dimensions; the native Album Art window can still use the bytes.
+std::optional<int> coverLongestEdgePx(IWICImagingFactory* factory, api_service* services, std::string& data) {
+    CoverFrame image;
+    const auto hr = image.open(factory, data);
+    if (SUCCEEDED(hr)) return static_cast<int>(std::max(image.width, image.height));
+    if (hr != WINCODEC_ERR_COMPONENTNOTFOUND) return {};
+    if (services) {
+        const auto type = svc_imageLoader::getServiceType();
+        const auto count = services->service_getNumServices(type);
+        for (size_t i = 0; i < count; ++i) {
+            auto* codec = services->service_enumService(type, i);
+            if (!codec) continue;
+            auto* reader = static_cast<svc_imageLoader*>(codec->getInterface(FALSE));
+            if (!reader) continue;
+            int width = 0, height = 0;
+            const int bytes = static_cast<int>(data.size());
+            if (reader->testData(data.data(), bytes)) reader->getDimensions(data.data(), bytes, &width, &height);
+            codec->releaseInterface(reader);
+            if (width > 0 && height > 0) return std::max(width, height);
+        }
+    }
+    return 0;
+}
+
+std::string loadArtwork(Store& store, HttpClient& http, IWICImagingFactory* factory, api_service* services,
+                        Id server, const LibraryItem& item, int targetEdgePx) {
+    auto cached = store.artwork(server, item);
+    if (!cached.canReuseFor(targetEdgePx) && !cached.data.empty() && !cached.cachedLongestEdgePx) {
+        cached.cachedLongestEdgePx = coverLongestEdgePx(factory, services, cached.data).value_or(0);
+        if (cached.cachedLongestEdgePx)
+            store.recordCachedCoverEdge(server, item, cached.requestedMaxEdgePx, cached.cachedLongestEdgePx);
+    }
+    if (!cached.canReuseFor(targetEdgePx) && !localLocation(item.target) && store.networkAvailable(server)) {
+        try {
+            auto data = http.connect(store.server(server))->cover(item, targetEdgePx);
+            if (artworkExtension(data)) {
+                auto receivedEdgePx = coverLongestEdgePx(factory, services, data);
+                if (receivedEdgePx && (*receivedEdgePx || !cached.cachedLongestEdgePx))
+                    return store.saveArtwork(server, item, targetEdgePx, *receivedEdgePx, std::move(data));
+            }
+        } catch (const ConnectionError&) {
+            store.connectionFailed(server);
+        } catch (const Error&) {
+            if (cached.data.empty()) throw;
+        }
+    }
+    return std::move(cached.data);
+}
+
+std::vector<std::uint32_t> decode(IWICImagingFactory* factory, std::string& bytes, UINT size) {
+    CoverFrame image;
+    if (FAILED(image.open(factory, bytes)) || std::uint64_t(image.width) * image.height > 64'000'000) return {};
     Com<IWICBitmapScaler> scaler;
     Com<IWICFormatConverter> converter;
-    if (FAILED(factory->CreateStream(stream.out())) ||
-        FAILED(stream->InitializeFromMemory(reinterpret_cast<BYTE*>(bytes.data()), static_cast<DWORD>(bytes.size()))) ||
-        FAILED(factory->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnDemand, decoder.out())) ||
-        FAILED(decoder->GetFrame(0, frame.out()))) return {};
-    UINT width = 0, height = 0;
-    if (FAILED(frame->GetSize(&width, &height)) || !width || !height ||
-        std::uint64_t(width) * height > 64'000'000) return {};
+    UINT width = image.width, height = image.height;
     const auto longest = width > height ? width : height;
     width = std::max(1u, static_cast<UINT>(std::uint64_t(width) * size / longest));
     height = std::max(1u, static_cast<UINT>(std::uint64_t(height) * size / longest));
-    IWICBitmapSource* source = frame.get();
+    IWICBitmapSource* source = image.frame.get();
     if (longest != size) {
         if (FAILED(factory->CreateBitmapScaler(scaler.out())) ||
             FAILED(scaler->Initialize(source, width, height, WICBitmapInterpolationModeFant))) return {};
@@ -104,10 +149,10 @@ std::vector<std::uint32_t> decode(IWICImagingFactory* factory, std::string& byte
 
 } // namespace
 
-ArtworkLoader::ArtworkLoader(Store& store, HttpClient& http, HWND player)
+ArtworkLoader::ArtworkLoader(Store& store, HttpClient& http, HWND player, api_service* services)
     : coverReadyMessage(RegisterWindowMessageW(L"ml_tangerinestream.coverReady")),
       lyricsReadyMessage(RegisterWindowMessageW(L"ml_tangerinestream.lyricsReady")),
-      store_(store), http_(http), player_(player) {
+      store_(store), http_(http), player_(player), services_(services) {
     try {
         for (int i = 0; i < artworkWorkers; ++i) workers_.emplace_back([this] { load(); });
     } catch (...) {
@@ -205,7 +250,7 @@ std::string ArtworkLoader::trackArtwork(const Track& track) {
     auto cached = store_.artwork(track.server, songArtwork(track));
     if (cached.data.empty() && !track.albumId.empty())
         cached = store_.artwork(track.server, albumArtwork(store_, track));
-    if (cached.requestedMaxEdgePx < playbackCoverSize && store_.networkAvailable(track.server))
+    if (!cached.canReuseFor(playbackCoverSize) && store_.networkAvailable(track.server))
         requestTrack(track.key, true);
     return std::move(cached.data);
 }
@@ -224,13 +269,13 @@ void ArtworkLoader::stageCover(const Track& track) {
     }
 }
 
-void ArtworkLoader::loadTrack(Id key) {
+void ArtworkLoader::loadTrack(Id key, IWICImagingFactory* factory) {
     auto track = store_.track(key);
     if (!track.key || !store_.networkAvailable(track.server)) return;
     try {
-        auto data = loadArtwork(store_, http_, track.server, songArtwork(track), playbackCoverSize);
+        auto data = loadArtwork(store_, http_, factory, services_, track.server, songArtwork(track), playbackCoverSize);
         if (data.empty() && !track.albumId.empty())
-            data = loadArtwork(store_, http_, track.server, albumArtwork(store_, track), playbackCoverSize);
+            data = loadArtwork(store_, http_, factory, services_, track.server, albumArtwork(store_, track), playbackCoverSize);
         if (!data.empty()) stageCover(track);
     } catch (const std::exception&) {}
     if (!store_.lyrics(key, true) && store_.networkAvailable(track.server)) {
@@ -277,7 +322,7 @@ void ArtworkLoader::load() {
             if (background) ++backgroundLoads_;
         }
         if (track) {
-            try { loadTrack(track); } catch (const std::exception&) {}
+            try { loadTrack(track, factory.get()); } catch (const std::exception&) {}
             std::scoped_lock lock(mutex_);
             pendingTracks_.erase(track);
         } else {
@@ -285,7 +330,7 @@ void ArtworkLoader::load() {
             const Id server = request.item.target.server;
             try {
                 if (factory.get()) {
-                    auto bytes = loadArtwork(store_, http_, server, request.item, request.size);
+                    auto bytes = loadArtwork(store_, http_, factory.get(), services_, server, request.item, request.size);
                     thumbnail.pixels = decode(factory.get(), bytes, request.size);
                 }
             } catch (const std::exception&) {

@@ -19,6 +19,13 @@ class Statement;
 struct CachedArtwork {
     std::string data;
     int requestedMaxEdgePx = 0;
+    int cachedLongestEdgePx = 0; // Zero until the cached image has been measured.
+
+    bool canReuseFor(int targetEdgePx) const {
+        if (cachedLongestEdgePx >= targetEdgePx || requestedMaxEdgePx >= targetEdgePx) return true;
+        // Stop asking for larger covers once the server returns its limit. Allow one pixel for rounding.
+        return cachedLongestEdgePx > 0 && requestedMaxEdgePx - cachedLongestEdgePx > 1;
+    }
 };
 
 class Store {
@@ -38,6 +45,8 @@ public:
     int playbackPort();
     bool textCatalog();
     void saveTextCatalog(bool text);
+    int coverSize();
+    void saveCoverSize(int size);
     std::string browseOrder(BrowseKind kind);
     void saveBrowseOrder(BrowseKind kind, const std::string& value);
     bool offlineMode();
@@ -55,7 +64,8 @@ public:
     CachedArtwork artwork(Id server, const LibraryItem& item);
     bool stageCover(const Track& track, const LibraryItem& song, const LibraryItem& album);
     void activeCover(Id key);
-    void saveArtwork(Id server, const LibraryItem& item, int requestedMaxEdgePx, const std::string& data);
+    void recordCachedCoverEdge(Id server, const LibraryItem& item, int requestedMaxEdgePx, int cachedLongestEdgePx);
+    std::string saveArtwork(Id server, const LibraryItem& item, int requestedMaxEdgePx, int cachedLongestEdgePx, std::string data);
     std::optional<Lyrics> lyrics(Id key, bool fresh = false);
     void saveLyrics(Id key, const Lyrics& lyrics);
     void pin(const std::vector<Track>& tracks, bool permanent);
