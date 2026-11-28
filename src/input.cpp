@@ -12,15 +12,7 @@
 #include <vector>
 #include <Winamp/in2.h>
 
-// wa_ipc.h uses _MSC_VER to decide whether Windows has already defined intptr_t.
-#ifndef _MSC_VER
-#define _MSC_VER 1900
-#define TS_RESTORE_COMPILER
-#endif
-#include <Winamp/wa_ipc.h>
-#ifdef TS_RESTORE_COMPILER
-#undef _MSC_VER
-#endif
+#include "host_profile.hpp"
 
 namespace {
 using tangerine::InputRequest;
@@ -279,6 +271,13 @@ void about(HWND w) {
     MessageBoxW(w, TS_PRODUCT_NAME_W L" input by COOLTRAINER. Configure servers in the "
                 TS_PRODUCT_NAME_W L" Media Library view.", TS_PRODUCT_NAME_W, MB_OK);
 }
+
+void registerDescription() noexcept {
+    try {
+        tangerine::setDefaultPluginDescription(tangerine::settingsDirectory(input.hMainWindow),
+            L"input", L"in_tangerinestream.dll", L"Plays tracks from your server or cache with WACUP's audio decoders.");
+    } catch (...) {} // The Preferences subtitle is optional during input initialization.
+}
 }
 
 extern "C" __declspec(dllexport) int winampGetExtendedFileInfoW(
@@ -295,12 +294,12 @@ extern "C" __declspec(dllexport) In_Module* winampGetInModule2() {
         static wchar_t description[] = TS_PRODUCT_NAME_W L" Input v" TS_VERSION_STRING;
         input.version = IN_VER_RET;
         input.description = reinterpret_cast<char*>(description);
-        input.Init = [] { return 0; };
+        input.Init = [] { registerDescription(); return 0; };
 #else
         static char description[] = TS_PRODUCT_NAME " Input v" TS_VERSION_STRING;
         input.version = IN_VER;
         input.description = description;
-        input.Init = [] {};
+        input.Init = registerDescription;
 #endif
         input.FileExtensions = extensions;
         input.UsesOutputPlug = IN_MODULE_FLAG_USES_OUTPUT_PLUGIN;

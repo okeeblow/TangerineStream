@@ -27,6 +27,7 @@
 #include <tuple>
 
 #include "ml_sdk.hpp"
+#include "host_profile.hpp"
 
 namespace tangerine {
 namespace {
@@ -45,7 +46,6 @@ constexpr UINT_PTR viewTimer = 1;
 constexpr UINT_PTR searchTimer = 2;
 constexpr UINT_PTR splitTimer = 4;
 constexpr UINT_PTR playerSubclass = 0x7151;
-constexpr UINT getIniDirectoryW = 1335; // Winamp 5.58+
 using Clock = std::chrono::steady_clock;
 
 int init();
@@ -3124,23 +3124,6 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     return FALSE;
 }
 
-std::filesystem::path settingsDirectory() {
-    auto wideDirectory = reinterpret_cast<const wchar_t*>(player(getIniDirectoryW));
-    if (reinterpret_cast<UINT_PTR>(wideDirectory) > 1 && *wideDirectory)
-        return std::filesystem::path(wideDirectory);
-    auto iniDirectory = reinterpret_cast<const char*>(player(IPC_GETINIDIRECTORY));
-    if (reinterpret_cast<UINT_PTR>(iniDirectory) > 1 && *iniDirectory) {
-        int size = MultiByteToWideChar(CP_ACP, 0, iniDirectory, -1, nullptr, 0);
-        if (size > 1) {
-            std::wstring directory(size, L'\0');
-            MultiByteToWideChar(CP_ACP, 0, iniDirectory, -1, directory.data(), size);
-            directory.pop_back();
-            return std::filesystem::path(directory);
-        }
-    }
-    throw Error("WACUP did not provide its profile directory.");
-}
-
 UINT_PTR addTreeItem(std::wstring label, std::wstring invariant, UINT_PTR parent, bool branch) {
     NAVINSERTSTRUCT insert{};
     insert.hParent = parent ? MLNavCtrl_FindItemById(plugin.hwndLibraryParent, parent) : nullptr;
@@ -3229,7 +3212,8 @@ int init() {
         closingInput = false;
         INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
         if (!InitCommonControlsEx(&controls)) throw Error("Windows could not initialize Media Library controls.");
-        const auto settings = settingsDirectory();
+        const auto settings = settingsDirectory(plugin.hwndWinampParent);
+        if (settings.empty()) throw Error("WACUP did not provide its profile directory.");
         const auto services = static_cast<UINT_PTR>(player(IPC_GET_API_SERVICE));
         app = std::make_unique<App>(settings / L"Plugins" / pluginName,
                                     services > 1 ? reinterpret_cast<api_service*>(services) : nullptr);
@@ -3240,14 +3224,8 @@ int init() {
             throw Error("WACUP playback tracking could not start.");
         app->treeId = addTreeItem(pluginName, pluginName, 0, true);
         refreshNavigation();
-        // WACUP reads the second line of its Preferences row from this per-profile catalog.
-        const auto descriptions = settings / L"plugin_descriptions.ini";
-        wchar_t existing[256]{};
-        GetPrivateProfileStringW(L"library", L"ml_tangerinestream.dll", L"", existing,
-                                 static_cast<DWORD>(std::size(existing)), descriptions.c_str());
-        if (!*existing)
-            WritePrivateProfileStringW(L"library", L"ml_tangerinestream.dll",
-                L"Navidrome and OpenSubsonic browsing by COOLTRAINER", descriptions.c_str());
+        setDefaultPluginDescription(settings, L"library", L"ml_tangerinestream.dll",
+                                    L"Navidrome and OpenSubsonic browsing by COOLTRAINER");
         { std::unique_lock lock(inputMutex); inputProfile = app.get(); }
         return 0;
     } catch (const std::exception& error) {
