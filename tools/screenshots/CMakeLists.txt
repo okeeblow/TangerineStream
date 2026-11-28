@@ -4,7 +4,7 @@ hunter_private_data(
     SHA1 4da8f9964b05a3fd13f7ad2588b667547ac74a68
     LOCATION httplib_source
 )
-add_executable(imposter-navidrome imposter-navidrome.cpp export.cpp fixture.cpp "${PROJECT_SOURCE_DIR}/src/server.cpp")
+add_executable(imposter-navidrome imposter-navidrome.cpp export.cpp fixture.cpp "${PROJECT_SOURCE_DIR}/src/network/server.cpp")
 target_include_directories(imposter-navidrome PRIVATE "${PROJECT_SOURCE_DIR}/src" "${PROJECT_BINARY_DIR}/generated")
 target_include_directories(imposter-navidrome SYSTEM PRIVATE "${httplib_source}")
 target_link_libraries(imposter-navidrome PRIVATE simdjson::simdjson uriparser::uriparser tangerine_migrations winhttp ws2_32 crypt32 bcrypt)

@@ -1,5 +1,5 @@
 #pragma once
-#include "server.hpp"
+#include "network/server.hpp"
 #include <sqlite3.h>
 #include <simdjson.h>
 #include <filesystem>

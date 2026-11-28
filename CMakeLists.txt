@@ -114,7 +114,7 @@ function(add_wacup_plugin target)
     set_target_properties(${target} PROPERTIES PREFIX "")
     target_compile_features(${target} PRIVATE cxx_std_17)
     target_compile_definitions(${target} PRIVATE WINVER=0x0601 _WIN32_WINNT=0x0601 UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_include_directories(${target} SYSTEM PRIVATE "${sdk_directory}")
     if(MINGW)
         target_link_options(${target} PRIVATE -static -static-libgcc -static-libstdc++)
@@ -128,18 +128,24 @@ function(add_wacup_plugin target)
     endif()
 endfunction()
 
-set_property(SOURCE src/input.rc src/plugin.rc APPEND PROPERTY OBJECT_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/tangerine.ico"
+set_property(SOURCE src/resources/input.rc src/resources/plugin.rc APPEND PROPERTY OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/tangerine.ico"
     "${CMAKE_CURRENT_BINARY_DIR}/generated/tangerine_product.h")
-add_wacup_plugin(in_tangerinestream src/input.cpp src/progressive_input.cpp src/host_player.cpp src/input.rc)
+set(host_player_sources src/host/host_player.cpp src/host/legacy/player.cpp)
+add_wacup_plugin(in_tangerinestream
+    src/playback/input.cpp src/playback/progressive_input.cpp
+    ${host_player_sources} src/host/legacy/input_abi.cpp src/resources/input.rc)
 target_compile_definitions(in_tangerinestream PRIVATE UNICODE_INPUT_PLUGIN)
 target_link_libraries(in_tangerinestream PRIVATE user32)
 
 add_wacup_plugin(ml_tangerinestream
-    src/plugin.cpp src/list_scroll.cpp src/server.cpp src/store.cpp src/playback.cpp src/artwork.cpp src/browse_sort.cpp
-    src/library_view.cpp src/view_editor.cpp
-    src/host_metadata.cpp src/host_player.cpp src/host_library.cpp src/legacy_skin.cpp src/plugin.rc)
-add_library(tangerine_migrations STATIC src/migrations.cpp)
+    src/library/plugin.cpp src/library/browse_sort.cpp src/library/library_view.cpp
+    src/ui/list_scroll.cpp src/ui/view_editor.cpp
+    src/network/server.cpp src/storage/store.cpp src/playback/playback.cpp src/media/artwork.cpp
+    src/host/host_metadata.cpp ${host_player_sources} src/host/host_library.cpp
+    src/host/legacy/library.cpp src/host/legacy/skin.cpp src/resources/plugin.rc)
+add_library(tangerine_migrations STATIC src/storage/migrations.cpp)
+target_include_directories(tangerine_migrations PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_features(tangerine_migrations PRIVATE cxx_std_17)
 target_link_libraries(tangerine_migrations PUBLIC tangerine_sqlite)
 if(MSVC)

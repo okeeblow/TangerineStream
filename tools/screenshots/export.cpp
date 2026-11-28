@@ -1,5 +1,5 @@
 #include "demo.hpp"
-#include "migrations.hpp"
+#include "storage/migrations.hpp"
 #include <algorithm>
 #include <cctype>
 #include <set>

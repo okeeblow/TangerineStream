@@ -1,0 +1,31 @@
+#include <windows.h>
+#include "resources/resources.h"
+#include "tangerine_product.h"
+
+IDI_TANGERINE ICON "tangerine.ico"
+
+1 VERSIONINFO
+FILEVERSION TS_VERSION_TUPLE
+PRODUCTVERSION TS_VERSION_TUPLE
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_DLL
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "COOLTRAINER"
+            VALUE "FileDescription", TS_INPUT_FILE_DESCRIPTION
+            VALUE "FileVersion", TS_VERSION_STRING
+            VALUE "InternalName", "in_tangerinestream"
+            VALUE "OriginalFilename", "in_tangerinestream.dll"
+            VALUE "ProductName", TS_PRODUCT_NAME
+            VALUE "ProductVersion", TS_VERSION_STRING
+            VALUE "Comments", "By COOLTRAINER"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
