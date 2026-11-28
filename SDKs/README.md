@@ -13,6 +13,8 @@ The Winamp SDK files retain their original notices and line endings. The SHA-256
 
 The SHA-256 of `winamp290-mlsdk.zip` is `2f8cc4fc43071b06ee3533d014336bf748ccd48ad1ac7c701a2469fbb832f058`.
 
+Tangerine Stream supplies the [2.90 navigation compatibility header](Winamp-2.90/gen_ml/ml_ipc_0313.h) alongside the original SDK. It maps a subset of the later C++ navigation API onto the tree messages in 2.90's `ml.h`. A plug-in can append rows, look up their IDs, read or change the selection, and delete its branches. Use the helpers on the Media Library UI thread for the lifetime of those rows. The old tree displays titles in the Windows ANSI code page and has no storage for invariant names. For list skinning, use 2.90's `ML_IPC_SKIN_LISTVIEW` and `ML_IPC_UNSKIN_LISTVIEW`.
+
 The SHA-256 of `wasabi-sdk_build488.exe` is `4117051c3271cbe3600aeeb239e94b7a772e99a1c61ddcd352cec9ca616893e2`. A copy of the [Mozilla Public License 1.1](https://www.mozilla.org/MPL/1.1/) accompanies the SDK's Expat source.
 
 Set `WACUP_SDK_HOME` to select a Winamp SDK directory for a build. The Media Library plug-in uses the legacy Media Library ABI. The build includes the bundled 5.55 Wasabi and Agave service headers because the 5.666 package omits them.
