@@ -350,6 +350,7 @@ $controls=[IO.File]::ReadAllText((Join-Path $tools 'WindowControls.cs'))
 $capture=@'
 public sealed partial class CaptureWindows {
     [DllImport("user32.dll",SetLastError=true)] static extern bool PrintWindow(IntPtr window,IntPtr dc,uint flags);
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr window,uint attribute,out Bounds bounds,int size);
     public Bitmap Print(IntPtr h) {
         var size=Rect(h).Size;
         if (size.Width<1 || size.Height<1 || size.Width>6000 || size.Height>6000) throw new InvalidOperationException("Invalid window dimensions.");
@@ -362,6 +363,36 @@ public sealed partial class CaptureWindows {
             }
             return image;
         } catch {image.Dispose();throw;}
+    }
+    public string DialogBounds {get;private set;}
+    static bool EmptyFrameEdge(Bitmap image,int x,int y,int dx,int dy,int length) {
+        for(int i=0;i<length;i++,x+=dx,y+=dy)
+            if(image.GetPixel(x,y).ToArgb()!=Color.Black.ToArgb()) return false;
+        return length>0;
+    }
+    public Bitmap PrintDialog(IntPtr window) {
+        var outer=Rect(window);
+        Bounds client,visual;
+        if(!GetClientRect(window,out client)) throw new Win32Exception();
+        MapWindowPoints(window,IntPtr.Zero,ref client,2);
+        var frame=outer;
+        if(DwmGetWindowAttribute(window,9,out visual,Marshal.SizeOf(typeof(Bounds)))==0) {
+            var painted=Rectangle.Intersect(outer,Rectangle.FromLTRB(visual.left,visual.top,visual.right,visual.bottom));
+            if(!painted.IsEmpty) frame=painted;
+        }
+        var source=Rectangle.FromLTRB(frame.Left-outer.Left,frame.Top-outer.Top,frame.Right-outer.Left,frame.Bottom-outer.Top);
+        // Some private desktops report the entire resize frame to DWM. PrintWindow leaves
+        // its side and bottom gutters black. Inspect only the nonclient margins Windows owns.
+        using(var pixels=Print(window)) {
+            int left=source.Left,right=source.Right,bottom=source.Bottom;
+            int y=client.top-outer.Top,height=client.bottom-client.top;
+            while(left<client.left-outer.Left && EmptyFrameEdge(pixels,left,y,0,1,height)) left++;
+            while(right>client.right-outer.Left && EmptyFrameEdge(pixels,right-1,y,0,1,height)) right--;
+            while(bottom>client.bottom-outer.Top && EmptyFrameEdge(pixels,left,bottom-1,1,0,right-left)) bottom--;
+            var visible=Rectangle.FromLTRB(left,source.Top,right,bottom);
+            DialogBounds="window "+outer.Size+", DWM "+frame.Size+", captured "+visible;
+            return pixels.Clone(visible,pixels.PixelFormat);
+        }
     }
     // The Classic Modern skin defines a 62px thumb on a track starting at x=19
     // with a 17px right margin. Locate the light handle on the dark groove in PrintWindow.
@@ -721,10 +752,10 @@ function Save-Shot($name,$only=[IntPtr]::Zero,$focusField=$tree,[switch]$stopped
     }
     $ui.CheckFocus($focusFrame,$focusField)
     if ($only -ne [IntPtr]::Zero) {
-        $dialog=$ui.Print($only)
+        $dialog=$ui.PrintDialog($only)
         try {
             $dialog.Save((Join-Path $shots ($name+'.png')),[Drawing.Imaging.ImageFormat]::Png)
-            Write-Log "Captured $name ($($dialog.Width) x $($dialog.Height)) $playbackStatus"
+            Write-Log "Captured $name ($($ui.DialogBounds)) $playbackStatus"
         } finally {$dialog.Dispose()}
         return
     }
