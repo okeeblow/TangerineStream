@@ -20,7 +20,7 @@ Open **Tangerine Stream** in the Media Library and click **Add server**. Enter y
 
 To add another server or change streaming quality, open **Preferences → Plug-ins → Media Library**, select **Tangerine Stream**, and click **Configure**. **Unify Libraries** combines servers in one library tree. Each server has its own quality settings. Metered connections default to MP3 at up to 192 kbps. Unmetered connections let the server choose.
 
-Cached tracks start immediately. Tangerine Stream downloads an uncached track before WACUP starts playing it, so a large FLAC can take a while on a slow connection. Skipping cancels the download. When a track does not qualify for caching, its temporary copy is deleted after playback.
+Cached tracks start immediately. FLAC and MP3 can start during the download when the enabled WACUP decoder supports Extended Read. If playback catches up with the download, it waits for more audio and resumes at the same frame. Other decoders open the completed file. The same download supplies the cache. Skipping cancels a transfer still in progress. Temporary copies are deleted after playback.
 
 ## Change the library view
 

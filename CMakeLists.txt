@@ -11,7 +11,7 @@ HunterGate(
     SHA1 6498c5d0dec25d7fffb2b0574ebaf265179b894d
     LOCAL
 )
-project(ml_tangerinestream VERSION 0.7.2 LANGUAGES C CXX RC)
+project(ml_tangerinestream VERSION 0.7.3 LANGUAGES C CXX RC)
 set(TANGERINE_PRODUCT_NAME "Tangerine Stream")
 # Windows VERSIONINFO requires four components.
 string(REPLACE "." ";" version_components "${PROJECT_VERSION};0;0;0")
@@ -130,7 +130,7 @@ endfunction()
 set_property(SOURCE src/input.rc src/plugin.rc APPEND PROPERTY OBJECT_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/tangerine.ico"
     "${CMAKE_CURRENT_BINARY_DIR}/generated/tangerine_product.h")
-add_wacup_plugin(in_tangerinestream src/input.cpp src/input.rc)
+add_wacup_plugin(in_tangerinestream src/input.cpp src/progressive_input.cpp src/input.rc)
 target_compile_definitions(in_tangerinestream PRIVATE UNICODE_INPUT_PLUGIN)
 target_link_libraries(in_tangerinestream PRIVATE user32)
 
@@ -140,9 +140,11 @@ add_wacup_plugin(ml_tangerinestream
     src/host_metadata.cpp src/plugin.rc)
 include(cmake/Migrations.cmake)
 embed_migrations(ml_tangerinestream)
-# The 5.666 package omits the Wasabi art and metadata service headers.
-target_include_directories(ml_tangerinestream SYSTEM PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Wasabi"
-    "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Agave")
+# The 5.666 package omits the Wasabi service headers.
+foreach(target IN ITEMS in_tangerinestream ml_tangerinestream)
+    target_include_directories(${target} SYSTEM PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Wasabi"
+        "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Agave")
+endforeach()
 target_link_libraries(ml_tangerinestream PRIVATE
     date::date simdjson::simdjson uriparser::uriparser tangerine_sqlite comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)

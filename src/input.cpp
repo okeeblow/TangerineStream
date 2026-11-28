@@ -1,4 +1,5 @@
 #include "input_bridge.hpp"
+#include "progressive_input.hpp"
 #include "tangerine_product.h"
 #include <algorithm>
 #include <array>
@@ -19,6 +20,7 @@ using tangerine::InputRequest;
 In_Module input{};
 std::mutex nameMutex;
 std::wstring current;
+std::weak_ptr<tangerine::ProgressiveInput> metadataPlayer;
 int duration = -1;
 In_Module* nativePlayer = nullptr;
 Out_Module* previousOutput = nullptr;
@@ -45,18 +47,19 @@ struct Download {
     unsigned excluded;
     UINT_PTR serial;
     HANDLE cancel = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::shared_ptr<tangerine::ProgressiveInput> player;
     ~Download() { if (cancel) CloseHandle(cancel); }
 };
 std::mutex downloadMutex;
 std::condition_variable downloadReady;
 std::shared_ptr<Download> loading, queued;
+std::shared_ptr<tangerine::ProgressiveInput> progressive;
 std::unique_ptr<AudioFile> completed;
 std::thread downloader;
 bool shuttingDown = false;
 UINT_PTR serial = 0;
 HWND receiver = nullptr;
 constexpr wchar_t receiverClass[] = L"TangerineStream.InputPlayback";
-constexpr UINT fileReadyMessage = WM_APP + 1;
 
 In_Module* selectInput(const wchar_t* source) {
     auto* module = reinterpret_cast<In_Module*>(SendMessageW(input.hMainWindow, WM_WA_IPC,
@@ -72,7 +75,7 @@ int query(InputRequest op, const wchar_t* filename, const wchar_t* field = nullp
     if (!marker && name.substr(0, 17) != L"http://127.0.0.1:") return 0;
     HMODULE library = nullptr;
     if (!GetModuleHandleExW(0, L"ml_tangerinestream.dll", &library)) return 0;
-    auto address = reinterpret_cast<void*>(GetProcAddress(library, "tangerineInputQueryV3"));
+    auto address = reinterpret_cast<void*>(GetProcAddress(library, "tangerineInputQueryV4"));
     auto fn = reinterpret_cast<tangerine::InputQuery>(address);
     int result = fn ? fn(op, filename, field, value, capacity, file, attempts) : 0;
     FreeLibrary(library);
@@ -99,13 +102,15 @@ void getFileInfo(const wchar_t* filename, wchar_t* title, int* length) {
 }
 
 void stop() {
+    std::unique_ptr<AudioFile> downloaded;
     {
         std::scoped_lock lock(downloadMutex);
         if (loading) SetEvent(loading->cancel);
         loading.reset();
         queued.reset();
-        completed.reset();
+        downloaded = std::move(completed);
     }
+    if (progressive) { progressive->stop(); progressive.reset(); }
     if (nativePlayer) {
         nativePlayer->Stop();
         nativePlayer->outMod = previousOutput;
@@ -117,6 +122,7 @@ void stop() {
     {
         std::scoped_lock lock(nameMutex);
         finished.swap(current);
+        metadataPlayer.reset();
     }
     query(InputRequest::ended, finished.c_str());
     input.is_seekable = 0;
@@ -164,13 +170,16 @@ void downloadLoop() {
             file = std::make_unique<AudioFile>();
             file->attempts.excluded = job->excluded;
             file->attempts.cancel = job->cancel;
+            file->attempts.progress = {job->player.get(), [](void* context, const wchar_t* path, LONGLONG bytes, LONGLONG total) {
+                static_cast<tangerine::ProgressiveInput*>(context)->update(path, bytes, total);
+            }};
             if (query(InputRequest::fetch, job->filename.c_str(), nullptr, file->path.data(), file->path.size(),
                       &file->lease, &file->attempts) != tangerine::fileReady) file.reset();
         } catch (...) { file.reset(); }
         std::scoped_lock lock(downloadMutex);
         if (loading == job) {
             completed = std::move(file);
-            PostMessageW(receiver, fileReadyMessage, job->serial, 0);
+            job->player->finish(completed ? completed->path.data() : nullptr);
         }
     }
 }
@@ -189,7 +198,11 @@ bool startFile(std::unique_ptr<AudioFile>& file) {
 
 bool queueDownload(const std::wstring& filename, unsigned excluded);
 LRESULT CALLBACK receiverProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
-    if (msg != fileReadyMessage) return DefWindowProcW(hwnd, msg, w, l);
+    if (msg == tangerine::ProgressiveInput::configure) {
+        if (progressive && w == serial) progressive->configureOutput(volume, pan);
+        return 0;
+    }
+    if (msg != tangerine::ProgressiveInput::finished) return DefWindowProcW(hwnd, msg, w, l);
     std::unique_ptr<AudioFile> file;
     std::shared_ptr<Download> job;
     {
@@ -199,7 +212,14 @@ LRESULT CALLBACK receiverProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         file = std::move(completed);
     }
     try {
-        if (file) {
+        if (l && file) {
+            if (progressive->outputOpen()) pendingSeek = progressive->position();
+            progressive->stop();
+            progressive.reset();
+            {
+                std::scoped_lock lock(nameMutex);
+                metadataPlayer.reset();
+            }
             if (startFile(file)) return 0;
             if (file->attempts.excluded != job->excluded && queueDownload(job->filename, file->attempts.excluded))
                 return 0;
@@ -225,6 +245,15 @@ bool queueDownload(const std::wstring& filename, unsigned excluded) {
     job->filename = filename;
     job->excluded = excluded;
     job->serial = ++serial;
+    job->player = std::make_shared<tangerine::ProgressiveInput>(input, selectInput, receiver, serial, duration);
+    job->player->pause(paused);
+    if (pendingSeek >= 0) job->player->seek(pendingSeek);
+    job->player->start();
+    progressive = job->player;
+    {
+        std::scoped_lock lock(nameMutex);
+        metadataPlayer = progressive;
+    }
     {
         std::scoped_lock lock(downloadMutex);
         if (!downloader.joinable()) downloader = std::thread(downloadLoop);
@@ -282,6 +311,14 @@ void registerDescription() noexcept {
 
 extern "C" __declspec(dllexport) int winampGetExtendedFileInfoW(
     const wchar_t* filename, const char* field, wchar_t* output, int capacity) {
+    if (field && output && capacity > 0 && !_strnicmp(field, "replaygain_", 11)) {
+        std::shared_ptr<tangerine::ProgressiveInput> player;
+        {
+            std::scoped_lock lock(nameMutex);
+            if (!filename || !*filename || !_wcsicmp(filename, current.c_str())) player = metadataPlayer.lock();
+        }
+        if (player && player->gainTag(field, output, capacity)) return 1;
+    }
     wchar_t tag[80]{};
     if (!field || !MultiByteToWideChar(CP_ACP, 0, field, -1, tag, 80)) return 0;
     return metadata(filename, tag, output, capacity);
@@ -310,19 +347,27 @@ extern "C" __declspec(dllexport) In_Module* winampGetInModule2() {
         input.IsOurFile = [](const wchar_t* file) { return query(InputRequest::recognize, file); };
         input.Play = play;
         input.Stop = stop;
-        input.Pause = [] { paused = true; if (nativePlayer) nativePlayer->Pause(); };
-        input.UnPause = [] { paused = false; if (nativePlayer) nativePlayer->UnPause(); };
+        input.Pause = [] { paused = true; if (nativePlayer) nativePlayer->Pause(); else if (progressive) progressive->pause(true); };
+        input.UnPause = [] { paused = false; if (nativePlayer) nativePlayer->UnPause(); else if (progressive) progressive->pause(false); };
         input.IsPaused = [] { return nativePlayer ? nativePlayer->IsPaused() : int(paused); };
         input.GetLength = [] {
             return duration >= 0 || !nativePlayer ? duration : nativePlayer->GetLength();
         };
-        input.GetOutputTime = [] { return nativePlayer ? nativePlayer->GetOutputTime() : std::max(0, pendingSeek); };
+        input.GetOutputTime = [] { return nativePlayer ? nativePlayer->GetOutputTime() : progressive ? progressive->position() : std::max(0, pendingSeek); };
         input.SetOutputTime = [](int ms) {
             if (ms >= 0 && nativePlayer && nativePlayer->is_seekable) nativePlayer->SetOutputTime(ms);
-            else if (ms >= 0 && !nativePlayer) pendingSeek = ms;
+            else if (ms >= 0 && !nativePlayer) { pendingSeek = ms; if (progressive) progressive->seek(ms); }
         };
-        input.SetVolume = [](int level) { if (level >= 0) volume = level; if (nativePlayer) nativePlayer->SetVolume(level); };
-        input.SetPan = [](int level) { pan = level; if (nativePlayer) nativePlayer->SetPan(level); };
+        input.SetVolume = [](int level) {
+            if (level >= 0) volume = level;
+            if (nativePlayer) nativePlayer->SetVolume(level);
+            else if (progressive && progressive->outputOpen()) input.outMod->SetVolume(level);
+        };
+        input.SetPan = [](int level) {
+            pan = level;
+            if (nativePlayer) nativePlayer->SetPan(level);
+            else if (progressive && progressive->outputOpen()) input.outMod->SetPan(level);
+        };
         input.EQSet = [](int on, char bands[10], int preamp) {
             if (bands) {
                 equalizerEnabled = on;

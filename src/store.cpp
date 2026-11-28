@@ -955,7 +955,7 @@ void Store::reconcile() {
     for (const auto& entry : std::filesystem::directory_iterator(cache_)) {
         auto extension = entry.path().extension();
         auto stem = entry.path().stem().string();
-        if (stem.size() == 37 && stem.compare(0, 5, "play-") == 0 &&
+        if (stem.size() == 37 && (stem.compare(0, 5, "play-") == 0 || stem.compare(0, 5, "read-") == 0) &&
             stem.find_first_not_of("0123456789abcdef", 5) == std::string::npos) {
             DeleteFileW(entry.path().c_str());
             continue;

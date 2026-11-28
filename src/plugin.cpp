@@ -473,7 +473,7 @@ int inputQuery(InputRequest request, const wchar_t* filename, const wchar_t* fie
             try {
                 const auto profile = owner->store.server(track.server);
                 *lease = prepareAudio(owner->store, owner->http, track, profile, owner->inputs(),
-                                     attempts->excluded, cancelled, file, attempts->temporary);
+                                     attempts->excluded, cancelled, file, attempts->temporary, attempts->progress);
             } catch (const std::exception& error) {
                 if (!cancelled()) owner->playbackError(track.server, std::string("Playback: ") + error.what());
                 return unavailable;
@@ -3280,7 +3280,7 @@ extern "C" __declspec(dllexport) winampMediaLibraryPlugin* winampGetMediaLibrary
     return &tangerine::plugin;
 }
 
-extern "C" __declspec(dllexport) int __cdecl tangerineInputQueryV3(
+extern "C" __declspec(dllexport) int __cdecl tangerineInputQueryV4(
     tangerine::InputRequest request, const wchar_t* filename, const wchar_t* field,
     wchar_t* dest, size_t capacity, HANDLE* lease, tangerine::SourceAttempts* attempts) {
     try { return tangerine::inputQuery(request, filename, field, dest, capacity, lease, attempts); }

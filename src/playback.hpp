@@ -1,6 +1,7 @@
 #pragma once
 
 #include "server.hpp"
+#include "input_bridge.hpp"
 #include "store.hpp"
 #include <atomic>
 #include <functional>
@@ -22,7 +23,7 @@ private:
 bool meteredInternet();
 HANDLE prepareAudio(Store& store, HttpClient& http, const Track& track, const Server& profile,
                     const InputExtensions& inputs, unsigned& excluded, const std::function<bool()>& cancelled,
-                    std::filesystem::path& path, bool& temporary);
+                    std::filesystem::path& path, bool& temporary, PlaybackProgress progress);
 void downloadAudio(Store& store, HttpClient& http, const Track& track, const Server& profile, ServerApi& api,
                    bool metered, const std::atomic_bool& stopping, const InputExtensions& inputs,
                    unsigned excluded = 0, bool (*currentCost)() = meteredInternet);

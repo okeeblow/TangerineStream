@@ -18,6 +18,7 @@ public:
     File& operator=(const File&) = delete;
     explicit operator bool() const { return handle_ != INVALID_HANDLE_VALUE; }
     HANDLE get() const { return handle_; }
+    void reset(HANDLE handle) { close(); handle_ = handle; }
     void close() {
         if (*this) CloseHandle(handle_);
         handle_ = INVALID_HANDLE_VALUE;
@@ -61,20 +62,25 @@ void checkAudioResponse(Response& response, AudioStream& stream, const InputExte
 
 class PlaybackDownload {
 public:
-    PlaybackDownload(Store& store, Id key) : store_(store), key_(key),
-        path_(store.partialPath(key).parent_path() / (L"play-" + wide(randomHex()) + L".part")),
-        file_(CreateFileW(path_.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr)) {
-        if (!file_) throw Error("Could not create a playback file.");
-    }
+    PlaybackDownload(Store& store, Id key, PlaybackProgress progress) : store_(store), key_(key), progress_(progress) {}
     ~PlaybackDownload() {
+        retire();
         file_.close();
         if (!path_.empty()) DeleteFileW(path_.c_str());
         if (reserved_) store_.release(key_);
     }
-    void start(std::int64_t length, bool retain) {
-        LARGE_INTEGER zero{};
-        if (!SetFilePointerEx(file_.get(), zero, nullptr, FILE_BEGIN) || !SetEndOfFile(file_.get()))
-            throw Error("Could not restart the playback download.");
+    void start(std::int64_t length, bool retain, const std::string& suffix) {
+        if (suffix.empty() || suffix.size() > 12 ||
+            suffix.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != suffix.npos)
+            throw Error("Invalid audio file extension.");
+        retire();
+        file_.close();
+        if (!path_.empty()) DeleteFileW(path_.c_str());
+        path_ = store_.partialPath(key_).parent_path() / (L"play-" + wide(randomHex()) + L"." + wide(suffix));
+        file_.reset(CreateFileW(path_.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                                CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (!file_) throw Error("Could not create a playback file.");
+        total_ = length;
         bytes = 0;
         if (retain && !reserved_) reserved_ = store_.reserve(key_, length, false);
         reservedBytes_ = std::max<std::int64_t>(0, length);
@@ -89,8 +95,13 @@ public:
         if (!WriteFile(file_.get(), data, size, &written, nullptr) || written != size)
             throw Error("Could not write the playback file. Check the free disk space.");
         bytes += written;
+        if (progress_.update && bytes - published_ >= 16 * 1024) {
+            published_ = bytes;
+            progress_.update(progress_.context, path_.c_str(), bytes, total_);
+        }
     }
-    HANDLE finish(const Track& track, const std::string& format, std::filesystem::path& result, bool& temporary) {
+    HANDLE finish(const std::string& format, std::filesystem::path& result, bool& temporary) {
+        retire();
         file_.close();
         HANDLE lease = INVALID_HANDLE_VALUE;
         result = path_;
@@ -98,13 +109,6 @@ public:
             path_.clear();
             temporary = false;
         } else {
-            const auto& suffix = format.empty() ? track.suffix : format;
-            if (suffix.empty() || suffix.size() > 12 ||
-                suffix.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != suffix.npos)
-                throw Error("Invalid audio file extension.");
-            result.replace_extension(wide(suffix));
-            if (!MoveFileW(path_.c_str(), result.c_str())) throw Error("Could not name the playback file.");
-            path_ = result;
             lease = CreateFileW(result.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
             temporary = true;
             if (lease != INVALID_HANDLE_VALUE) path_.clear();
@@ -114,9 +118,15 @@ public:
     }
     std::int64_t bytes = 0;
 private:
+    void retire() {
+        if (published_) progress_.update(progress_.context, nullptr, 0, 0);
+        published_ = 0;
+    }
     void discardReservation() { store_.release(key_); reserved_ = false; }
     Store& store_;
     Id key_;
+    PlaybackProgress progress_;
+    std::int64_t published_ = 0, total_ = -1;
     std::filesystem::path path_;
     File file_;
     std::int64_t reservedBytes_ = 0;
@@ -254,7 +264,7 @@ bool meteredInternet() {
 
 HANDLE prepareAudio(Store& store, HttpClient& http, const Track& track, const Server& profile,
                     const InputExtensions& inputs, unsigned& excluded, const std::function<bool()>& cancelled,
-                    std::filesystem::path& path, bool& temporary) {
+                    std::filesystem::path& path, bool& temporary, PlaybackProgress progress) {
     auto api = http.connect(profile);
     for (;;) {
         if (cancelled()) throw Error("Playback cancelled.");
@@ -277,7 +287,7 @@ HANDLE prepareAudio(Store& store, HttpClient& http, const Track& track, const Se
         };
         auto stream = api->stream(track, quality, inputs, excluded);
         excluded |= stream.choice;
-        PlaybackDownload file(store, track.key);
+        PlaybackDownload file(store, track.key, progress);
         std::int64_t total = -1;
         std::string version;
         for (int attempt = 0; continueTransfer(); ++attempt) {
@@ -301,7 +311,7 @@ HANDLE prepareAudio(Store& store, HttpClient& http, const Track& track, const Se
                 } else {
                     total = length;
                     version = stream.choice == originalSource ? validator(response) : std::string{};
-                    file.start(total, retain);
+                    file.start(total, retain, stream.format.empty() ? track.suffix : stream.format);
                 }
                 char buffer[64 * 1024];
                 while (auto count = response.read(buffer, sizeof(buffer))) {
@@ -312,7 +322,7 @@ HANDLE prepareAudio(Store& store, HttpClient& http, const Track& track, const Se
                 if (!continueTransfer()) break;
                 if (!file.bytes || (total >= 0 && file.bytes != total))
                     throw ConnectionError("The audio download ended early.");
-                return file.finish(track, stream.format, path, temporary);
+                return file.finish(stream.format, path, temporary);
             } catch (const ConnectionError&) {
                 if (attempt >= 2) throw;
             }
