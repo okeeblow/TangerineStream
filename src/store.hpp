@@ -44,7 +44,8 @@ public:
     std::string playbackSecret();
     int playbackPort();
     bool textCatalog();
-    void saveTextCatalog(bool text);
+    SortTags viewSettings(BrowseKind kind);
+    void saveViewSettings(BrowseKind kind, const SortTags& values);
     int coverSize();
     void saveCoverSize(int size);
     std::string browseOrder(BrowseKind kind);

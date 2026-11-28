@@ -3,6 +3,7 @@
 #include "dpi.hpp"
 #include "artwork.hpp"
 #include "browse_sort.hpp"
+#include "view_editor.hpp"
 #include "host_metadata.hpp"
 #include "resources.h"
 #include "tangerine_product.h"
@@ -18,6 +19,7 @@
 #include <condition_variable>
 #include <deque>
 #include <future>
+#include <functional>
 #include <iterator>
 #include <optional>
 #include <set>
@@ -35,9 +37,13 @@ constexpr auto profilesChanged = WM_APP + 2;
 constexpr auto moreRequested = WM_APP + 4;
 constexpr auto selectionChanged = WM_APP + 5;
 constexpr auto artworkViewportChanged = WM_APP + 6;
+constexpr auto detailsReady = WM_APP + 7;
+constexpr auto filtersChanged = WM_APP + 8;
+constexpr auto populateTiles = WM_APP + 9;
 constexpr UINT_PTR playbackTimer = 0x7151;
 constexpr UINT_PTR viewTimer = 1;
 constexpr UINT_PTR searchTimer = 2;
+constexpr UINT_PTR splitTimer = 4;
 constexpr UINT_PTR playerSubclass = 0x7151;
 constexpr UINT getIniDirectoryW = 1335; // Winamp 5.58+
 using Clock = std::chrono::steady_clock;
@@ -158,6 +164,15 @@ struct SearchResult {
     double seconds = 0;
 };
 
+struct ViewDetails {
+    ViewProjection projection;
+    std::vector<Track> preview;
+    std::optional<std::map<Id, std::string>> cacheChanges;
+    std::string error;
+    bool albumPreview = false;
+};
+using ViewTask = std::function<ViewDetails(const std::function<bool()>&)>;
+
 struct Playing {
     Track track;
     int playlistPosition = -1;
@@ -214,10 +229,26 @@ public:
         result.reset();
         return ready;
     }
+    void submitDetails(HWND view, ViewTask task) {
+        {
+            std::scoped_lock lock(searchMutex);
+            ++detailsSerial;
+            detailsView = view;
+            detailsTask = std::move(task);
+            details.reset();
+        }
+        searchReady.notify_one();
+    }
+    std::optional<ViewDetails> takeDetails(HWND view) {
+        std::scoped_lock lock(searchMutex);
+        if (view != detailsView) return {};
+        return std::exchange(details, {});
+    }
     void cancelSearch(HWND view) {
         std::scoped_lock lock(searchMutex);
         if (activeView != view) return;
         ++serial;
+        clearDetails();
         request.reset();
         result.reset();
     }
@@ -226,6 +257,7 @@ public:
         if (activeView != view) return;
         activeView = nullptr;
         ++serial;
+        clearDetails();
         request.reset();
         result.reset();
     }
@@ -254,6 +286,8 @@ public:
     void sample(Id startedKey = 0);
     void sendAlbums(std::vector<BrowseLocation> albums, AlbumAction action, mlDropItemStruct drop = {});
     void finishAlbums();
+    void sendTrackRecords(const std::vector<Track>& tracks, AlbumAction action, mlDropItemStruct drop);
+    std::vector<Track> albumTracks(Id server, const BrowseLocation& album, bool downloadedOnly = true);
     void preparePlayback(const Track& track, const wchar_t* filename);
     void cachePlaying(Id key, unsigned excluded);
     void refreshInputs() {
@@ -301,13 +335,17 @@ public:
     std::string reportError;
 
 private:
-    std::vector<Track> albumTracks(Id server, const BrowseLocation& album);
     std::deque<AlbumJob> albumJobs;
     std::atomic_bool stopping{false};
     std::thread browser, maintenance, reporter;
     std::mutex searchMutex, maintenanceMutex;
     std::condition_variable searchReady, maintenanceReady, reportsReady;
     std::uint64_t serial = 0;
+    std::uint64_t detailsSerial = 0;
+    HWND detailsView = nullptr;
+    ViewTask detailsTask;
+    std::optional<ViewDetails> details;
+    void clearDetails() { ++detailsSerial; detailsView = nullptr; detailsTask = {}; details.reset(); }
     std::optional<Search> request;
     std::optional<SearchResult> result;
     bool pendingMaintenance = false, refreshFavorites = false, refreshReports = false;
@@ -465,7 +503,7 @@ int inputQuery(InputRequest request, const wchar_t* filename, const wchar_t* fie
 }
 
 
-std::vector<Track> App::albumTracks(Id server, const BrowseLocation& album) {
+std::vector<Track> App::albumTracks(Id server, const BrowseLocation& album, bool downloadedOnly) {
     if (store.networkAvailable(server) && !localLocation(album)) {
         try {
             auto page = http.connect(store.server(server))->browse(album, {}, 0);
@@ -477,7 +515,7 @@ std::vector<Track> App::albumTracks(Id server, const BrowseLocation& album) {
     for (int offset = 0; ; offset += pageSize) {
         auto page = store.cachedPage(server, album, {}, offset);
         for (auto& track : page.tracks)
-            if (track.bytes > 0) downloaded.push_back(std::move(track));
+            if (!downloadedOnly || track.bytes > 0) downloaded.push_back(std::move(track));
         if (!page.more) return downloaded;
     }
 }
@@ -500,41 +538,44 @@ void App::finishAlbums() {
         auto job = std::move(albumJobs.front());
         albumJobs.pop_front();
         if (job.action == AlbumAction::drop && (!IsWindow(job.target) || WindowFromPoint(job.drop.p) != job.target)) continue;
-        auto tracks = job.tracks.get();
-        if (tracks.empty()) {
-            MessageBoxW(activeView, L"No tracks from the selected albums are available.", pluginName, MB_OK);
-            continue;
-        }
-        struct Tags { std::wstring url, title, artist, album; };
-        std::vector<Tags> tags;
-        tags.reserve(tracks.size());
-        std::vector<itemRecordW> records(tracks.size());
-        for (size_t i = 0; i < tracks.size(); ++i) {
-            const auto& t = tracks[i];
-            tags.push_back({playlistFile(t), wide(t.title), wide(t.artist), wide(t.album)});
-            auto& tag = tags.back();
-            auto& record = records[i];
-            record.filename = tag.url.data();
-            record.title = tag.title.data();
-            record.artist = tag.artist.data();
-            record.album = tag.album.data();
-            record.length = t.duration;
-            record.track = t.trackNumber;
-            record.disc = t.discNumber;
-        }
-        const int count = static_cast<int>(records.size());
-        itemRecordListW list{records.data(), count, count};
-        if (job.action != AlbumAction::drop) {
-            // Bit 1 makes the explicit Play / Enqueue choice override the ML default.
-            mlSendToWinampStruct send{ML_TYPE_ITEMRECORDLISTW, &list, job.action == AlbumAction::enqueue ? 3 : 2};
-            library(ML_IPC_SENDTOWINAMP, reinterpret_cast<WPARAM>(&send));
-            continue;
-        }
-        job.drop.flags = 0;
-        job.drop.result = 0;
-        job.drop.data = &list;
-        library(ML_IPC_HANDLEDROP, reinterpret_cast<WPARAM>(&job.drop));
+        sendTrackRecords(job.tracks.get(), job.action, job.drop);
     }
+}
+
+void App::sendTrackRecords(const std::vector<Track>& tracks, AlbumAction action, mlDropItemStruct drop) {
+    if (tracks.empty()) {
+        MessageBoxW(activeView, L"No tracks from the selected albums are available.", pluginName, MB_OK);
+        return;
+    }
+    struct Tags { std::wstring url, title, artist, album; };
+    std::vector<Tags> tags;
+    tags.reserve(tracks.size());
+    std::vector<itemRecordW> records(tracks.size());
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        const auto& t = tracks[i];
+        tags.push_back({playlistFile(t), wide(t.title), wide(t.artist), wide(t.album)});
+        auto& tag = tags.back();
+        auto& record = records[i];
+        record.filename = tag.url.data();
+        record.title = tag.title.data();
+        record.artist = tag.artist.data();
+        record.album = tag.album.data();
+        record.length = t.duration;
+        record.track = t.trackNumber;
+        record.disc = t.discNumber;
+    }
+    const int count = static_cast<int>(records.size());
+    itemRecordListW list{records.data(), count, count};
+    if (action != AlbumAction::drop) {
+        // Bit 1 makes the explicit Play / Enqueue choice override the ML default.
+        mlSendToWinampStruct send{ML_TYPE_ITEMRECORDLISTW, &list, action == AlbumAction::enqueue ? 3 : 2};
+        library(ML_IPC_SENDTOWINAMP, reinterpret_cast<WPARAM>(&send));
+        return;
+    }
+    drop.flags = 0;
+    drop.result = 0;
+    drop.data = &list;
+    library(ML_IPC_HANDLEDROP, reinterpret_cast<WPARAM>(&drop));
 }
 
 void App::browse() {
@@ -544,8 +585,26 @@ void App::browse() {
         Search search;
         {
             std::unique_lock lock(searchMutex);
-            searchReady.wait(lock, [this] { return stopping || request.has_value(); });
+            searchReady.wait(lock, [this] { return stopping || detailsTask || request.has_value(); });
             if (stopping) return;
+            if (detailsTask) {
+                const auto generation = detailsSerial;
+                auto task = std::exchange(detailsTask, {});
+                lock.unlock();
+                ViewDetails ready;
+                try {
+                    ready = task([&] {
+                        std::scoped_lock guard(searchMutex);
+                        return stopping || detailsSerial != generation;
+                    });
+                } catch (const std::exception& e) { ready.error = e.what(); }
+                lock.lock();
+                if (!stopping && detailsSerial == generation) {
+                    details = std::move(ready);
+                    PostMessageW(detailsView, detailsReady, 0, 0);
+                }
+                continue;
+            }
             search = std::move(*request);
             request.reset();
         }
@@ -1277,42 +1336,62 @@ class View {
 public:
     View(HWND window, const Navigation& node)
         : hwnd(window), list(GetDlgItem(hwnd, IDC_TRACKS)), category(node.category), location(categoryLocation(category)), treeServer(node.server) {
-        LVCOLUMNW column{};
-        column.mask = LVCF_TEXT | LVCF_WIDTH;
-        const wchar_t* names[] = {L"Name", L"Details", L"Album", L"Time", L"Cache"};
-        for (int i = 0; i < 5; ++i) {
-            column.pszText = const_cast<wchar_t*>(names[i]);
-            ListView_InsertColumn(list, i, &column);
-        }
-        ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_HEADERINALLVIEWS);
-        ListView_SetUnicodeFormat(list, TRUE);
         skinWindow(hwnd, SKINNEDWND_TYPE_DIALOG);
-        if (!skinWindow(list, SKINNEDWND_TYPE_LISTVIEW, SWLVS_DOUBLEBUFFER | SWLVS_SELALWAYS)) {
-            legacySkin = library(ML_IPC_SKIN_LISTVIEW, reinterpret_cast<WPARAM>(list));
+        for (int id : {IDC_TRACKS, IDC_DETAIL_TILES}) {
+            auto control = GetDlgItem(hwnd, id);
+            ListView_SetExtendedListViewStyle(control, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_HEADERINALLVIEWS);
+            ListView_SetUnicodeFormat(control, TRUE);
+            if (!skinWindow(control, SKINNEDWND_TYPE_LISTVIEW, SWLVS_DOUBLEBUFFER | SWLVS_SELALWAYS))
+                legacySkins.push_back(library(ML_IPC_SKIN_LISTVIEW, reinterpret_cast<WPARAM>(control)));
+            // WACUP installs its window procedure above the common-controls subclass chain.
+            auto proc = GetWindowLongPtrW(control, GWLP_WNDPROC);
+            if (SetPropW(control, listSkinProc, reinterpret_cast<HANDLE>(proc)) &&
+                !SetWindowLongPtrW(control, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(libraryListProc)))
+                RemovePropW(control, listSkinProc);
+            attachListScrollbars(control);
         }
-        // WACUP installs its window procedure above the common-controls subclass chain.
-        auto proc = GetWindowLongPtrW(list, GWLP_WNDPROC);
-        if (SetPropW(list, listSkinProc, reinterpret_cast<HANDLE>(proc)) &&
-            !SetWindowLongPtrW(list, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(libraryListProc)))
-            RemovePropW(list, listSkinProc);
-        attachListScrollbars(list);
+        for (int id : {IDC_RESULTS, IDC_FILTER_FIRST, IDC_FILTER_SECOND, IDC_FILTER_THIRD}) {
+            auto control = GetDlgItem(hwnd, id);
+            ListView_SetUnicodeFormat(control, TRUE);
+            ListView_SetExtendedListViewStyle(control, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+            skinWindow(control, SKINNEDWND_TYPE_LISTVIEW, SWLVS_FULLROWSELECT | SWLVS_SELALWAYS | SWLVS_DOUBLEBUFFER);
+            attachListScrollbars(control);
+        }
+        for (int id : {IDC_DIVIDER_H, IDC_DIVIDER_V}) {
+            auto divider = GetDlgItem(hwnd, id);
+            skinWindow(divider, SKINNEDWND_TYPE_DIVIDER, id == IDC_DIVIDER_V ? SWDIV_VERT : 0);
+            MLSkinnedDivider_SetCallback(divider, dividerMoved, reinterpret_cast<LPARAM>(this));
+        }
         skinWindow(GetDlgItem(hwnd, IDC_QUERY), SKINNEDWND_TYPE_EDIT, SWES_VCENTER);
         for (int id : {IDC_SEARCH_LABEL, IDC_STATUS})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_STATIC);
-        for (int id : {IDC_VIEW_MENU, IDC_SOURCE_MENU, IDC_ADD_SERVER, IDC_BACK, IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_CACHE_MENU})
+        for (int id : {IDC_SORT_MENU, IDC_VIEW_OPTIONS, IDC_SOURCE_MENU, IDC_ADD_SERVER, IDC_BACK, IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_CACHE_MENU})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_BUTTON);
+        SetDlgItemTextW(hwnd, IDC_VIEW_OPTIONS, L"\u2261");
+        tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+            0, 0, 0, 0, hwnd, nullptr, plugin.hDllInstance, nullptr);
+        if (tip) {
+            TOOLINFOW tool{};
+            tool.cbSize = sizeof(tool);
+            tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+            tool.hwnd = hwnd;
+            tool.uId = reinterpret_cast<UINT_PTR>(GetDlgItem(hwnd, IDC_VIEW_OPTIONS));
+            tool.lpszText = const_cast<wchar_t*>(L"View options (F2 to edit)");
+            SendMessageW(tip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+        }
         preferredCoverSize = app->store.coverSize();
         tileSize = preferredCoverSize ? preferredCoverSize : automaticCoverSize();
         SetTimer(hwnd, viewTimer, 2000, nullptr);
         SendDlgItemMessageW(hwnd, IDC_QUERY, EM_SETLIMITTEXT, 256, 0);
-        textList = app->store.textCatalog();
     }
     ~View() {
         KillTimer(hwnd, viewTimer);
         KillTimer(hwnd, searchTimer);
         if (app) app->artwork.cancel(artGeneration);
-        if (legacySkin) library(ML_IPC_UNSKIN_LISTVIEW, legacySkin);
+        if (tip) DestroyWindow(tip);
+        for (auto skin : legacySkins) if (skin) library(ML_IPC_UNSKIN_LISTVIEW, skin);
         if (images) {
+            ListView_SetImageList(list, nullptr, LVSIL_SMALL);
             ListView_SetImageList(list, nullptr, LVSIL_NORMAL);
             ImageList_Destroy(images);
         }
@@ -1320,16 +1399,28 @@ public:
     void setCategory(BrowseKind kind) { category = kind; }
     void populateServers();
     void receive(SearchResult result);
+    void receiveDetails(ViewDetails result);
+    void filterSelectionChanged(int pane);
+    void updatePreview();
+    void saveOptions() { app->store.saveViewSettings(location.kind, writeViewOptions(options)); }
+    void displayOther(NMLVDISPINFOW& display);
+    void filterEvent(int pane) {
+        if (!fillingFilters && filtered()) PostMessageW(hwnd, filtersChanged, pane, 0);
+    }
+    void focusResults(bool preview) { previewFocus = preview; queueSelectionUpdate(); }
+    void playPreview() { previewFocus = true; play(false); }
     void receiveArtwork();
     void scheduleArtwork() {
         if (!artworkUpdatePosted)
             artworkUpdatePosted = PostMessageW(hwnd, artworkViewportChanged, 0, 0) != FALSE;
     }
     void updateArtworkViewport();
+    void fillTiles();
     void fetchMore();
     void display(NMLVDISPINFOW& display);
     void activate(int index);
     void command(int id, int notification);
+    void sortColumn(int column);
     void refresh();
     void updateButtons();
     void queueSelectionUpdate() {
@@ -1337,8 +1428,8 @@ public:
     }
     void updateSelection();
     void prefetchTrack(int row) {
-        if (showTracks() && row >= 0 && static_cast<size_t>(row) < tracks.size())
-            app->artwork.requestTrack(tracks[row].key);
+        if (showTracks() && row >= 0 && row < rowCount())
+            app->artwork.requestTrack(trackAt(row).key);
     }
     void layout(int width, int height);
     void beginDrag(const NMLISTVIEW& notification);
@@ -1376,6 +1467,7 @@ private:
     BrowseKind category;
     BrowseLocation location;
     std::vector<BrowseLocation> draggedAlbums;
+    std::vector<Track> draggedTracks;
     std::string query;
     SortChoice order = defaultSort(BrowseKind::albums);
     bool descending = false;
@@ -1395,7 +1487,8 @@ private:
     double browseSeconds = 0;
     std::wstring selectionSummary;
     std::string message;
-    LRESULT legacySkin = 0;
+    std::vector<LRESULT> legacySkins;
+    HWND tip = nullptr;
     const Id treeServer;
     Id currentServer = 0;
     int tileSize = 160;
@@ -1403,8 +1496,22 @@ private:
     int automaticCoverSize() const {
         return std::clamp(MulDiv(160, windowDpi(hwnd), 96), 96, 384);
     }
-    bool textList = false;
+    ViewOptions options;
+    std::shared_ptr<const BrowsePage> projectionSource;
+    ViewProjection projection;
+    FilterSelection filterSelection;
+    std::vector<Track> previewTracks;
+    std::vector<int> localPreviewRows, previewSelection;
+    std::map<Id, std::string> cacheLabels;
+    bool detailsPending = false;
+    bool previewFocus = false, fillingFilters = false, projecting = false;
+    int splitStart = 0, splitLength = 0;
+    static void CALLBACK dividerMoved(HWND divider, INT pos, LPARAM param);
     HIMAGELIST images = nullptr;
+    bool detailRows = false;
+    int tileColumnCount = 0;
+    bool addingTiles = false;
+    std::map<int, UINT> restoreTileState;
     ArtworkLoader::Generation artGeneration = 0;
     std::vector<ImageSlot> slots;
     std::map<int, int> slotForRow;
@@ -1417,18 +1524,44 @@ private:
         return std::min(192, static_cast<int>(24 * MiB / (tileSize * tileSize * 4)));
     }
 
-    bool showTracks() const { return trackView(location.kind); }
+    BrowseKind sourceKind() const {
+        return location.kind == BrowseKind::albums && (options.mode != ViewMode::covers || !options.musicPreset.empty()) ?
+            BrowseKind::tracks : location.kind;
+    }
+    bool groupedAlbums() const { return trackView(sourceKind()) && options.mode == ViewMode::covers; }
+    bool filtered() const { return options.mode == ViewMode::filtered; }
+    bool projectedList() const { return filtered() || (options.mode == ViewMode::list && trackView(sourceKind())); }
+    bool showTracks() const { return trackView(sourceKind()) && !groupedAlbums(); }
     bool albumActions() const {
-        return location.kind == BrowseKind::albums || location.kind == BrowseKind::genreAlbums ||
+        return groupedAlbums() || location.kind == BrowseKind::albums || location.kind == BrowseKind::genreAlbums ||
                location.kind == BrowseKind::artistAlbums || location.kind == BrowseKind::favorites;
     }
     bool showTiles() const {
-        return !showTracks() && !textList;
+        return options.mode == ViewMode::covers ? options.albumArt : (filtered() && options.resultArt);
     }
-    int rowCount() const { return static_cast<int>(showTracks() ? tracks.size() : items.size()); }
+    bool supportsPreview() const {
+        return trackView(location.kind) || albumActions() || location.kind == BrowseKind::playlists;
+    }
+    bool hasPreview() const { return options.mode == ViewMode::covers && supportsPreview() && options.albumResults; }
+    int rowCount() const {
+        if (groupedAlbums()) return static_cast<int>(projection.albums.size());
+        if (projectedList()) return static_cast<int>(projection.matches.size());
+        return static_cast<int>(showTracks() ? tracks.size() : items.size());
+    }
+    const Track& trackAt(int row) const {
+        return projectedList() ? projectionSource->tracks[projection.matches[row]] : tracks[row];
+    }
+    const LibraryItem& itemAt(int row) const {
+        if (groupedAlbums()) return projection.albums[row].item;
+        return filtered() ? projectionSource->items[projection.matches[row]] : items[row];
+    }
+    int previewCount() const { return static_cast<int>(groupedAlbums() ? localPreviewRows.size() : previewTracks.size()); }
+    const Track& previewAt(int row) const {
+        return groupedAlbums() ? projectionSource->tracks[localPreviewRows[row]] : previewTracks[row];
+    }
     const BrowseLocation* albumAt(int index) const {
-        if (showTracks() || index < 0 || static_cast<size_t>(index) >= items.size()) return nullptr;
-        const auto& target = items[index].target;
+        if (showTracks() || index < 0 || index >= rowCount()) return nullptr;
+        const auto& target = itemAt(index).target;
         return target.kind == BrowseKind::albumTracks ? &target : nullptr;
     }
     void startSearch();
@@ -1436,8 +1569,20 @@ private:
     void resetLocation();
     void changePresentation();
     void resizeColumns();
+    void setColumns();
+    void project(bool reorder = false);
+    void configureView(int id);
+    void setCoverSize(int size);
+    void clearPreview();
+    void previewCountChanged();
     void popup(int button);
     void updateRowCount();
+    bool detailTiles() const { return GetDlgCtrlID(list) == IDC_DETAIL_TILES; }
+    void clearList() {
+        restoreTileState.clear();
+        if (detailTiles()) ListView_DeleteAllItems(list);
+        else ListView_SetItemCount(list, 0);
+    }
     void scheduleMore();
     void resetImages();
     int imageFor(int row);
@@ -1445,7 +1590,13 @@ private:
     void play(bool enqueue);
     void cache(bool pin);
     void updateStatus();
-    std::wstring trackCell(const Track& track, int column) const;
+    std::string trackValue(const Track& track, std::string_view field) const {
+        if (field == "cache") {
+            auto it = cacheLabels.find(track.key);
+            if (it != cacheLabels.end()) return it->second;
+        }
+        return browseField(track, field);
+    }
     std::vector<Track> selection();
     std::vector<BrowseLocation> selectedAlbums() const;
     const Server* selected() const;
@@ -1474,22 +1625,33 @@ void View::resetLocation() {
 void View::resetContent() {
     cancelDrag();
     app->cancelSearch(hwnd);
+    clearPreview();
+    projecting = false;
+    detailsPending = false;
+    cacheLabels.clear();
+    fillingFilters = true;
+    for (int i = 0; i < 3; ++i) ListView_SetItemCount(GetDlgItem(hwnd, IDC_FILTER_FIRST + i), 0);
+    fillingFilters = false;
     loading = more = morePosted = false;
     sources.clear();
     nextSource = 0;
     browseSeconds = 0;
     selectionSummary.clear();
     message.clear();
-    ListView_SetItemCount(list, 0);
+    clearList();
+    projection = {};
+    projectionSource.reset();
+    filterSelection = {};
+    options = readViewOptions(location.kind, app->store.viewSettings(location.kind), app->store.textCatalog());
     items.clear();
     tracks.clear();
     knownItems.clear();
     knownTracks.clear();
     resetImages();
-    order = defaultSort(location.kind);
+    order = defaultSort(sourceKind());
     descending = order.descending;
-    auto saved = app->store.browseOrder(location.kind);
-    for (const auto& choice : sortChoices(location.kind)) {
+    auto saved = sourceKind() == location.kind ? app->store.browseOrder(location.kind) : options.trackSort;
+    for (const auto& choice : sortChoices(sourceKind())) {
         if (!saved.empty() && saved.compare(1, saved.npos, choice.key) == 0) {
             order = choice;
             descending = saved.front() == '-';
@@ -1523,7 +1685,9 @@ void View::fetchMore() {
     updateButtons();
     updateStatus();
     const auto& source = sources.at(nextSource);
-    app->search(hwnd, source.server, location, query, source.offset, source.cached);
+    auto request = location;
+    request.kind = sourceKind();
+    app->search(hwnd, source.server, request, query, source.offset, source.cached);
 }
 
 void View::scheduleMore() {
@@ -1533,11 +1697,53 @@ void View::scheduleMore() {
 
 void View::updateRowCount() {
     const int previousWidth = listViewportWidth(list);
-    ListView_SetItemCountEx(list, rowCount(), LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
+    if (detailTiles()) fillTiles();
+    else ListView_SetItemCountEx(list, rowCount(), LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
     if (listViewportWidth(list) != previousWidth) resizeColumns();
     scheduleArtwork();
     InvalidateRect(list, nullptr, FALSE);
     updateSelection();
+}
+
+void View::fillTiles() {
+    if (!detailTiles() || addingTiles) return;
+    const int goal = rowCount();
+    int row = ListView_GetItemCount(list);
+    if (row == goal) return;
+    addingTiles = true;
+    if (row > goal) { ListView_DeleteAllItems(list); row = 0; }
+    // Only real list items can carry the subitem array that native tile view draws.
+    // The list retains column numbers. Text, covers and metadata stay in our catalog.
+    ListView_SetItemCount(list, goal);
+    const auto& keys = showTracks() ? options.trackColumns : options.itemColumns;
+    std::vector<UINT> subitems;
+    for (UINT col = 1; col < keys.size() && col <= 20; ++col) subitems.push_back(col);
+    LVITEMW item{};
+    item.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_COLUMNS;
+    item.pszText = LPSTR_TEXTCALLBACKW;
+    item.iImage = I_IMAGECALLBACK;
+    item.cColumns = static_cast<UINT>(subitems.size());
+    item.puColumns = subitems.data();
+    const auto deadline = Clock::now() + std::chrono::milliseconds(5);
+    bool failed = false;
+    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+    for (; row < goal; ++row) {
+        item.iItem = row;
+        if (ListView_InsertItem(list, &item) < 0) { failed = true; break; }
+        for (const auto col : subitems) ListView_SetItemText(list, row, col, LPSTR_TEXTCALLBACKW);
+        auto saved = restoreTileState.find(row);
+        if (saved != restoreTileState.end()) {
+            ListView_SetItemState(list, row, saved->second, LVIS_FOCUSED | LVIS_SELECTED);
+            if (saved->second & LVIS_FOCUSED) ListView_EnsureVisible(list, row, FALSE);
+            restoreTileState.erase(saved);
+        }
+        if ((row % 16) == 15 && Clock::now() >= deadline) { ++row; break; }
+    }
+    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+    addingTiles = false;
+    InvalidateRect(list, nullptr, FALSE);
+    scheduleArtwork();
+    if (row < goal && !failed) PostMessageW(hwnd, populateTiles, 0, 0);
 }
 
 void View::receive(SearchResult result) {
@@ -1547,20 +1753,20 @@ void View::receive(SearchResult result) {
     auto& source = sources.at(nextSource);
     source.cached = result.cached;
     source.error = std::move(result.error);
-    const auto oldCount = rowCount();
+    const auto oldCount = tracks.size() + items.size();
     const bool emptyPage = result.page.items.empty() && result.page.tracks.empty();
     for (auto& item : result.page.items) {
         item.target.server = source.server;
         if (knownItems.emplace(source.server, item.target.kind, item.target.id).second)
             items.push_back(std::move(item));
     }
-    const bool pagedTracks = location.kind == BrowseKind::tracks || location.kind == BrowseKind::offline;
+    const bool pagedTracks = sourceKind() == BrowseKind::tracks || sourceKind() == BrowseKind::offline;
     for (auto& track : result.page.tracks) {
         if (!pagedTracks || knownTracks.insert(track.key).second) tracks.push_back(std::move(track));
     }
     // A repeated server page must not get stuck in an endless scroll loop.
     source.more = source.error.empty() && result.page.more && source.offset <= INT_MAX - 2 * pageSize &&
-                  (emptyPage || rowCount() != oldCount);
+                  (emptyPage || items.size() + tracks.size() != oldCount);
     source.offset += pageSize;
     more = false;
     for (size_t step = 1; step <= sources.size(); ++step) {
@@ -1569,8 +1775,17 @@ void View::receive(SearchResult result) {
     }
     // A single live album list already comes from the server in alphabetical order.
     // Other global orders need every source page before exposing their row indices.
+    if (projectedList() || groupedAlbums()) {
+        if (more) { updateStatus(); scheduleMore(); return; }
+        auto sourceRows = std::make_shared<BrowsePage>();
+        sourceRows->tracks = std::move(tracks);
+        sourceRows->items = std::move(items);
+        projectionSource = std::move(sourceRows);
+        project();
+        return;
+    }
     const bool streamOrder = std::string_view(order.key) == "sequence" ||
-        (sources.size() == 1 && !source.cached && location.kind == BrowseKind::albums &&
+        (sources.size() == 1 && !source.cached && sourceKind() == BrowseKind::albums &&
          query.empty() && std::string_view(order.key) == "name" && !descending);
     if (!streamOrder && more) {
         updateStatus();
@@ -1588,9 +1803,20 @@ void View::chooseOrder(SortChoice choice, bool reverse) {
     order = choice;
     descending = reverse;
     if (previous == savedOrder() && std::string_view(order.key) != "random") return;
-    app->store.saveBrowseOrder(location.kind, savedOrder());
-    if (loading || more || std::string_view(order.key) == "sequence") startSearch();
+    if (sourceKind() == location.kind) app->store.saveBrowseOrder(location.kind, savedOrder());
+    else { options.trackSort = savedOrder(); saveOptions(); }
+    if (projectionSource) { changePresentation(); project(true); }
+    else if (loading || more || std::string_view(order.key) == "sequence") startSearch();
     else applyOrder();
+}
+
+void View::sortColumn(int column) {
+    const auto& keys = showTracks() ? options.trackColumns : options.itemColumns;
+    if (column < 0 || static_cast<size_t>(column) >= keys.size()) return;
+    const std::string_view key = showTiles() && !options.coverDetails ? std::string_view{"name"} : std::string_view{keys[column]};
+    const auto& choices = sortChoices(sourceKind());
+    auto it = std::find_if(choices.begin(), choices.end(), [&](const SortChoice& choice) { return choice.key == key; });
+    if (it != choices.end()) chooseOrder(*it, key == order.key ? !descending : it->descending);
 }
 
 void View::applyOrder() {
@@ -1624,37 +1850,34 @@ void View::refresh() {
             if (source.cached && app->store.networkAvailable(source.server)) { startSearch(); return; }
         }
     }
-    const int first = std::max(0, ListView_GetTopIndex(list));
-    const int last = std::min(static_cast<int>(tracks.size()), first + ListView_GetCountPerPage(list) + 1);
-    for (int i = first; i < last; ++i) {
-        auto updated = app->store.track(tracks[i].key);
-        const auto& track = tracks[i];
-        if (track.bytes == updated.bytes && track.favorite == updated.favorite &&
-            track.pinned == updated.pinned) continue;
-        tracks[i] = std::move(updated);
-        ListView_RedrawItems(list, i, i);
+    if (!detailsPending && !loading && !more) {
+        std::map<Id, std::string> visible;
+        auto collect = [&](HWND control, int total, bool preview) {
+            auto first = std::max(0, ListView_GetTopIndex(control));
+            auto end = std::min(total, first + ListView_GetCountPerPage(control) + 1);
+            if (!preview && showTiles()) { auto range = visibleTileRows(); first = range.first; end = range.end; }
+            for (int i = first; i < end; ++i) {
+                auto& t = preview ? previewAt(i) : trackAt(i);
+                visible.emplace(t.key, trackValue(t, "cache"));
+            }
+        };
+        if (showTracks()) collect(list, rowCount(), false);
+        if (hasPreview()) collect(GetDlgItem(hwnd, IDC_RESULTS), previewCount(), true);
+        if (!visible.empty()) {
+            detailsPending = true;
+            app->submitDetails(hwnd, [store = &app->store, visible = std::move(visible)](const auto& cancelled) {
+                ViewDetails result;
+                auto& changes = result.cacheChanges.emplace();
+                for (auto& [id, old] : visible) {
+                    if (cancelled()) break;
+                    auto value = browseField(store->track(id), "cache");
+                    if (old != value) changes.emplace(id, std::move(value));
+                }
+                return result;
+            });
+        }
     }
     updateStatus();
-}
-
-std::wstring View::trackCell(const Track& track, int column) const {
-    switch (column) {
-    case 0: return wide(track.title.empty() ? track.id : track.title);
-    case 1: return wide(track.artist);
-    case 2: return wide(track.album);
-    case 3:
-        if (track.duration) {
-            auto seconds = track.duration % 60;
-            return std::to_wstring(track.duration / 60) + L":" + (seconds < 10 ? L"0" : L"") +
-                std::to_wstring(seconds);
-        }
-        return {};
-    case 4:
-        if (track.pinned) return track.bytes ? L"Permanent" : L"Pin pending";
-        if (track.favorite) return track.bytes ? L"Favorite" : L"Favorite pending";
-        return track.bytes ? L"Rolling" : L"";
-    default: return {};
-    }
 }
 
 void View::display(NMLVDISPINFOW& display) {
@@ -1663,13 +1886,193 @@ void View::display(NMLVDISPINFOW& display) {
     if (row < 0 || row >= rowCount()) return;
     if (item.mask & LVIF_TEXT) {
         std::wstring text;
-        if (showTracks()) text = trackCell(tracks[row], item.iSubItem);
-        else if (item.iSubItem == 0) text = wide(items[row].target.title);
-        else if (item.iSubItem == 1) text = wide(items[row].subtitle);
+        const auto& columns = showTracks() ? options.trackColumns : options.itemColumns;
+        if (showTiles() && !options.coverDetails)
+            text = showTracks() ? wide(browseField(trackAt(row), "name")) : wide(itemAt(row).target.title);
+        else if (static_cast<size_t>(item.iSubItem) < columns.size()) {
+            const auto& key = columns[item.iSubItem];
+            text = formatCell(key, showTracks() ? trackValue(trackAt(row), key) : browseField(itemAt(row), key));
+        }
         if (item.pszText && item.cchTextMax > 0) lstrcpynW(item.pszText, text.c_str(), item.cchTextMax);
     }
     if (item.mask & LVIF_IMAGE) item.iImage = showTiles() ? imageFor(row) : I_IMAGENONE;
     if ((!showTiles() || !images) && row >= rowCount() - 12) scheduleMore();
+}
+
+void View::displayOther(NMLVDISPINFOW& info) {
+    auto& item = info.item;
+    if (!(item.mask & LVIF_TEXT) || !item.pszText || item.cchTextMax <= 0) return;
+    std::wstring text;
+    if (info.hdr.idFrom == IDC_RESULTS) {
+        if (item.iItem >= 0 && item.iItem < previewCount() && static_cast<size_t>(item.iSubItem) < options.trackColumns.size()) {
+            auto& key = options.trackColumns[item.iSubItem];
+            text = formatCell(key, trackValue(previewAt(item.iItem), key));
+        }
+    } else {
+        size_t pane = info.hdr.idFrom - IDC_FILTER_FIRST;
+        if (pane < options.filters.size() && static_cast<size_t>(item.iItem) < projection.groups[pane].size()) {
+            const auto& keys = options.filterColumns.at(options.filters[pane]);
+            if (static_cast<size_t>(item.iSubItem) < keys.size()) {
+                const auto& row = projection.groups[pane][item.iItem];
+                text = summaryCell(row, keys[item.iSubItem]);
+                if (keys[item.iSubItem] == "value" && text.empty()) text = L"(unknown)";
+            }
+        }
+    }
+    lstrcpynW(item.pszText, text.c_str(), item.cchTextMax);
+}
+
+void View::project(bool reorder) {
+    if (!projectionSource) return;
+    projecting = detailsPending = true;
+    app->submitDetails(hwnd, [source = projectionSource, songs = trackView(sourceKind()), settings = options,
+        selection = filterSelection, sort = order, reverse = descending,
+        indices = reorder ? nullptr : projection.order, cache = cacheLabels](const auto& cancelled) {
+        ViewDetails result;
+        result.projection = projectRows(*source, songs, settings, selection, sort, reverse, indices, cache, cancelled);
+        return result;
+    });
+    updateStatus();
+}
+
+void View::filterSelectionChanged(int pane) {
+    if (fillingFilters || !filtered() || static_cast<size_t>(pane) >= options.filters.size()) return;
+    auto control = GetDlgItem(hwnd, IDC_FILTER_FIRST + pane);
+    std::set<std::wstring> selected;
+    const auto& groups = projection.groups[pane];
+    const bool all = ListView_GetNextItem(control, -1, LVNI_FOCUSED) == 0 && ListView_GetItemState(control, 0, LVIS_SELECTED);
+    if (!all) {
+        for (int i = ListView_GetNextItem(control, 0, LVNI_SELECTED); i > 0 && static_cast<size_t>(i) < groups.size();
+             i = ListView_GetNextItem(control, i, LVNI_SELECTED)) selected.insert(groups[i].value);
+    }
+    if (selected == filterSelection[pane]) return;
+    filterSelection[pane] = std::move(selected);
+    for (size_t i = pane + 1; i < filterSelection.size(); ++i) filterSelection[i].clear();
+    project();
+}
+
+void View::receiveDetails(ViewDetails result) {
+    projecting = detailsPending = false;
+    if (!result.error.empty()) { message = std::move(result.error); updateStatus(); return; }
+    if (result.cacheChanges) {
+        if (result.cacheChanges->empty()) return;
+        for (auto& [id, value] : *result.cacheChanges) cacheLabels[id] = std::move(value);
+        InvalidateRect(list, nullptr, FALSE);
+        if (hasPreview()) InvalidateRect(GetDlgItem(hwnd, IDC_RESULTS), nullptr, FALSE);
+        if (filtered() && std::find(options.filters.begin(), options.filters.end(), "cache") != options.filters.end()) project();
+        return;
+    }
+    if (result.albumPreview) {
+        previewTracks = std::move(result.preview);
+        previewCountChanged();
+        updateSelection();
+        return;
+    }
+    if (!projectionSource) return;
+    // Track rows keep their source index across sorts and filter changes. An album's
+    // first track identifies its old selection even if another track sorts first now.
+    std::map<int, UINT> selection;
+    auto remember = [&](int row, UINT state) {
+        if (row < 0 || row >= rowCount()) return;
+        int source = groupedAlbums() ? projection.albums[row].rows.front() : projection.matches[row];
+        selection[source] |= state;
+    };
+    remember(ListView_GetNextItem(list, -1, LVNI_FOCUSED), LVIS_FOCUSED);
+    for (int i = ListView_GetNextItem(list, -1, LVNI_SELECTED); i >= 0; i = ListView_GetNextItem(list, i, LVNI_SELECTED))
+        remember(i, LVIS_SELECTED);
+    clearList();
+    clearPreview();
+    resetImages();
+    fillingFilters = true;
+    projection = std::move(result.projection);
+    if (filtered()) {
+        for (size_t pane = 0; pane < options.filters.size(); ++pane) {
+            auto control = GetDlgItem(hwnd, IDC_FILTER_FIRST + static_cast<int>(pane));
+            const auto& groups = projection.groups[pane];
+            const int first = ListView_GetTopIndex(control);
+            ListView_SetItemCountEx(control, static_cast<int>(groups.size()), LVSICF_NOSCROLL);
+            ListView_SetItemState(control, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+            const auto& selected = filterSelection[pane];
+            if (selected.empty()) {
+                ListView_SetItemState(control, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            } else {
+                bool focus = true;
+                for (size_t i = 1; i < groups.size(); ++i) if (selected.count(groups[i].value)) {
+                    ListView_SetItemState(control, i, LVIS_SELECTED | (focus ? LVIS_FOCUSED : 0), LVIS_SELECTED | LVIS_FOCUSED);
+                    focus = false;
+                }
+            }
+            if (first > 0 && static_cast<size_t>(first) < groups.size()) ListView_EnsureVisible(control, first, FALSE);
+            InvalidateRect(control, nullptr, FALSE);
+        }
+    }
+    fillingFilters = false;
+    changePresentation();
+    updateRowCount();
+    for (int i = 0; !selection.empty() && i < rowCount(); ++i) {
+        UINT state = 0;
+        auto restore = [&](int source) {
+            auto it = selection.find(source);
+            if (it != selection.end()) { state |= it->second; selection.erase(it); }
+        };
+        if (groupedAlbums()) for (int row : projection.albums[i].rows) restore(row);
+        else restore(projection.matches[i]);
+        if (!state) continue;
+        if (detailTiles() && i >= ListView_GetItemCount(list)) restoreTileState[i] = state;
+        else {
+            ListView_SetItemState(list, i, state, LVIS_SELECTED | LVIS_FOCUSED);
+            if (state & LVIS_FOCUSED) ListView_EnsureVisible(list, i, FALSE);
+        }
+    }
+    queueSelectionUpdate();
+}
+
+void View::clearPreview() {
+    previewSelection.clear();
+    ListView_SetItemCount(GetDlgItem(hwnd, IDC_RESULTS), 0);
+    previewTracks.clear();
+    localPreviewRows.clear();
+    previewFocus = false;
+}
+void View::previewCountChanged() {
+    auto control = GetDlgItem(hwnd, IDC_RESULTS);
+    ListView_SetItemCountEx(control, previewCount(), LVSICF_NOSCROLL);
+    InvalidateRect(control, nullptr, FALSE);
+    resizeColumns();
+}
+void View::updatePreview() {
+    if (!hasPreview()) return;
+    std::vector<int> selected;
+    for (int i = ListView_GetNextItem(list, -1, LVNI_SELECTED); i >= 0 && i < rowCount();
+         i = ListView_GetNextItem(list, i, LVNI_SELECTED)) selected.push_back(i);
+    if (selected == previewSelection) return;
+    clearPreview();
+    previewSelection = selected;
+    if (groupedAlbums()) {
+        for (int i : selected) {
+            const auto& rows = projection.albums[i].rows;
+            localPreviewRows.insert(localPreviewRows.end(), rows.begin(), rows.end());
+        }
+        previewCountChanged();
+        return;
+    }
+    std::vector<BrowseLocation> targets;
+    for (int i : selected) {
+        auto& target = itemAt(i).target;
+        if (target.kind == BrowseKind::albumTracks || target.kind == BrowseKind::song || target.kind == BrowseKind::playlistTracks)
+            targets.push_back(target);
+    }
+    detailsPending = true;
+    app->submitDetails(hwnd, [targets = std::move(targets), owner = app.get()](const auto& cancelled) {
+        ViewDetails result;
+        result.albumPreview = true;
+        for (auto& target : targets) {
+            if (cancelled()) break;
+            auto rows = owner->albumTracks(target.server, target, false);
+            std::move(rows.begin(), rows.end(), std::back_inserter(result.preview));
+        }
+        return result;
+    });
 }
 
 void View::resetImages() {
@@ -1680,6 +2083,7 @@ void View::resetImages() {
     slotForRow.clear();
     artRead = 0;
     if (images) {
+        ListView_SetImageList(list, nullptr, LVSIL_SMALL);
         ListView_SetImageList(list, nullptr, LVSIL_NORMAL);
         ImageList_Destroy(images);
         images = nullptr;
@@ -1750,7 +2154,14 @@ void View::updateArtworkViewport() {
         if (i < visible.first - nearby.first) add(visible.first - 1 - i);
         if (i < nearby.end - visible.end) add(visible.end + i);
     }
-    app->artwork.setViewport(artGeneration, tileSize, items, rows, visibleCount);
+    app->artwork.setViewport(artGeneration, tileSize, [this](int row) -> LibraryItem {
+        if (showTracks()) {
+            const auto& t = trackAt(row);
+            return {{BrowseKind::song, t.id, t.title, t.server}, {}, t.coverId};
+        }
+        const auto& item = itemAt(row);
+        return {item.target, {}, item.coverId};
+    }, rows, visibleCount);
 }
 
 void View::receiveArtwork() {
@@ -1790,7 +2201,24 @@ void View::receiveArtwork() {
 }
 
 void View::changePresentation() {
-    SetDlgItemTextW(hwnd, IDC_VIEW_MENU, order.label);
+    const bool wantDetail = showTiles() && options.coverDetails;
+    const bool switching = wantDetail != detailTiles();
+    std::map<int, UINT> oldState;
+    const bool wasFocused = GetFocus() == list;
+    if (switching) {
+        for (int i = ListView_GetNextItem(list, -1, LVNI_SELECTED); i >= 0; i = ListView_GetNextItem(list, i, LVNI_SELECTED))
+            oldState[i] = LVIS_SELECTED;
+        int focus = ListView_GetNextItem(list, -1, LVNI_FOCUSED);
+        if (focus >= 0) oldState[focus] |= LVIS_FOCUSED;
+        ListView_SetImageList(list, nullptr, LVSIL_NORMAL);
+        ListView_SetImageList(list, nullptr, LVSIL_SMALL);
+        clearList();
+        ShowWindow(list, SW_HIDE);
+        list = GetDlgItem(hwnd, wantDetail ? IDC_DETAIL_TILES : IDC_TRACKS);
+        if (images) ListView_SetImageList(list, images, LVSIL_NORMAL);
+        ShowWindow(list, SW_SHOWNA);
+    }
+    SetDlgItemTextW(hwnd, IDC_SORT_MENU, order.label);
     const Id filter = treeServer ? treeServer : app->filterServer;
     const auto source = std::find_if(servers.begin(), servers.end(),
         [filter](const Server& profile) { return profile.id == filter; });
@@ -1831,8 +2259,17 @@ void View::changePresentation() {
         SetWindowPos(list, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
-    ListView_SetView(list, tiles ? LV_VIEW_ICON : LV_VIEW_DETAILS);
-    ListView_SetExtendedListViewStyleEx(list, LVS_EX_FULLROWSELECT, tiles ? 0 : LVS_EX_FULLROWSELECT);
+    detailRows = false;
+    if (tiles && options.coverDetails) {
+        // Hosts without tile view can still show the cover beside the metadata in report view.
+        detailRows = ListView_SetView(list, LV_VIEW_TILE) != 1;
+        if (detailRows) ListView_SetView(list, LV_VIEW_DETAILS);
+    } else ListView_SetView(list, tiles ? LV_VIEW_ICON : LV_VIEW_DETAILS);
+    ListView_SetImageList(list, detailRows ? images : nullptr, LVSIL_SMALL);
+    ListView_SetExtendedListViewStyleEx(list, LVS_EX_FULLROWSELECT | LVS_EX_HIDELABELS,
+        (!tiles || detailRows ? LVS_EX_FULLROWSELECT : 0) |
+        (tiles && !options.coverDetails && !options.coverTitles ? LVS_EX_HIDELABELS : 0));
+    const auto& keys = showTracks() ? options.trackColumns : options.itemColumns;
     if (tiles && images) {
         const auto font = reinterpret_cast<HFONT>(SendMessageW(list, WM_GETFONT, 0, 0));
         HDC dc = GetDC(list);
@@ -1842,27 +2279,36 @@ void View::changePresentation() {
         SelectObject(dc, previous);
         ReleaseDC(list, dc);
         const int gap = MulDiv(4, windowDpi(hwnd), 96);
-        ListView_SetIconSpacing(list, tileSize + gap, tileSize + 2 * metrics.tmHeight + gap);
+        if (options.coverDetails && !detailRows) {
+            LVTILEVIEWINFO info{};
+            info.cbSize = sizeof(info);
+            info.dwMask = LVTVIM_TILESIZE | LVTVIM_COLUMNS;
+            info.dwFlags = LVTVIF_FIXEDSIZE;
+            info.sizeTile = {tileSize + MulDiv(160, windowDpi(hwnd), 96), tileSize + gap};
+            info.cLines = std::min(20, static_cast<int>(keys.size()));
+            ListView_SetTileViewInfo(list, &info);
+        } else if (!detailRows) {
+            ListView_SetIconSpacing(list, tileSize + gap, tileSize + (options.coverTitles ? 2 * metrics.tmHeight : 0) + gap);
+        }
     }
     SendDlgItemMessageW(hwnd, IDC_QUERY, EM_SETCUEBANNER, FALSE,
         reinterpret_cast<LPARAM>(showTracks() ? L"Search tracks" : L"Search this view"));
-    const wchar_t* title = L"Name";
-    if (showTracks()) title = L"Title";
-    else switch (location.kind) {
-    case BrowseKind::albums: case BrowseKind::artistAlbums: case BrowseKind::genreAlbums: title = L"Album"; break;
-    case BrowseKind::genres: title = L"Genre"; break;
-    case BrowseKind::albumArtists: title = L"Album Artist"; break;
-    case BrowseKind::artists: title = L"Artist"; break;
-    case BrowseKind::playlists: title = L"Playlist"; break;
-    default: break;
+    setColumns();
+    if (wantDetail) {
+        if (tileColumnCount != static_cast<int>(keys.size())) {
+            clearList();
+            tileColumnCount = static_cast<int>(keys.size());
+        }
+        if (switching) restoreTileState = std::move(oldState);
+        fillTiles();
+    } else if (switching) {
+        ListView_SetItemCountEx(list, rowCount(), LVSICF_NOSCROLL);
+        for (auto [i, state] : oldState) if (i < rowCount()) {
+            ListView_SetItemState(list, i, state, LVIS_SELECTED | LVIS_FOCUSED);
+            if (state & LVIS_FOCUSED) ListView_EnsureVisible(list, i, FALSE);
+        }
     }
-    auto details = showTracks() ? L"Artist" : L"Details";
-    LVCOLUMNW column{};
-    column.mask = LVCF_TEXT;
-    column.pszText = const_cast<wchar_t*>(title);
-    ListView_SetColumn(list, 0, &column);
-    column.pszText = const_cast<wchar_t*>(details);
-    ListView_SetColumn(list, 1, &column);
+    if (switching && wasFocused) SetFocus(list);
     RECT bounds{};
     GetClientRect(hwnd, &bounds);
     layout(bounds.right, bounds.bottom);
@@ -1875,7 +2321,13 @@ void View::activate(int index) {
         play(false);
         return;
     }
-    auto target = items[index].target;
+    if (groupedAlbums()) {
+        if (!hasPreview()) { options.albumResults = true; saveOptions(); changePresentation(); }
+        updatePreview();
+        SetFocus(GetDlgItem(hwnd, IDC_RESULTS));
+        return;
+    }
+    auto target = itemAt(index).target;
     history.push_back({location, query, std::move(items), std::move(sources), nextSource, index, savedOrder()});
     location = std::move(target);
     SetDlgItemTextW(hwnd, IDC_QUERY, L"");
@@ -1892,7 +2344,7 @@ void View::back() {
     SetDlgItemTextW(hwnd, IDC_QUERY, wide(query).c_str());
     KillTimer(hwnd, searchTimer);
     resetContent();
-    if (savedOrder() != outer.order) { startSearch(); return; }
+    if (projectedList() || groupedAlbums() || savedOrder() != outer.order) { startSearch(); return; }
     for (const auto& source : outer.sources) {
         const bool useCache = location.kind == BrowseKind::offline || localLocation(location) ||
                               !app->store.networkAvailable(source.server);
@@ -1919,30 +2371,35 @@ void View::back() {
 void View::updateSelection() {
     selectionPending = false;
     const auto started = Clock::now();
-    const int selectedRows = ListView_GetSelectedCount(list);
-    const int count = selectedRows ? selectedRows : rowCount();
+    if (hasPreview() && !previewFocus) updatePreview();
+    const bool preview = hasPreview() && previewFocus;
+    HWND active = preview ? GetDlgItem(hwnd, IDC_RESULTS) : list;
+    const int total = preview ? previewCount() : rowCount();
+    const bool songsView = preview || showTracks();
+    const int selectedRows = ListView_GetSelectedCount(active);
+    const int count = selectedRows ? selectedRows : total;
     std::int64_t seconds = 0, songs = 0;
     bool knownDuration = true, knownCount = true;
     auto include = [&](int i) {
-        const auto duration = showTracks() ? tracks[i].duration : items[i].duration;
-        const int n = showTracks() ? 1 : items[i].songCount;
+        const auto duration = preview ? previewAt(i).duration : showTracks() ? trackAt(i).duration : itemAt(i).duration;
+        const int n = songsView ? 1 : itemAt(i).songCount;
         knownDuration &= duration > 0 || n == 0;
         knownCount &= n >= 0;
         seconds += duration;
         songs += std::max(0, n);
     };
     if (selectedRows) {
-        for (int i = ListView_GetNextItem(list, -1, LVNI_SELECTED); i >= 0 && i < rowCount();
-             i = ListView_GetNextItem(list, i, LVNI_SELECTED)) include(i);
+        for (int i = ListView_GetNextItem(active, -1, LVNI_SELECTED); i >= 0 && i < total;
+             i = ListView_GetNextItem(active, i, LVNI_SELECTED)) include(i);
     } else {
         for (int i = 0; i < count; ++i) include(i);
     }
     auto numberOf = [](std::int64_t n, const wchar_t* one, const wchar_t* many) {
         return std::to_wstring(n) + L" " + (n == 1 ? one : many);
     };
-    selectionSummary = showTracks() ? numberOf(count, L"track", L"tracks") : numberOf(count, L"item", L"items");
+    selectionSummary = songsView ? numberOf(count, L"track", L"tracks") : numberOf(count, L"item", L"items");
     if (selectedRows) selectionSummary += L" selected";
-    if (!showTracks() && count && knownCount) selectionSummary += L"  |  " + numberOf(songs, L"track", L"tracks");
+    if (!songsView && count && knownCount) selectionSummary += L"  |  " + numberOf(songs, L"track", L"tracks");
     if (knownDuration && seconds > 0) {
         auto padded = [](std::int64_t n) { return (n < 10 ? L"0" : L"") + std::to_wstring(n); };
         selectionSummary += L" [" + (seconds >= 3600 ? std::to_wstring(seconds / 3600) + L":" +
@@ -1962,8 +2419,10 @@ void View::updateStatus() {
     auto server = selected();
     std::wstring status;
     if (!server) status = L"Add a Navidrome or OpenSubsonic server to get started.";
-    else if ((loading || more) && !ListView_GetItemCount(list))
-        status = rowCount() ? L"Loading... " + std::to_wstring(rowCount()) : L"Loading...";
+    else if ((loading || more || projecting) && !ListView_GetItemCount(list)) {
+        const auto loaded = items.size() + tracks.size();
+        status = loaded ? L"Loading... " + std::to_wstring(loaded) : L"Loading...";
+    }
     else if (!message.empty()) status = wide(message);
     else if (!app->reportError.empty()) status = wide(app->reportError);
     else {
@@ -1989,18 +2448,23 @@ void View::updateStatus() {
     }
     if (server && app->store.offlineMode()) status = L"Offline  |  " + status;
     if (!history.empty()) status += L"  |  " + wide(location.title);
+    if (!options.musicPreset.empty()) {
+        for (auto& preset : musicPresets(location.kind))
+            if (options.musicPreset == preset.key) { status += std::wstring(L"  |  ") + preset.label; break; }
+    }
     if (server && servers.size() > 1 && sources.size() == 1) status += L"  |  " + wide(server->name);
     SetDlgItemTextW(hwnd, IDC_STATUS, status.c_str());
 }
 
 void View::updateButtons() {
     const bool haveServer = selected() != nullptr;
-    const bool haveRows = ListView_GetSelectedCount(list) > 0;
+    const bool preview = hasPreview() && previewFocus;
+    const bool haveRows = ListView_GetSelectedCount(preview ? GetDlgItem(hwnd, IDC_RESULTS) : list) > 0;
     EnableWindow(GetDlgItem(hwnd, IDC_QUERY), haveServer);
-    EnableWindow(GetDlgItem(hwnd, IDC_OPEN), haveRows);
-    EnableWindow(GetDlgItem(hwnd, IDC_CACHE_MENU), haveRows);
-    bool playable = haveRows && (showTracks() || albumActions());
-    if (playable && !showTracks()) {
+    EnableWindow(GetDlgItem(hwnd, IDC_OPEN), haveRows && !preview);
+    EnableWindow(GetDlgItem(hwnd, IDC_CACHE_MENU), haveRows && (preview || showTracks() || groupedAlbums()));
+    bool playable = haveRows && (preview || showTracks() || albumActions());
+    if (playable && !preview && !showTracks()) {
         for (int i = ListView_GetNextItem(list, -1, LVNI_SELECTED); i >= 0;
              i = ListView_GetNextItem(list, i, LVNI_SELECTED)) {
             if (!albumAt(i)) { playable = false; break; }
@@ -2011,42 +2475,62 @@ void View::updateButtons() {
 
 std::vector<Track> View::selection() {
     std::vector<Track> selectedTracks;
-    for (int i = ListView_GetNextItem(list, -1, LVNI_SELECTED); i >= 0;
-         i = ListView_GetNextItem(list, i, LVNI_SELECTED)) {
-        if (static_cast<std::size_t>(i) < tracks.size()) selectedTracks.push_back(tracks[i]);
+    const bool preview = hasPreview() && previewFocus;
+    HWND active = preview ? GetDlgItem(hwnd, IDC_RESULTS) : list;
+    for (int i = ListView_GetNextItem(active, -1, LVNI_SELECTED); i >= 0 && i < (preview ? previewCount() : rowCount());
+         i = ListView_GetNextItem(active, i, LVNI_SELECTED)) {
+        if (preview) selectedTracks.push_back(previewAt(i));
+        else if (groupedAlbums()) {
+            for (int row : projection.albums[i].rows) selectedTracks.push_back(projectionSource->tracks[row]);
+        } else if (showTracks()) selectedTracks.push_back(trackAt(i));
     }
     return selectedTracks;
 }
 
 void View::beginDrag(const NMLISTVIEW& notification) {
-    const auto* album = albumAt(notification.iItem);
-    if (!album) return;
-    draggedAlbums = ListView_GetItemState(list, notification.iItem, LVIS_SELECTED) ?
-        selectedAlbums() : std::vector<BrowseLocation>{*album};
-    if (draggedAlbums.empty()) return;
+    const bool preview = notification.hdr.idFrom == IDC_RESULTS;
+    const int row = notification.iItem;
+    if (row < 0 || row >= (preview ? previewCount() : rowCount())) return;
+    previewFocus = preview;
+    if (preview || showTracks() || groupedAlbums()) {
+        if (ListView_GetItemState(notification.hdr.hwndFrom, row, LVIS_SELECTED)) draggedTracks = selection();
+        else if (preview) draggedTracks.push_back(previewAt(row));
+        else if (groupedAlbums()) {
+            for (int i : projection.albums[row].rows) draggedTracks.push_back(projectionSource->tracks[i]);
+        } else draggedTracks.push_back(trackAt(row));
+    } else if (const auto* album = albumAt(row)) {
+        draggedAlbums = ListView_GetItemState(list, row, LVIS_SELECTED) ?
+            selectedAlbums() : std::vector<BrowseLocation>{*album};
+    }
+    if (draggedAlbums.empty() && draggedTracks.empty()) return;
     SetCapture(hwnd);
     POINT point = notification.ptAction;
-    MapWindowPoints(list, hwnd, &point, 1);
+    MapWindowPoints(notification.hdr.hwndFrom, hwnd, &point, 1);
     drag(point, false);
 }
 
 void View::cancelDrag() {
     draggedAlbums.clear();
+    draggedTracks.clear();
     if (GetCapture() == hwnd) ReleaseCapture();
 }
 
 void View::drag(POINT point, bool released) {
-    if (draggedAlbums.empty()) return;
+    if (draggedAlbums.empty() && draggedTracks.empty()) return;
     mlDropItemStruct drop{};
     drop.type = ML_TYPE_ITEMRECORDLISTW;
     drop.p = point;
     if (!ClientToScreen(hwnd, &drop.p)) { cancelDrag(); return; }
     drop.flags = released ? ML_HANDLEDRAG_FLAG_NOCURSOR : 0;
     library(ML_IPC_HANDLEDRAG, reinterpret_cast<WPARAM>(&drop));
-    if (released && !draggedAlbums.empty()) {
+    if (released) {
         auto albums = std::move(draggedAlbums);
+        auto tracks = std::move(draggedTracks);
         cancelDrag();
-        if (drop.result > 0) app->sendAlbums(std::move(albums), AlbumAction::drop, drop);
+        if (drop.result > 0) {
+            if (!tracks.empty()) app->sendTrackRecords(tracks, AlbumAction::drop, drop);
+            else if (!albums.empty()) app->sendAlbums(std::move(albums), AlbumAction::drop, drop);
+        }
     }
 }
 
@@ -2062,7 +2546,7 @@ std::vector<BrowseLocation> View::selectedAlbums() const {
 }
 
 void View::play(bool enqueue) {
-    if (!showTracks()) {
+    if (!showTracks() && !groupedAlbums() && !(hasPreview() && previewFocus)) {
         auto albums = selectedAlbums();
         if (!albums.empty()) app->sendAlbums(std::move(albums),
                                              enqueue ? AlbumAction::enqueue : AlbumAction::play);
@@ -2104,8 +2588,8 @@ void View::popup(int button) {
     if (button == IDC_CACHE_MENU) {
         AppendMenuW(menu, MF_STRING, IDC_KEEP_OFFLINE, L"Keep offline");
         AppendMenuW(menu, MF_STRING, IDC_UNPIN, L"Unpin");
-    } else if (button == IDC_VIEW_MENU) {
-        const auto& choices = sortChoices(location.kind);
+    } else if (button == IDC_SORT_MENU) {
+        const auto& choices = sortChoices(sourceKind());
         for (size_t i = 0; i < choices.size(); ++i) {
             const bool active = std::string_view(choices[i].key) == order.key;
             AppendMenuW(menu, MF_STRING | (active ? MF_CHECKED : 0), sortCommand + i, choices[i].label);
@@ -2113,8 +2597,42 @@ void View::popup(int button) {
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         if (std::string_view(order.key) != "sequence" && std::string_view(order.key) != "random")
             AppendMenuW(menu, MF_STRING | (descending ? MF_CHECKED : 0), directionCommand, L"Descending");
-        if (!showTracks()) {
-            AppendMenuW(menu, MF_STRING | (textList ? MF_CHECKED : 0), IDC_TEXT_LIST, L"Text list");
+    } else if (button == IDC_VIEW_OPTIONS) {
+        auto option = [&](int id, const wchar_t* label, bool checked = false) {
+            AppendMenuW(menu, MF_STRING | (checked ? MF_CHECKED : 0), id, label);
+        };
+        option(IDC_EDIT_VIEW, L"Edit view mode...\tF2");
+        if (auto modes = CreatePopupMenu()) {
+            AppendMenuW(modes, MF_STRING, IDC_SIMPLE, L"Simple List View");
+            AppendMenuW(modes, MF_STRING, IDC_COVERS, L"Album Cover View");
+            AppendMenuW(modes, MF_STRING, IDC_FILTERED, L"Filtered View");
+            CheckMenuRadioItem(modes, IDC_SIMPLE, IDC_FILTERED, filtered() ? IDC_FILTERED :
+                options.mode == ViewMode::covers ? IDC_COVERS : IDC_SIMPLE, MF_BYCOMMAND);
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(modes), L"View mode");
+        }
+        option(IDC_SEARCH, L"Refresh view metadata\tF5");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        if (filtered()) {
+            auto fields = filterFields(location.kind);
+            for (size_t i = 0; i < options.filters.size(); ++i) {
+                auto label = std::wstring(L"Edit \"") + findColumn(fields, options.filters[i])->label + L"\" filter columns...";
+                option(IDC_EDIT_FILTER_FIRST + static_cast<int>(i), label.c_str());
+            }
+            option(IDC_RESULT_ART, L"Display results using album art", options.resultArt);
+            option(IDC_FILTERS_RIGHT, L"Show results to the right of the filter panes", options.filtersRight);
+        }
+        if (options.mode == ViewMode::covers)
+            option(IDC_RESULT_ART, L"Display results using album art", options.albumArt);
+        if (options.mode == ViewMode::covers && supportsPreview()) {
+            option(IDC_ALBUM_RESULTS, L"Show the album selection results", options.albumResults);
+            if (options.albumResults)
+                option(IDC_ALBUMS_RIGHT, L"Show results to the right of the album art", options.albumsRight);
+        }
+        if (showTiles()) {
+            AppendMenuW(menu, MF_STRING | (options.coverTitles ? MF_CHECKED : 0) | (options.coverDetails ? MF_GRAYED : 0),
+                        IDC_COVER_TITLES, L"Show album title below album art");
+            option(IDC_COVER_DETAILS, L"Show details beside album art", options.coverDetails);
+            if (options.coverDetails) option(IDC_COVER_COLUMNS, L"Edit album art columns...");
             if (HMENU sizes = CreatePopupMenu()) {
                 for (size_t i = 0; i < std::size(coverSizes); ++i) {
                     const int size = coverSizes[i];
@@ -2123,10 +2641,20 @@ void View::popup(int button) {
                     AppendMenuW(sizes, MF_STRING | (size == preferredCoverSize ? MF_CHECKED : 0),
                                 coverSizeCommand + i, label.c_str());
                 }
-                AppendMenuW(menu, MF_POPUP | (textList ? MF_GRAYED : 0),
+                if (std::find(std::begin(coverSizes), std::end(coverSizes), preferredCoverSize) == std::end(coverSizes)) {
+                    const auto label = std::to_wstring(preferredCoverSize) + L" px";
+                    AppendMenuW(sizes, MF_STRING | MF_CHECKED, IDC_EDIT_VIEW, label.c_str());
+                }
+                AppendMenuW(sizes, MF_STRING, IDC_EDIT_VIEW, L"Custom size...");
+                AppendMenuW(menu, MF_POPUP,
                             reinterpret_cast<UINT_PTR>(sizes), L"Cover size");
             }
         }
+        if (options.mode == ViewMode::covers && !showTiles() && hasPreview())
+            option(IDC_COVER_COLUMNS, L"Edit album columns...");
+        if (!showTiles() || hasPreview())
+            option(IDC_EDIT_COLUMNS, filtered() || hasPreview() ? L"Edit results columns..." : L"Edit view columns...");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING | (app->store.offlineMode() ? MF_CHECKED : 0), IDC_OFFLINE, L"Work offline");
     } else {
         const Id filter = treeServer ? treeServer : app->filterServer;
@@ -2161,21 +2689,9 @@ void View::command(int id, int notification) {
         if (index <= servers.size()) selectCategory(category, index ? servers[index - 1].id : 0);
         return;
     }
-    const auto& choices = sortChoices(location.kind);
+    const auto& choices = sortChoices(sourceKind());
     if (id >= coverSizeCommand && static_cast<size_t>(id - coverSizeCommand) < std::size(coverSizes)) {
-        const int size = coverSizes[id - coverSizeCommand];
-        if (size == preferredCoverSize) return;
-        app->store.saveCoverSize(size);
-        preferredCoverSize = size;
-        const int pixels = size ? size : automaticCoverSize();
-        if (pixels != tileSize) {
-            const auto anchor = visibleTileRows();
-            tileSize = pixels;
-            resetImages();
-            changePresentation();
-            if (anchor.count()) ListView_EnsureVisible(list, anchor.first, FALSE);
-            scheduleArtwork();
-        }
+        setCoverSize(coverSizes[id - coverSizeCommand]);
         return;
     }
     if (id >= sortCommand && static_cast<size_t>(id - sortCommand) < choices.size()) {
@@ -2186,7 +2702,7 @@ void View::command(int id, int notification) {
     switch (id) {
     case directionCommand: chooseOrder(order, !descending); break;
     case IDC_ADD_SERVER: configure(hwnd, currentServer, true); break;
-    case IDC_VIEW_MENU: case IDC_SOURCE_MENU: case IDC_CACHE_MENU: popup(id); break;
+    case IDC_SORT_MENU: case IDC_VIEW_OPTIONS: case IDC_SOURCE_MENU: case IDC_CACHE_MENU: popup(id); break;
     case IDC_QUERY:
         if (notification == EN_CHANGE) SetTimer(hwnd, searchTimer, 300, nullptr);
         break;
@@ -2198,16 +2714,136 @@ void View::command(int id, int notification) {
         break;
     case IDC_BACK: back(); break;
     case IDC_OPEN: activate(ListView_GetNextItem(list, -1, LVNI_SELECTED)); break;
-    case IDC_TEXT_LIST:
-        textList = !textList;
-        app->store.saveTextCatalog(textList);
-        changePresentation();
-        break;
+    case IDC_EDIT_VIEW: case IDC_SIMPLE: case IDC_COVERS: case IDC_FILTERED:
+    case IDC_EDIT_COLUMNS: case IDC_EDIT_FILTER_FIRST: case IDC_EDIT_FILTER_FIRST + 1: case IDC_EDIT_FILTER_FIRST + 2:
+    case IDC_ALBUM_RESULTS: case IDC_ALBUMS_RIGHT: case IDC_FILTERS_RIGHT: case IDC_RESULT_ART:
+    case IDC_COVER_TITLES: case IDC_COVER_DETAILS: case IDC_COVER_COLUMNS:
+        configureView(id); break;
     case IDC_PLAY: play(false); break;
     case IDC_ENQUEUE: play(true); break;
     case IDC_KEEP_OFFLINE: cache(true); break;
     case IDC_UNPIN: cache(false); break;
     }
+}
+
+void View::setCoverSize(int size) {
+    if (size == preferredCoverSize) return;
+    app->store.saveCoverSize(size);
+    preferredCoverSize = size;
+    const int pixels = size ? size : automaticCoverSize();
+    if (pixels == tileSize) return;
+    const auto anchor = visibleTileRows();
+    tileSize = pixels;
+    resetImages();
+    changePresentation();
+    if (anchor.count()) ListView_EnsureVisible(list, anchor.first, FALSE);
+    scheduleArtwork();
+}
+
+void View::configureView(int id) {
+    ViewEditorHost host{plugin.hDllInstance, skinWindow};
+    auto next = options;
+    int size = preferredCoverSize;
+    if (id == IDC_EDIT_VIEW) {
+        if (!editLibraryView(host, hwnd, location.kind, supportsPreview(), next, size)) return;
+    } else if (id == IDC_EDIT_COLUMNS || id == IDC_COVER_COLUMNS) {
+        bool songs = showTracks() || (hasPreview() && id == IDC_EDIT_COLUMNS);
+        auto kind = songs ? BrowseKind::tracks : groupedAlbums() ? BrowseKind::albums : location.kind;
+        if (!editLibraryColumns(host, hwnd, id == IDC_COVER_COLUMNS ? L"Edit Album Art Columns" :
+            hasPreview() || filtered() ? L"Edit Results Columns" : L"Edit View Columns",
+            viewFields(kind), defaultColumns(kind), songs ? next.trackColumns : next.itemColumns)) return;
+    } else if (id >= IDC_EDIT_FILTER_FIRST && id < IDC_EDIT_FILTER_FIRST + 3) {
+        size_t pane = id - IDC_EDIT_FILTER_FIRST;
+        if (pane >= next.filters.size()) return;
+        auto fields = filterFields(location.kind);
+        const auto& key = next.filters[pane];
+        auto label = findColumn(fields, key)->label;
+        if (!editLibraryColumns(host, hwnd, std::wstring(L"Edit ") + label + L" Filter Columns",
+                summaryFields(label), defaultSummaryColumns(key), next.filterColumns[key])) return;
+    } else switch (id) {
+    case IDC_SIMPLE: next.mode = ViewMode::list; break;
+    case IDC_COVERS: next.mode = ViewMode::covers; next.albumArt = true; break;
+    case IDC_FILTERED: next.mode = ViewMode::filtered; break;
+    case IDC_ALBUM_RESULTS: next.albumResults = !next.albumResults; break;
+    case IDC_ALBUMS_RIGHT: next.albumsRight = !next.albumsRight; break;
+    case IDC_FILTERS_RIGHT: next.filtersRight = !next.filtersRight; break;
+    case IDC_RESULT_ART:
+        if (next.mode == ViewMode::covers) next.albumArt = !next.albumArt;
+        else next.resultArt = !next.resultArt;
+        break;
+    case IDC_COVER_TITLES: next.coverTitles = !next.coverTitles; break;
+    case IDC_COVER_DETAILS: next.coverDetails = !next.coverDetails; break;
+    }
+    const bool newPreset = next.musicPreset != options.musicPreset;
+    const bool reload = next.mode != options.mode || newPreset;
+    if (next.mode != options.mode && next.mode == ViewMode::covers) next.albumArt = true;
+    const auto previousSource = sourceKind();
+    auto previousRows = projectionSource;
+    const bool refilter = !reload && filtered() && next.filters != options.filters;
+    const bool wasPreview = hasPreview();
+    // Keep the old row mapping valid until the native control releases its selection.
+    if (reload) clearList();
+    options = std::move(next);
+    if (newPreset) {
+        for (auto& preset : musicPresets(location.kind)) if (preset.key == options.musicPreset && preset.sort) {
+            const auto& choices = sortChoices(sourceKind());
+            auto choice = std::find_if(choices.begin(), choices.end(), [&](const SortChoice& c) { return std::string_view(c.key) == preset.sort; });
+            if (choice != choices.end()) {
+                order = *choice;
+                descending = true;
+                if (sourceKind() == location.kind) app->store.saveBrowseOrder(location.kind, savedOrder());
+                else options.trackSort = savedOrder();
+            }
+            break;
+        }
+    }
+    saveOptions();
+    if (reload && previousSource == sourceKind() && (projectedList() || groupedAlbums()) &&
+        (previousRows || (!loading && !more && (!tracks.empty() || !items.empty())))) {
+        if (!previousRows) {
+            auto rows = std::make_shared<BrowsePage>();
+            rows->tracks = std::move(tracks);
+            rows->items = std::move(items);
+            previousRows = std::move(rows);
+        }
+        clearPreview();
+        filterSelection = {};
+        projection = {};
+        projectionSource = previousRows;
+        resetImages();
+        changePresentation();
+        project();
+    } else if (reload) startSearch();
+    else {
+        if (wasPreview && !hasPreview()) {
+            clearPreview();
+            if (!groupedAlbums()) { app->submitDetails(hwnd, {}); detailsPending = false; }
+        }
+        if (refilter) {
+            filterSelection = {};
+            fillingFilters = true;
+            for (int i = 0; i < 3; ++i) ListView_SetItemCount(GetDlgItem(hwnd, IDC_FILTER_FIRST + i), 0);
+            fillingFilters = false;
+            project();
+        }
+        changePresentation();
+        updateSelection();
+    }
+    setCoverSize(size);
+}
+
+void CALLBACK View::dividerMoved(HWND, INT, LPARAM param) {
+    auto& view = *reinterpret_cast<View*>(param);
+    if (view.splitLength <= 0) return;
+    POINT pt{};
+    if (!GetCursorPos(&pt) || !ScreenToClient(view.hwnd, &pt)) return;
+    const bool right = view.filtered() ? view.options.filtersRight : view.options.albumsRight;
+    const int pos = right ? pt.x : pt.y;
+    view.options.splitPercent = std::clamp(MulDiv(pos - view.splitStart, 100, view.splitLength), 15, 85);
+    RECT rc{};
+    GetClientRect(view.hwnd, &rc);
+    view.layout(rc.right, rc.bottom);
+    SetTimer(view.hwnd, splitTimer, 200, nullptr);
 }
 
 void View::layout(int width, int height) {
@@ -2240,37 +2876,81 @@ void View::layout(int width, int height) {
     visible(IDC_BACK, !history.empty());
     if (!history.empty()) place(IDC_BACK, gap, 8);
     place(IDC_SEARCH_LABEL, gap, 0);
-    const HWND sortButton = GetDlgItem(hwnd, IDC_VIEW_MENU);
+    const HWND sortButton = GetDlgItem(hwnd, IDC_SORT_MENU);
     auto buttonFont = reinterpret_cast<HFONT>(SendMessageW(sortButton, WM_GETFONT, 0, 0));
     auto oldFont = buttonFont ? SelectObject(dc, buttonFont) : nullptr;
     int menuWidth = 0;
     // WACUP's skinned button reports the ideal size of its current caption.
     // Measure the whole set in the button font so the toolbar stays still.
-    for (const auto& choice : sortChoices(location.kind)) {
+    for (const auto& choice : sortChoices(sourceKind())) {
         RECT text{};
         DrawTextW(dc, choice.label, -1, &text, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
         menuWidth = std::max(menuWidth, static_cast<int>(text.right));
     }
     if (oldFont) SelectObject(dc, oldFont);
     menuWidth += MulDiv(24, dpi, 96);
-    const int menuLeft = std::max(0, width - gap - menuWidth);
+    const int optionsLeft = std::max(0, width - gap - row);
+    const int menuLeft = std::max(0, optionsLeft - gap - menuWidth);
     const int sourceWidth = std::min(controlWidth(IDC_SOURCE_MENU, 12), width / 3);
     const int sourceLeft = std::max(0, menuLeft - gap - sourceWidth);
     move(IDC_QUERY, left, gap, sourceLeft - gap - left, row);
     move(IDC_SOURCE_MENU, sourceLeft, gap, sourceWidth, row);
-    move(IDC_VIEW_MENU, menuLeft, gap, menuWidth, row);
+    move(IDC_SORT_MENU, menuLeft, gap, std::min(menuWidth, optionsLeft - menuLeft), row);
+    move(IDC_VIEW_OPTIONS, optionsLeft, gap, row, row);
     const int listTop = row + gap * 2;
-    move(IDC_TRACKS, gap, listTop, width - gap * 2, footer - gap - listTop);
+    const bool filters = filtered(), preview = hasPreview(), split = filters || preview;
+    const bool right = filters ? options.filtersRight : options.albumsRight;
+    RECT first{gap, listTop, std::max(gap, width - gap), std::max(listTop, footer - gap)}, second = first;
+    visible(IDC_DIVIDER_H, split && !right);
+    visible(IDC_DIVIDER_V, split && right);
+    if (split) {
+        splitStart = right ? first.left : first.top;
+        splitLength = right ? first.right - first.left : first.bottom - first.top;
+        int middle = splitStart + MulDiv(splitLength, options.splitPercent, 100);
+        const int bar = std::max(4, gap * 2);
+        if (preview && showTiles() && !right && options.splitPercent == 45) {
+            const int caption = options.coverTitles && !options.coverDetails ? 2 * metrics.tmHeight : 0;
+            const int coverRow = tileSize + caption + row + gap * 2;
+            if (splitLength >= coverRow + bar + row * 2) middle = std::max(middle, splitStart + coverRow);
+        }
+        if (right) {
+            first.right = middle; second.left = middle + bar;
+            move(IDC_DIVIDER_V, middle, first.top, bar, first.bottom - first.top);
+        } else {
+            first.bottom = middle; second.top = middle + bar;
+            move(IDC_DIVIDER_H, first.left, middle, first.right - first.left, bar);
+        }
+    }
+    auto placePane = [&](int id, RECT bounds) {
+        move(id, bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top);
+    };
+    placePane(GetDlgCtrlID(list), filters ? second : first);
+    visible(IDC_RESULTS, preview);
+    if (preview) placePane(IDC_RESULTS, second);
+    for (int i = 0; i < 3; ++i) {
+        const int n = static_cast<int>(options.filters.size());
+        visible(IDC_FILTER_FIRST + i, filters && i < n);
+        if (!filters || i >= n) continue;
+        RECT pane = first;
+        if (right) {
+            pane.top += MulDiv(first.bottom - first.top, i, n);
+            pane.bottom = first.top + MulDiv(first.bottom - first.top, i + 1, n) - (i + 1 < n ? gap : 0);
+        } else {
+            pane.left += MulDiv(first.right - first.left, i, n);
+            pane.right = first.left + MulDiv(first.right - first.left, i + 1, n) - (i + 1 < n ? gap : 0);
+        }
+        placePane(IDC_FILTER_FIRST + i, pane);
+    }
     left = gap;
     auto action = [&](int id, bool show) {
         visible(id, show);
         if (show) place(id, footer, 10);
     };
     action(IDC_ADD_SERVER, !currentServer);
-    action(IDC_PLAY, currentServer && (showTracks() || albumActions()));
-    action(IDC_ENQUEUE, currentServer && (showTracks() || albumActions()));
+    action(IDC_PLAY, currentServer && (showTracks() || albumActions() || preview));
+    action(IDC_ENQUEUE, currentServer && (showTracks() || albumActions() || preview));
     action(IDC_OPEN, currentServer && !showTracks());
-    action(IDC_CACHE_MENU, currentServer && showTracks());
+    action(IDC_CACHE_MENU, currentServer && (showTracks() || groupedAlbums() || preview));
     move(IDC_STATUS, left, footer, width - gap - left, row);
     SelectObject(dc, previous);
     ReleaseDC(hwnd, dc);
@@ -2278,32 +2958,87 @@ void View::layout(int width, int height) {
     scheduleArtwork();
 }
 
+void View::setColumns() {
+    auto header = [](HWND control, const Columns& fields, const std::vector<std::string>& keys) {
+        int count = Header_GetItemCount(ListView_GetHeader(control));
+        while (count > static_cast<int>(keys.size())) ListView_DeleteColumn(control, --count);
+        for (int i = 0; i < static_cast<int>(keys.size()); ++i) {
+            const auto* f = findColumn(fields, keys[i]);
+            if (!f) continue;
+            LVCOLUMNW column{};
+            column.mask = LVCF_TEXT | LVCF_SUBITEM;
+            column.iSubItem = i;
+            column.pszText = const_cast<wchar_t*>(f->label);
+            if (i < count) ListView_SetColumn(control, i, &column);
+            else ListView_InsertColumn(control, i, &column);
+        }
+    };
+    auto kind = groupedAlbums() ? BrowseKind::albums : sourceKind();
+    const auto keys = showTiles() && !options.coverDetails ? std::vector<std::string>{"name"} :
+        (showTracks() ? options.trackColumns : options.itemColumns);
+    header(list, viewFields(kind), keys);
+    const auto sorted = std::find(keys.begin(), keys.end(), order.key);
+    MLSkinnedListView_DisplaySort(list, sorted == keys.end() ? -1 : static_cast<int>(sorted - keys.begin()), !descending);
+    if (hasPreview()) header(GetDlgItem(hwnd, IDC_RESULTS), viewFields(BrowseKind::tracks), options.trackColumns);
+    if (filtered()) {
+        auto fields = filterFields(location.kind);
+        for (size_t i = 0; i < options.filters.size(); ++i) {
+            auto& key = options.filters[i];
+            header(GetDlgItem(hwnd, IDC_FILTER_FIRST + static_cast<int>(i)),
+                   summaryFields(findColumn(fields, key)->label), options.filterColumns.at(key));
+        }
+    }
+}
+
 void View::resizeColumns() {
-    const int width = listViewportWidth(list);
-    if (showTiles()) {
-        ListView_SetColumnWidth(list, 0, width);
-        for (int i = 1; i < 5; ++i) ListView_SetColumnWidth(list, i, 0);
-    } else if (showTracks()) {
-        const int weights[] = {33, 20, 24, 8, 15};
-        int percent = 0, left = 0;
-        for (int i = 0; i < 5; ++i) {
-            percent += weights[i];
-            const int right = MulDiv(width, percent, 100);
-            ListView_SetColumnWidth(list, i, right - left);
+    int dpi = windowDpi(hwnd);
+    auto fit = [dpi](HWND control, const Columns& fields, const std::vector<std::string>& keys) {
+        int total = 0, minimum = 0;
+        HDC dc = GetDC(control);
+        auto previous = SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(control, WM_GETFONT, 0, 0)));
+        std::vector<int> widths;
+        for (auto& key : keys) {
+            const auto* f = findColumn(fields, key);
+            if (!f) { widths.push_back(0); continue; }
+            RECT extent{};
+            DrawTextW(dc, f->label, -1, &extent, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+            widths.push_back(extent.right + MulDiv(18, dpi, 96));
+            minimum += widths.back();
+            total += f->width;
+        }
+        SelectObject(dc, previous);
+        ReleaseDC(control, dc);
+        if (!total) return;
+        const int extra = std::max(0, listViewportWidth(control) - minimum);
+        int weight = 0, left = 0;
+        for (int i = 0; i < static_cast<int>(keys.size()); ++i) {
+            const auto* f = findColumn(fields, keys[i]);
+            if (!f) continue;
+            weight += f->width;
+            const int right = MulDiv(extra, weight, total);
+            const int width = widths[i] + right - left;
+            if (ListView_GetColumnWidth(control, i) != width) ListView_SetColumnWidth(control, i, width);
             left = right;
         }
-    } else {
-        ListView_SetColumnWidth(list, 0, MulDiv(width, 2, 3));
-        ListView_SetColumnWidth(list, 1, width - MulDiv(width, 2, 3));
-        for (int i = 2; i < 5; ++i) ListView_SetColumnWidth(list, i, 0);
+    };
+    if (showTiles() && !options.coverDetails) ListView_SetColumnWidth(list, 0, listViewportWidth(list));
+    else fit(list, viewFields(groupedAlbums() ? BrowseKind::albums : sourceKind()), showTracks() ? options.trackColumns : options.itemColumns);
+    if (hasPreview()) fit(GetDlgItem(hwnd, IDC_RESULTS), viewFields(BrowseKind::tracks), options.trackColumns);
+    if (filtered()) {
+        auto fields = filterFields(location.kind);
+        for (size_t i = 0; i < options.filters.size(); ++i) {
+            auto& key = options.filters[i];
+            fit(GetDlgItem(hwnd, IDC_FILTER_FIRST + static_cast<int>(i)),
+                summaryFields(findColumn(fields, key)->label), options.filterColumns.at(key));
+        }
     }
 }
 
 LRESULT CALLBACK searchProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR view) {
-    if (msg == WM_GETDLGCODE && w == VK_RETURN)
+    if (msg == WM_GETDLGCODE && (w == VK_F2 || w == VK_F5 || (w == VK_RETURN && GetDlgCtrlID(hwnd) == IDC_QUERY)))
         return DefSubclassProc(hwnd, msg, w, l) | DLGC_WANTMESSAGE;
-    if (msg == WM_KEYDOWN && w == VK_RETURN) {
-        SendMessageW(reinterpret_cast<HWND>(view), WM_COMMAND, IDC_SEARCH, 0);
+    if (msg == WM_KEYDOWN && (w == VK_F2 || w == VK_F5 || (w == VK_RETURN && GetDlgCtrlID(hwnd) == IDC_QUERY))) {
+        SendMessageW(reinterpret_cast<HWND>(view), WM_COMMAND, w == VK_F2 ? IDC_EDIT_VIEW : IDC_SEARCH, 0);
         return 0;
     }
     return DefSubclassProc(hwnd, msg, w, l);
@@ -2316,7 +3051,8 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             view = new View(hwnd, *reinterpret_cast<const Navigation*>(l));
             SetWindowLongPtrW(hwnd, DWLP_USER, reinterpret_cast<LONG_PTR>(view));
             app->activeView = hwnd;
-            SetWindowSubclass(GetDlgItem(hwnd, IDC_QUERY), searchProc, 1, reinterpret_cast<DWORD_PTR>(hwnd));
+            for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
+                SetWindowSubclass(child, searchProc, 1, reinterpret_cast<DWORD_PTR>(hwnd));
             view->populateServers();
             return TRUE;
         }
@@ -2335,7 +3071,22 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         case WM_COMMAND: view->command(LOWORD(w), HIWORD(w)); return TRUE;
         case WM_NOTIFY: {
             auto notification = reinterpret_cast<NMHDR*>(l);
-            if (notification->idFrom != IDC_TRACKS) break;
+            if (notification->idFrom == IDC_RESULTS || (notification->idFrom >= IDC_FILTER_FIRST && notification->idFrom <= IDC_FILTER_THIRD)) {
+                if (notification->code == LVN_GETDISPINFOW) { view->displayOther(*reinterpret_cast<NMLVDISPINFOW*>(l)); return TRUE; }
+                if (notification->idFrom == IDC_RESULTS) {
+                    if (notification->code == LVN_BEGINDRAG) { view->beginDrag(*reinterpret_cast<NMLISTVIEW*>(l)); return TRUE; }
+                    if (notification->code == NM_SETFOCUS) view->focusResults(true);
+                    if (notification->code == LVN_ITEMCHANGED || notification->code == LVN_ODSTATECHANGED) view->queueSelectionUpdate();
+                    if (notification->code == NM_DBLCLK || (notification->code == LVN_KEYDOWN &&
+                        reinterpret_cast<NMLVKEYDOWN*>(l)->wVKey == VK_RETURN)) view->playPreview();
+                } else if (notification->code == LVN_ITEMCHANGED || notification->code == LVN_ODSTATECHANGED) {
+                    view->filterEvent(static_cast<int>(notification->idFrom) - IDC_FILTER_FIRST);
+                }
+                break;
+            }
+            if (notification->hwndFrom != view->list) break;
+            if (notification->code == LVN_COLUMNCLICK) view->sortColumn(reinterpret_cast<NMLISTVIEW*>(l)->iSubItem);
+            if (notification->code == NM_SETFOCUS) view->focusResults(false);
             if (notification->code == LVN_ODCACHEHINT || notification->code == LVN_ENDSCROLL)
                 view->scheduleArtwork();
             if (notification->code == LVN_BEGINDRAG) {
@@ -2365,6 +3116,7 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         case WM_TIMER:
             if (w == viewTimer) view->refresh();
             if (w == searchTimer) view->command(IDC_SEARCH, 0);
+            if (w == splitTimer) { KillTimer(hwnd, splitTimer); view->saveOptions(); }
             return TRUE;
         case profilesChanged:
             if (l) view->setCategory(static_cast<BrowseKind>(w));
@@ -2373,8 +3125,13 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         case viewReady:
             if (auto result = app->takeResult(hwnd)) view->receive(std::move(*result));
             return TRUE;
+        case detailsReady:
+            if (auto result = app->takeDetails(hwnd)) view->receiveDetails(std::move(*result));
+            return TRUE;
+        case filtersChanged: view->filterSelectionChanged(static_cast<int>(w)); return TRUE;
         case ArtworkLoader::readyMessage: view->receiveArtwork(); return TRUE;
         case artworkViewportChanged: view->updateArtworkViewport(); return TRUE;
+        case populateTiles: view->fillTiles(); return TRUE;
         case moreRequested: view->fetchMore(); return TRUE;
         case selectionChanged: view->updateSelection(); return TRUE;
         case WM_DESTROY:

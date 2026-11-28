@@ -3,6 +3,7 @@
 #include "store.hpp"
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <set>
 #include <thread>
 
@@ -32,7 +33,7 @@ public:
 
     Generation reset(HWND view);
     void cancel(Generation generation);
-    void setViewport(Generation generation, int size, const std::vector<LibraryItem>& items,
+    void setViewport(Generation generation, int size, const std::function<LibraryItem(int)>& itemAt,
                      const std::vector<int>& rowsInPriorityOrder, std::size_t visibleCount);
     std::vector<Thumbnail> take(Generation generation);
     void requestTrack(Id key, bool priority = false);

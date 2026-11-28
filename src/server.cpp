@@ -244,6 +244,10 @@ SortTags sortTags(const Json& node) {
     field("playCount", {"playCount"});
     field("albumCount", {"albumCount"});
     field("channels", {"channelCount", "channels"});
+    field("bitRate", {"bitRate"});
+    field("sampleRate", {"samplingRate", "sampleRate"});
+    field("bitDepth", {"bitDepth"});
+    field("path", {"path"});
     field("bpm", {"bpm"});
     field("comment", {"comment"});
     field("owner", {"owner", "ownerName"});

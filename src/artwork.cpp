@@ -194,7 +194,7 @@ void ArtworkLoader::cancel(Generation generation) {
     ready_.notify_all();
 }
 
-void ArtworkLoader::setViewport(Generation generation, int size, const std::vector<LibraryItem>& items,
+void ArtworkLoader::setViewport(Generation generation, int size, const std::function<LibraryItem(int)>& itemAt,
                                 const std::vector<int>& rowsInPriorityOrder, std::size_t visibleCount) {
     {
         std::scoped_lock lock(mutex_);
@@ -204,8 +204,7 @@ void ArtworkLoader::setViewport(Generation generation, int size, const std::vect
         visibleRows_.insert(rowsInPriorityOrder.begin(), rowsInPriorityOrder.begin() + visibleCount);
         for (int row : rowsInPriorityOrder) {
             if (startedRows_.count(row)) continue;
-            const auto& item = items[row];
-            requests_.push_back({generation, row, size, {item.target, {}, item.coverId}});
+            requests_.push_back({generation, row, size, itemAt(row)});
         }
     }
     ready_.notify_all();

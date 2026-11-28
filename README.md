@@ -20,8 +20,12 @@ Open **Tangerine Stream** in the Media Library and click **Add server**. Enter y
 
 To add another server or change streaming quality, open **Preferences → Plug-ins → Media Library**, select **Tangerine Stream**, and click **Configure**. **Unify Libraries** combines servers in one library tree. Each server has its own quality settings. Metered connections default to MP3 at up to 192 kbps. Unmetered connections let the server choose.
 
+## Change the library view
+
+Open **≡** at the right of the search bar, or press **F2** to edit the current view. Choose a simple list, album covers, or up to three filters such as Genre, Artist and Album. The menu also lets you choose columns, set the cover size and show the selected album’s tracks below or beside its art. Tangerine Stream remembers the layout for each category.
+
 ## Listen offline
 
 Select tracks and choose **Cache → Keep offline**, or enable **Automatically keep server favorites offline** in Configure. Pinned tracks and downloaded favorites use space outside the shared rolling cache, which defaults to 1 GiB.
 
-Choose **Work offline** from the sort menu to browse what you’ve already visited. Downloaded tracks play offline, and Tangerine Stream saves your scrobbles across restarts until it can send them to the server.
+Choose **≡ → Work offline** to browse what you’ve already visited. Downloaded tracks play offline, and Tangerine Stream saves your scrobbles across restarts until it can send them to the server.

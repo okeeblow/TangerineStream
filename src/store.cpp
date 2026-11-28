@@ -387,9 +387,14 @@ bool Store::textCatalog() {
     return setting("text_catalog") == "1";
 }
 
-void Store::saveTextCatalog(bool text) {
+SortTags Store::viewSettings(BrowseKind kind) {
     std::scoped_lock lock(mutex_);
-    setSetting("text_catalog", text ? "1" : "0");
+    return decodeSortTags(setting(("library_view_" + std::to_string(static_cast<int>(kind))).c_str()));
+}
+
+void Store::saveViewSettings(BrowseKind kind, const SortTags& values) {
+    std::scoped_lock lock(mutex_);
+    setSetting(("library_view_" + std::to_string(static_cast<int>(kind))).c_str(), encodeSortTags(values));
 }
 
 int Store::coverSize() {

@@ -13,6 +13,10 @@ struct SortChoice {
 
 const std::vector<SortChoice>& sortChoices(BrowseKind kind);
 const SortChoice& defaultSort(BrowseKind kind);
+std::string browseField(const Track& track, std::string_view key);
+std::string browseField(const LibraryItem& item, std::string_view key);
+std::vector<size_t> sortIndices(const std::vector<Track>& rows, const SortChoice& choice, bool descending);
+std::vector<size_t> sortIndices(const std::vector<LibraryItem>& rows, const SortChoice& choice, bool descending);
 std::vector<size_t> sortRows(std::vector<Track>& rows, const SortChoice& choice, bool descending);
 std::vector<size_t> sortRows(std::vector<LibraryItem>& rows, const SortChoice& choice, bool descending);
 

@@ -11,7 +11,7 @@ HunterGate(
     SHA1 6498c5d0dec25d7fffb2b0574ebaf265179b894d
     LOCAL
 )
-project(ml_tangerinestream VERSION 0.6.16 LANGUAGES C CXX RC)
+project(ml_tangerinestream VERSION 0.7.0 LANGUAGES C CXX RC)
 set(TANGERINE_PRODUCT_NAME "Tangerine Stream")
 # Windows VERSIONINFO requires four components.
 string(REPLACE "." ";" version_components "${PROJECT_VERSION};0;0;0")
@@ -136,6 +136,7 @@ target_link_libraries(in_tangerinestream PRIVATE user32)
 
 add_wacup_plugin(ml_tangerinestream
     src/plugin.cpp src/list_scroll.cpp src/server.cpp src/store.cpp src/playback.cpp src/artwork.cpp src/browse_sort.cpp
+    src/library_view.cpp src/view_editor.cpp
     src/host_metadata.cpp src/plugin.rc)
 include(cmake/Migrations.cmake)
 embed_migrations(ml_tangerinestream)

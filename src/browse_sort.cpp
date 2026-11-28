@@ -33,6 +33,7 @@ std::string number(int64_t value, int minimum = 1) {
 
 std::string field(const LibraryItem& item, std::string_view key) {
     if (key == "name") return item.target.title;
+    if (key == "details") return item.subtitle;
     if (key == "id") return item.target.id;
     if (key == "songCount") return number(item.songCount, 0);
     if (key == "duration") return number(item.duration);
@@ -48,6 +49,14 @@ std::string field(const Track& t, std::string_view key) {
     if (key == "artist") return tag(t.sortTags, key, t.artist);
     if (key == "albumArtist") return tag(t.sortTags, key, t.albumArtist.empty() ? t.artist : t.albumArtist);
     if (key == "album") return t.album;
+    if (key == "track") return number(t.trackNumber);
+    if (key == "disc") return number(t.discNumber);
+    if (key == "format") return t.suffix;
+    if (key == "cache") {
+        if (t.pinned) return t.bytes ? "Permanent" : "Pin pending";
+        if (t.favorite) return t.bytes ? "Favorite" : "Favorite pending";
+        return t.bytes ? "Rolling" : "";
+    }
     if (key == "genre") return t.genre;
     if (key == "year") return number(t.year);
     if (key == "releaseYear") return tag(t.sortTags, key, number(t.year));
@@ -91,7 +100,7 @@ std::optional<int64_t> timestamp(std::string value) {
 }
 
 template<class T>
-std::vector<size_t> sort(std::vector<T>& rows, const SortChoice& choice, bool descending) {
+std::vector<size_t> indicesFor(const std::vector<T>& rows, const SortChoice& choice, bool descending) {
     const std::string_view key(choice.key);
     if (key == "sequence" || rows.size() < 2) return {};
     struct Entry {
@@ -127,6 +136,13 @@ std::vector<size_t> sort(std::vector<T>& rows, const SortChoice& choice, bool de
             return collate(a.title, b.title) < 0;
         });
     }
+    return indices;
+}
+
+template<class T>
+std::vector<size_t> sort(std::vector<T>& rows, const SortChoice& choice, bool descending) {
+    auto indices = indicesFor(rows, choice, descending);
+    if (indices.empty()) return indices;
     std::vector<T> sorted;
     sorted.reserve(rows.size());
     for (auto i : indices) sorted.push_back(std::move(rows[i]));
@@ -135,6 +151,15 @@ std::vector<size_t> sort(std::vector<T>& rows, const SortChoice& choice, bool de
 }
 } // namespace
 
+std::string browseField(const Track& row, std::string_view key) { return field(row, key); }
+std::string browseField(const LibraryItem& row, std::string_view key) { return field(row, key); }
+std::vector<size_t> sortIndices(const std::vector<Track>& rows, const SortChoice& choice, bool descending) {
+    return indicesFor(rows, choice, descending);
+}
+std::vector<size_t> sortIndices(const std::vector<LibraryItem>& rows, const SortChoice& choice, bool descending) {
+    return indicesFor(rows, choice, descending);
+}
+
 const std::vector<SortChoice>& sortChoices(BrowseKind kind) {
     static const std::vector<SortChoice> albumChoices{albumArtist, id, artist, duration, plays, name,
         randomOrder, rating, added, played, songs, starred, release};
@@ -142,7 +167,10 @@ const std::vector<SortChoice>& sortChoices(BrowseKind kind) {
     static const std::vector<SortChoice> genreChoices{albums, name, songs};
     static const std::vector<SortChoice> playlistChoices{duration, name, owner, visibility, songs, updated};
     static const std::vector<SortChoice> trackChoices{album, albumArtist, artist, bpm, channels, comment,
-        duration, starred, genre, name, plays, randomOrder, rating, added, played, release, year};
+        duration, starred, genre, name, plays, randomOrder, rating, added, played, updated, release, year,
+        {"track", L"Track number", true}, {"disc", L"Disc number", true}, {"format", L"Format"},
+        {"bitRate", L"Bitrate", true}, {"sampleRate", L"Sample rate", true}, {"bitDepth", L"Bit depth", true},
+        {"cache", L"Cache"}, {"path", L"Path"}};
     static const std::vector<SortChoice> orderedTracks = [] {
         std::vector<SortChoice> choices{sequence, id, sortName};
         choices.insert(choices.end(), trackChoices.begin(), trackChoices.end());
