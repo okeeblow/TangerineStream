@@ -36,621 +36,282 @@ foreach ($argument in ($env:TS_SHOT_ARGS -split '\s+' | Where-Object { $_ })) {
 }
 $build = Join-Path $root $(if ($compiler -eq 'vs') {'build-screenshots-vs-v143'} else {'build-screenshots-mingw32'})
 $imposter = Join-Path $build 'imposter-navidrome.exe'
-$wpf=Join-Path ([Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()) 'WPF'
-$uiAssemblies=@('System.Drawing','Accessibility')+@('UIAutomationClient.dll','UIAutomationTypes.dll','WindowsBase.dll' | ForEach-Object {Join-Path $wpf $_})
-Add-Type -ReferencedAssemblies $uiAssemblies -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Diagnostics;
-using System.Drawing;
-using System.Runtime.InteropServices;
-using System.Text;
-using System.Windows.Automation;
-using Accessibility;
-
-// Win32 interop for regenerate-screenshots.bat. Each window operation checks
-// both the launched process and its desktop before touching an HWND.
-public sealed class CaptureDesktop : IDisposable
-{
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern IntPtr CreateDesktop(string name, IntPtr device, IntPtr mode, uint flags, uint access, IntPtr security);
-    [DllImport("user32.dll")] static extern bool CloseDesktop(IntPtr desktop);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr CreateJobObject(IntPtr attributes, string name);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetInformationJobObject(IntPtr job, int type, ref JobLimits data, int bytes);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
-    [DllImport("kernel32.dll")] static extern bool TerminateJobObject(IntPtr job, uint code);
-    [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr process, uint code);
-    [DllImport("kernel32.dll")] static extern uint ResumeThread(IntPtr thread);
-    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
-    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern bool CreateProcess(string file, StringBuilder command, IntPtr pa, IntPtr ta, bool inherit,
-        uint flags, IntPtr env, string cwd, ref Startup startup, out ProcessInfo process);
-
-    [StructLayout(LayoutKind.Sequential)] struct BasicLimits {
-        public long perProcess, perJob; public uint flags; public UIntPtr min, max; public uint active;
-        public UIntPtr affinity; public uint priority, scheduling;
+# Gallery poses and window layouts
+function Save-Welcome($welcome) {
+    $ui.Post($main,0x111,40047,0)
+    [void]$ui.Send($main,0x400,0,101)
+    [void](Wait-For {$ui.Send($main,0x400,0,104) -eq 0 -and $ui.Send($main,0x400,0,124) -eq 0} 'stopped player and empty playlist')
+    Save-Shot 'classic-modern-welcome' -stopped -focusField $ui.Item($welcome,1001)
+}
+function Connect-DemoServer {
+    $welcome = Wait-For { Find-Form 1001 } 'Add server button'
+    Save-Welcome $welcome
+    $ui.EnqueueFile($main,(New-Intro 0))
+    [void](Wait-For {$ui.Send($main,0x400,0,124) -eq 1} 'the Add Server track')
+    Start-PoseTrack 'add-server'
+    $ui.Post($ui.Item($welcome,1001),0xf5,0,0)
+    $settings = Wait-For { Find-Form 1021 } 'server settings'
+    $ui.SetText($ui.Item($settings,1020),'Demo Server')
+    $ui.SetText($ui.Item($settings,1021),'https://tangerine.stream/')
+    $ui.SetText($ui.Item($settings,1022),'okeeblow')
+    $ui.SetText($ui.Item($settings,1023),'tangerine')
+    if (!$ui.Send($ui.Item($settings,1024),0xf0,0,0)) {[void]$ui.Send($ui.Item($settings,1024),0xf5,0,0)}
+    # The settings form updates its server list when its selection changes.
+    $servers=$ui.Item($settings,1027)
+    Command $settings 1001
+    [void](Wait-For {$ui.Send($servers,0x1004,0,0) -eq 2} 'the temporary blank server row')
+    Command $settings 1034
+    [void](Wait-For {$ui.Send($servers,0x1004,0,0) -eq 1 -and
+        $ui.ControlText($ui.Item($settings,1020)) -eq 'Demo Server' -and $ui.SelectListItem($servers,'Demo Server')} 'Demo Server in both fields')
+    Save-Shot 'add-server' $ui.Root($settings) $ui.Item($settings,1021)
+    $ui.SetText($ui.Item($settings,1020),'Music Library')
+    $ui.SetText($ui.Item($settings,1021),$api)
+    $ui.SetText($ui.Item($settings,1022),$demoUser)
+    $ui.SetText($ui.Item($settings,1023),$demoPassword)
+    $ok = $ui.Item($settings,1)
+    if ($ok -eq [IntPtr]::Zero) { $ok=$ui.Item($ui.Root($settings),1) }
+    $ui.Post($ok,0xf5,0,0)
+}
+function Save-ClassicModernGallery {
+    Save-Shot 'classic-modern-albums'
+    $form=Wait-Library
+    $ui.SetText($ui.Item($form,1003),$pose.albumQuery)
+    Command $form 1004
+    [void](Wait-For {$ui.Send($ui.Item($form,1006),0x1004,0,0) -eq $pose.albumMatches -and $pose.albumMatches -gt 1} 'complete multi-album search')
+    Save-Shot 'classic-modern-album-search'
+    $form=Search-Album
+    Command $form 1008
+    [void](Wait-For {$ui.ControlText($ui.Item($form,1013)).Contains($pose.album)} 'album tracks')
+    [void](Wait-Library)
+    Click-First $ui.Item($form,1006)
+    Command $form 1011
+    Save-Shot 'classic-modern-album-tracks'
+    foreach ($pair in @(@('Genres','genres'),@('Album Artists','album-artists'),@('Artists','artists'),@('Tracks','tracks'),
+                         @('Playlists','playlists'))) {
+        Save-Category $pair[0] ('classic-modern-'+$pair[1]) $true ($pair[0] -eq 'Playlists')
+        if ($pair[0] -eq 'Playlists' -and $pose.playlist) {
+            $form=Wait-Library
+            $ui.SetText($ui.Item($form,1003),$pose.playlist); Command $form 1004
+            [void](Wait-For {$ui.SelectListItem($ui.Item($form,1006),$pose.playlist)} 'the featured playlist')
+            Command $form 1008
+            [void](Wait-For {$ui.ControlText($ui.Item($form,1013)).Contains('  |  ')} 'opened contents view')
+            Command $form 1051
+            [void](Wait-Library)
+            Save-Shot 'classic-modern-playlist-tracks'
+        }
     }
-    [StructLayout(LayoutKind.Sequential)] struct JobLimits {
-        public BasicLimits basic; public ulong rOps,wOps,oOps,rBytes,wBytes,oBytes;
-        public UIntPtr processMem, jobMem, peakProcess, peakJob;
-    }
-    [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct Startup {
-        public int size; public string reserved, desktop, title; public int x,y,w,h,xChars,yChars,fill,flags;
-        public short show, reservedSize; public IntPtr reservedPtr, stdin, stdout, stderr;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct ProcessInfo { public IntPtr process, thread; public int pid, tid; }
-    IntPtr desktop, job;
-    public string Name { get; private set; }
-    public CaptureDesktop(string name) {
-        Name=name;
-        desktop=CreateDesktop(name,IntPtr.Zero,IntPtr.Zero,0,0x1ff,IntPtr.Zero);
-        if (desktop==IntPtr.Zero) throw new Win32Exception();
-        try {
-            job=CreateJobObject(IntPtr.Zero,null);
-            var limits=new JobLimits();
-            limits.basic.flags=0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            if (job==IntPtr.Zero || !SetInformationJobObject(job,9,ref limits,Marshal.SizeOf(limits))) throw new Win32Exception();
-        } catch { Dispose(); throw; }
-    }
-    public Process Start(string file,string command,string cwd) {
-        var startup=new Startup();
-        startup.size=Marshal.SizeOf(startup);
-        startup.desktop=@"WinSta0\"+Name;
-        ProcessInfo child;
-        if (!CreateProcess(file,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,false,0x08000004,
-                           IntPtr.Zero,cwd,ref startup,out child)) throw new Win32Exception();
-        try {
-            if (!AssignProcessToJobObject(job,child.process)) throw new Win32Exception();
-            var managed=Process.GetProcessById(child.pid);
-            if (ResumeThread(child.thread)==UInt32.MaxValue) throw new Win32Exception();
-            return managed;
-        } catch { TerminateProcess(child.process,1); throw; }
-        finally { CloseHandle(child.thread); CloseHandle(child.process); }
-    }
-    public void Dispose() {
-        if (job!=IntPtr.Zero) { TerminateJobObject(job,1); CloseHandle(job); job=IntPtr.Zero; }
-        if (desktop!=IntPtr.Zero) { CloseDesktop(desktop); desktop=IntPtr.Zero; }
-    }
+    Save-Category 'Favorites' 'classic-modern-favorites' $false
+    Select-View 'Tracks'
+    $form=Wait-Library
+    $ui.SetText($ui.Item($form,1003),$pose.filter)
+    Command $form 1004
+    [void](Wait-For {$count=$ui.Send($ui.Item($form,1006),0x1004,0,0); $count -gt 1 -and $count -le 23} 'multi-track catalog search')
+    Command $form 1053
+    [void](Wait-For {[CaptureWindows]::IsWindowVisible($ui.Item($form,1040))} 'filter panes')
+    [void](Wait-Library)
+    Save-Shot 'classic-modern-filtered-tracks'
+    Start-PoseTrack 'edit-view-mode'
+    Command $form 1050
+    $dialog=Wait-For {Find-Form 1060} 'view mode editor'
+    Save-Shot 'edit-view-mode' $ui.Root($dialog) $ui.Item($dialog,1060)
+    $ui.Post($ui.Root($dialog),0x10,0,0)
+    [void](Wait-For {!(Find-Form 1060)} 'closed view mode editor')
+    Start-PoseTrack 'edit-columns'
+    Command $form 1058
+    $dialog=Wait-For {Find-Form 1067} 'columns editor'
+    Save-Shot 'edit-columns' $ui.Root($dialog) $ui.Item($dialog,1067)
+    $ui.Post($ui.Root($dialog),0x10,0,0)
+    [void](Wait-For {!(Find-Form 1067)} 'closed columns editor')
+    Select-View 'Offline Cache'
+    $form=Wait-Library
+    Command $form 1015
+    [void](Wait-For {$ui.ControlText($ui.Item($form,1013)).StartsWith('Offline')} 'offline mode')
+    Save-Shot 'classic-modern-offline-cache'
+    Command $form 1015
+    [void](Wait-For {!$ui.ControlText($ui.Item($form,1013)).StartsWith('Offline')} 'online library')
 }
 
-public sealed class CaptureWindows
-{
-    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-    [DllImport("user32.dll")] static extern IntPtr GetThreadDesktop(uint thread);
-    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
-    [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] static extern int GetPrivateProfileString(string section,string key,string fallback,StringBuilder value,int size,string path);
-    [DllImport("user32.dll",SetLastError=true)] static extern bool AttachThreadInput(uint from,uint to,bool attach);
-    [DllImport("user32.dll")] static extern IntPtr SetActiveWindow(IntPtr window);
-    [DllImport("user32.dll")] static extern IntPtr SetFocus(IntPtr window);
-    [DllImport("user32.dll")] static extern IntPtr GetActiveWindow();
-    [DllImport("user32.dll")] static extern IntPtr GetFocus();
-    [StructLayout(LayoutKind.Sequential)] struct GuiThread {
-        public int size,flags;
-        public IntPtr active,focus,capture,menu,move,caret;
-        public Bounds caretRect;
+function Set-ModernProfile($profile,$skin) {
+    $olive = $skin -eq 'Olive'
+    # Classic Modern's main, equalizer and playlist are a 550px stack.
+    # The library's stock anchor is one column right and one player-height down.
+    $windows = if ($olive) {
+        @(@('main','Main Window','normal','32,32,550,243'),
+          @('PLEdit','Playlist Editor','normalpl','32,275,550,246'),
+          @('MLibrary','Media Library','normal','32,521,1500,784'),
+          @('winamp.albumart','Album Art','normal','1072,32,460,489'),
+          @('resizable_nostatus','Lyrics','resizable_nostatus','582,32,490,489'))
+    } else {
+        @(@('main','Main Window','normal','32,32,550,242'),
+          @('equalizer','Equalizer','normaleq','32,274,550,242'),
+          @('PLEdit','Playlist Editor','normalpl','32,516,550,242'),
+          @('MLibrary','Media Library','normal','582,274,984,484'),
+          @('winamp.albumart','Album Art','normal','582,32,492,242'),
+          @('resizable_nostatus','Lyrics','resizable_nostatus','1074,32,492,242'))
     }
-    [DllImport("user32.dll",SetLastError=true)] static extern bool GetGUIThreadInfo(uint thread,ref GuiThread state);
-    [DllImport("user32.dll")] static extern bool IsChild(IntPtr parent,IntPtr child);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern bool GetUserObjectInformation(IntPtr handle,int index,StringBuilder data,int bytes,out int needed);
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window,out int process);
-    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr window,StringBuilder text,int count);
-    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr window,StringBuilder text,int count);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
-    [DllImport("user32.dll")] static extern IntPtr GetDlgItem(IntPtr window,int id);
-    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr window,uint flag);
-    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window,out Bounds bounds);
-    [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr window,out Bounds bounds);
-    [DllImport("user32.dll")] static extern int MapWindowPoints(IntPtr from,IntPtr to,ref Bounds bounds,uint count);
-    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr window,IntPtr after,int x,int y,int w,int h,int flags);
-    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr window,int show);
-    [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr SendMessageTimeout(IntPtr window,uint msg,IntPtr w,IntPtr l,uint flags,uint ms,out IntPtr result);
-    [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr SendMessageTimeout(IntPtr window,uint msg,IntPtr w,string text,uint flags,uint ms,out IntPtr result);
-    [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool PostMessage(IntPtr window,uint msg,IntPtr w,IntPtr l);
-    [StructLayout(LayoutKind.Sequential)] struct CopyData {public IntPtr command; public int size; public IntPtr data;}
-    [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
-    static extern IntPtr SendMessageTimeout(IntPtr window,uint msg,IntPtr sender,ref CopyData data,uint flags,uint ms,out IntPtr result);
-    [DllImport("user32.dll",SetLastError=true)] static extern bool PrintWindow(IntPtr window,IntPtr dc,uint flags);
-    [DllImport("user32.dll")] static extern int GetWindowRgn(IntPtr window,IntPtr region);
-    [DllImport("gdi32.dll")] static extern IntPtr CreateRectRgn(int l,int t,int r,int b);
-    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
-    delegate bool EnumProc(IntPtr window,IntPtr param);
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc visit,IntPtr arg);
-    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent,EnumProc visit,IntPtr arg);
-    [DllImport("oleacc.dll")] static extern int AccessibleObjectFromWindow(IntPtr window,uint id,ref Guid iid,[MarshalAs(UnmanagedType.Interface)] out IAccessible obj);
-    [StructLayout(LayoutKind.Sequential)] struct Bounds {public int left,top,right,bottom;}
-    readonly int pid;
-    readonly string desktop;
-    static string DesktopName(uint thread) {
-        var name=new StringBuilder(256); int needed;
-        if (!GetUserObjectInformation(GetThreadDesktop(thread),2,name,name.Capacity*2,out needed)) throw new Win32Exception();
-        return name.ToString();
+    $layouts = foreach ($w in $windows) {
+        '<section name="Container:{0}"><section name="{1}"><section name="Layout:{2}"><entry name="rect" value="{3}"/><entry name="restoredrect" value="{3}"/><entry name="r" value="1.000000"/><entry name="maximized" value="0"/></section></section></section>' -f $w
     }
-    public CaptureWindows(int pid,string desktop) {
-        this.pid=pid; this.desktop=desktop;
-        if (!desktop.StartsWith("TangerineShots-",StringComparison.Ordinal) || DesktopName(GetCurrentThreadId())!=desktop)
-            throw new InvalidOperationException("The capture worker must run on its own desktop.");
-    }
-    bool Owned(IntPtr window) {
-        int owner;
-        uint thread=GetWindowThreadProcessId(window,out owner);
-        return thread!=0 && owner==pid && DesktopName(thread)==desktop;
-    }
-    void Check(IntPtr window) {
-        if (!Owned(window)) throw new InvalidOperationException("The window is outside this WACUP session.");
-    }
-    public IntPtr[] Windows(IntPtr parent) {
-        var all=new List<IntPtr>();
-        EnumProc collect=delegate(IntPtr h,IntPtr unused){if(Owned(h)) all.Add(h); return true;};
-        if(parent==IntPtr.Zero) EnumWindows(collect,IntPtr.Zero);
-        else if (Owned(parent)) EnumChildWindows(parent,collect,IntPtr.Zero);
-        return all.ToArray();
-    }
-    public string Class(IntPtr h) { if(!Owned(h)) return ""; var s=new StringBuilder(128); GetClassName(h,s,s.Capacity); return s.ToString(); }
-    public string Text(IntPtr h) {
-        if(!Owned(h)) return ""; var s=new StringBuilder(2048); GetWindowText(h,s,s.Capacity); return s.ToString();
-    }
-    public IntPtr Item(IntPtr h,int id) { return Owned(h)?GetDlgItem(h,id):IntPtr.Zero; }
-    public IntPtr Root(IntPtr h) { Check(h); return GetAncestor(h,2); }
-    public Rectangle Rect(IntPtr h) { Check(h); Bounds b; GetWindowRect(h,out b); return Rectangle.FromLTRB(b.left,b.top,b.right,b.bottom); }
-    public void Place(IntPtr h,int x,int y,int w,int height) {
-        Check(h);
-        if (!SetWindowPos(h,IntPtr.Zero,x,y,w,height,0x14)) throw new Win32Exception();
-    }
-    public void Show(IntPtr h,bool visible) {Check(h);ShowWindow(h,visible?4:0);}
-    public static string ProfileValue(string file,string section,string key) {
-        var value=new StringBuilder(256);
-        GetPrivateProfileString(section,key,"",value,value.Capacity,file);
-        return value.ToString();
-    }
-    public void FocusFrame(IntPtr frame,IntPtr field) {
-        Check(frame);Check(field);
-        if(field!=frame && !IsChild(frame,field)) throw new InvalidOperationException("Focus target is outside the capture frame.");
-        int owner;
-        uint from=GetCurrentThreadId(),to=GetWindowThreadProcessId(frame,out owner);
-        if(!AttachThreadInput(from,to,true)) throw new Win32Exception();
-        try {
-            SetWindowPos(frame,IntPtr.Zero,0,0,0,0,3);
-            SetActiveWindow(frame); SetFocus(field);
-            var focused=GetFocus();
-            if(GetActiveWindow()!=frame || (focused!=field && !IsChild(field,focused)))
-                throw new InvalidOperationException("Could not activate "+Text(frame)+" and focus its "+Class(field)+" control.");
-            Send(frame,0x86,1,0); // WM_NCACTIVATE paints the active nonclient title.
-        } finally {AttachThreadInput(from,to,false);}
-    }
-    public void CheckFocus(IntPtr frame,IntPtr field) {
-        Check(frame); Check(field);
-        int owner;
-        uint thread=GetWindowThreadProcessId(field,out owner);
-        var state=new GuiThread {size=Marshal.SizeOf(typeof(GuiThread))};
-        if(!GetGUIThreadInfo(thread,ref state)) throw new Win32Exception();
-        if(state.active!=frame || (state.focus!=field && !IsChild(field,state.focus))) FocusFrame(frame,field);
-    }
-    public long Send(IntPtr h,uint msg,long w,long l) {
-        Check(h); IntPtr result;
-        if (SendMessageTimeout(h,msg,(IntPtr)w,(IntPtr)l,0x20,10000,out result)==IntPtr.Zero) {
-            int error=Marshal.GetLastWin32Error();
-            throw new Win32Exception(error==0?1460:error);
-        }
-        return result.ToInt64();
-    }
-    public void Post(IntPtr h,uint msg,int w,int l) {
-        Check(h); if (!PostMessage(h,msg,(IntPtr)w,(IntPtr)l)) throw new Win32Exception();
-    }
-    public void SetText(IntPtr h,string value) {
-        Check(h); IntPtr result;
-        if (SendMessageTimeout(h,12,IntPtr.Zero,value,2,5000,out result)==IntPtr.Zero) throw new Win32Exception();
-    }
-    public void EnqueueFile(IntPtr player,string path) {
-        Check(player);
-        var message=new CopyData {command=(IntPtr)1100,size=(path.Length+1)*2,data=Marshal.StringToHGlobalUni(path)};
-        try {
-            IntPtr result;
-            if(SendMessageTimeout(player,0x4a,IntPtr.Zero,ref message,2,5000,out result)==IntPtr.Zero) throw new Win32Exception();
-        } finally {Marshal.FreeHGlobal(message.data);}
-    }
-    public string ControlText(IntPtr h) {
-        Check(h); IntPtr buf=Marshal.AllocHGlobal(8192);
-        try { Send(h,13,4096,buf.ToInt64()); return Marshal.PtrToStringUni(buf); } finally { Marshal.FreeHGlobal(buf); }
-    }
-    public bool SelectTree(IntPtr tree,string path) {
-        Check(tree);
-        var guid=typeof(IAccessible).GUID; IAccessible acc;
-        if (AccessibleObjectFromWindow(tree,0xfffffffc,ref guid,out acc)!=0) return false;
-        try {
-            long item=Send(tree,0x110a,0,0);
-            foreach(string name in path.Split('/')) {
-                while(item!=0 && acc.get_accName((int)Send(tree,0x112b,item,0))!=name) item=Send(tree,0x110a,1,item);
-                if(item==0) return false;
-                if (name==path.Substring(path.LastIndexOf('/')+1)) {
-                    Send(tree,0x110b,9,item);
-                    return Send(tree,0x110a,9,0)==item;
-                }
-                Send(tree,0x1102,2,item);
-                item=Send(tree,0x110a,4,item);
-            }
-            return false;
-        } finally {Marshal.ReleaseComObject(acc);}
-    }
-    public bool SelectListItem(IntPtr list,string title) {
-        Check(list);
-        var guid=typeof(IAccessible).GUID; IAccessible acc;
-        if(AccessibleObjectFromWindow(list,0xfffffffc,ref guid,out acc)!=0) return false;
-        try {
-            int count=(int)Send(list,0x1004,0,0);
-            if(count>100) return false; // the unfiltered catalog is still on screen
-            for(int i=0;i<count;i++) {
-                if(!String.Equals(acc.get_accName(i+1),title,StringComparison.Ordinal)) continue;
-                Send(list,0x100,0x24,0);
-                for(int row=0;row<i;row++) Send(list,0x100,0x28,0);
-                return (Send(list,0x102c,i,2)&2)!=0;
-            }
-            return false;
-        } catch(ArgumentException) {return false;}
-        catch(COMException) {return false;}
-        finally {Marshal.ReleaseComObject(acc);}
-    }
-    public Bitmap Print(IntPtr h) {
-        var size=Rect(h).Size;
-        if (size.Width<1 || size.Height<1 || size.Width>6000 || size.Height>6000) throw new InvalidOperationException("Invalid window dimensions.");
-        var image=new Bitmap(size.Width,size.Height,System.Drawing.Imaging.PixelFormat.Format24bppRgb);
-        try {
-            using (var g=Graphics.FromImage(image)) {
-                var dc=g.GetHdc();
-                try { if (!PrintWindow(h,dc,2)) throw new Win32Exception(); }
-                finally {g.ReleaseHdc(dc);}
-            }
-            return image;
-        } catch {image.Dispose();throw;}
-    }
-    public Region Shape(IntPtr h) {
-        Check(h); var region=CreateRectRgn(0,0,0,0);
-        try {return GetWindowRgn(h,region)>1 ? Region.FromHrgn(region) : new Region(new Rectangle(Point.Empty,Rect(h).Size));}
-        finally {DeleteObject(region);}
-    }
-    public bool SpectrumMoving(IntPtr window) {
-        using(var first=Print(window)) {
-            System.Threading.Thread.Sleep(130);
-            using(var next=Print(window)) {
-                int changed=0;
-                for(int y=45;y<first.Height-16;y+=3) for(int x=16;x<first.Width-16;x+=3) {
-                    if(first.GetPixel(x,y)!=next.GetPixel(x,y) && ++changed>=8) return true;
-                }
-            }
-        }
-        return false;
-    }
-    public string ArtworkStatus { get; private set; }
-    public bool BentoArtwork(IntPtr player,string filename) {
-        using(var expected=new Bitmap(filename))
-        using(var frame=Print(player)) {
-            foreach(var area in new[]{new Rectangle(454,53,170,170),new Rectangle(825,377,312,312)}) {
-                int error=0, samples=0;
-                for(int y=1;y<16;y++) for(int x=1;x<16;x++) {
-                    var a=expected.GetPixel(x*expected.Width/16,y*expected.Height/16);
-                    var b=frame.GetPixel(area.Left+x*area.Width/16,area.Top+y*area.Height/16);
-                    error+=Math.Abs(a.R-b.R)+Math.Abs(a.G-b.G)+Math.Abs(a.B-b.B);
-                    samples+=3;
-                }
-                if(error>samples*32) {
-                    ArtworkStatus="Artwork at "+area+" differs from the track cover by "+(error/samples)+" levels per channel.";
-                    return false;
-                }
-            }
-            return true;
-        }
-    }
-    // The Classic Modern skin defines a 62px thumb on a track starting at x=19
-    // with a 17px right margin. Locate the light handle on the dark groove in PrintWindow.
-    public double ClassicModernSeekFraction(IntPtr player) {
-        using (var frame=Print(player)) {
-            int width=frame.Width;
-            var brightness=new int[width];
-            int minimum=765, maximum=0;
-            for(int x=20;x<width-18;x++) {
-                for(int y=146;y<=158;y+=2) {
-                    var pixel=frame.GetPixel(x,y);
-                    brightness[x]=Math.Max(brightness[x],pixel.R+pixel.G+pixel.B);
-                }
-                minimum=Math.Min(minimum,brightness[x]);
-                maximum=Math.Max(maximum,brightness[x]);
-            }
-            int pixels=0,sum=0,threshold=minimum+(maximum-minimum)*2/3;
-            for(int x=20;x<width-18;x++) if(brightness[x]>threshold) {pixels++;sum+=x;}
-            return pixels<12 || pixels>75 ? -1 : (sum/(double)pixels-50)/(width-98);
-        }
-    }
-    public double BentoSeekFraction(IntPtr player) {
-        using(var frame=Print(player)) {
-            // The silver thumb on Big Bento's 428px progress bar is 43px wide.
-            for(int x=10;x<435;x++) {
-                var pixel=frame.GetPixel(x,138);
-                if(pixel.R>210 && pixel.G>210 && pixel.B>210) return (x-10)/385.0;
-            }
-            return -1;
-        }
-    }
-    public string RowStatus { get; private set; }
-    public bool TopReportRow(IntPtr list,int start,int total,string title) {
-        Check(list);
-        int count=(int)Send(list,0x1004,0,0);
-        if(count!=total) {RowStatus="Loaded "+count+" of "+total+" rows.";return false;}
-        var guid=typeof(IAccessible).GUID; IAccessible rows;
-        if(AccessibleObjectFromWindow(list,0xfffffffc,ref guid,out rows)!=0) return false;
-        try {
-            var first=rows.get_accName(start+1);
-            if(first!=title) {RowStatus="Row "+start+" contains ["+first+"], expected ["+title+"].";return false;}
-            Send(list,0x1013,start,0);
-            int top=(int)Send(list,0x1027,0,0), x,y,w,h;
-            rows.accLocation(out x,out y,out w,out h,start+1);
-            if(top!=start) Send(list,0x1014,0,(start-top)*h);
-            top=(int)Send(list,0x1027,0,0);
-            if(top!=start) {RowStatus="Top row is "+top+", expected "+start+".";return false;}
-            var bounds=Rect(list);
-            var last=first;
-            for(int i=top;i<count;i++) {
-                rows.accLocation(out x,out y,out w,out h,i+1);
-                if(y>=bounds.Bottom) break;
-                last=rows.get_accName(i+1);
-                if(String.IsNullOrEmpty(last) || last.Trim(' ','\u2800','\u2060','\u200b').Length==0) {
-                    RowStatus="Unpopulated visible row at "+i+" following "+first+".";return false;
-                }
-            }
-            RowStatus="row "+(top+1)+" of "+count+", "+first+" through "+last;
-            return true;
-        } catch(ArgumentException) {return false;}
-        catch(COMException) {return false;}
-        finally {Marshal.ReleaseComObject(rows);}
-    }
-    public string FitPopulatedColumns(IntPtr list) {
-        Check(list);
-        IntPtr header=(IntPtr)Send(list,0x101f,0,0);
-        if(header==IntPtr.Zero || !IsWindowVisible(header)) return "";
-        int rows=(int)Send(list,0x1004,0,0), columns=(int)Send(header,0x1200,0,0);
-        if(rows==0) {Show(header,false);return "empty list";}
-        if(columns<=1) return "";
-        object pattern;
-        var table=AutomationElement.FromHandle(list);
-        if(!table.TryGetCurrentPattern(GridPattern.Pattern,out pattern)) throw new InvalidOperationException("The library table did not expose its cells.");
-        var grid=(GridPattern)pattern;
-        int first=(int)Send(list,0x1027,0,0), last=Math.Min(rows,first+(int)Send(list,0x1028,0,0)+1);
-        Bounds bounds;
-        if(!GetClientRect(list,out bounds)) throw new Win32Exception();
-        int viewportBottom=Rect(list).Bottom;
-        var names=new string[columns];
-        var heading=new int[columns];
-        var minimum=new int[columns];
-        var preferred=new int[columns];
-        var flex=new int[columns];
-        var report=new List<string>();
-        int minimumTotal=0, contentTotal=0, flexTotal=0;
-        var headers=AutomationElement.FromHandle(header).FindAll(TreeScope.Children,Condition.TrueCondition);
-        if(headers.Count!=columns) throw new InvalidOperationException("The library table did not expose all of its headings.");
-        using(var g=Graphics.FromHwnd(list)) {
-            for(int col=0;col<columns;col++) {
-                names[col]=headers[col].Current.Name;
-                var widths=new List<int>();
-                for(int row=first;row<last;row++) {
-                    var cell=grid.GetItem(row,col);
-                    if(cell==null || cell.Current.BoundingRectangle.Top>=viewportBottom) continue;
-                    string value=cell.Current.Name;
-                    if(String.IsNullOrWhiteSpace(value) || value.Trim() == "\u2800") continue;
-                    widths.Add((int)Math.Ceiling(g.MeasureString(value,SystemFonts.MessageBoxFont).Width)+18);
-                }
-                if(widths.Count==0) {report.Add(names[col]+" hidden");continue;}
-                widths.Sort();
-                heading[col]=(int)Math.Ceiling(g.MeasureString(names[col],SystemFonts.MessageBoxFont).Width)+18;
-                bool compact=Array.IndexOf(new[]{"Cache","Length","Tracks","Albums","Year","Disc","#"},names[col])>=0;
-                // Fit fixed values such as "EA TRAX™" in full. A single long artist credit
-                // should not consume space that would display the titles of many tracks.
-                minimum[col]=Math.Max(heading[col],widths[compact?widths.Count-1:widths.Count/4]);
-                preferred[col]=Math.Max(minimum[col],widths[widths.Count-1-widths.Count/10]);
-                flex[col]=compact?0:preferred[col];
-                minimumTotal+=minimum[col]; contentTotal+=preferred[col]; flexTotal+=flex[col];
-            }
-        }
-        if(contentTotal==0) throw new InvalidOperationException("The nonempty library table returned no visible values.");
-        int space=bounds.right-3, weighted=0, assigned=0;
-        if(minimumTotal>space) {
-            minimum=heading;
-            minimumTotal=0;
-            foreach(int pixels in heading) minimumTotal+=pixels;
-        }
-        bool shrink=contentTotal>space;
-        int extra=shrink?Math.Max(0,space-minimumTotal):space-contentTotal;
-        int weights=shrink?contentTotal-minimumTotal:(flexTotal==0?contentTotal:flexTotal);
-        for(int col=0;col<columns;col++) {
-            int baseWidth=shrink?minimum[col]:preferred[col];
-            weighted+=shrink?preferred[col]-minimum[col]:(flexTotal==0?preferred[col]:flex[col]);
-            int share=weights==0?0:(int)((long)extra*weighted/weights);
-            int width=baseWidth+share-assigned;
-            Send(list,0x101e,col,width);
-            if(width>0) report.Add(names[col]+" "+width+"px");
-            assigned=share;
-        }
-        return String.Join(", ",report.ToArray());
-    }
-    public void FitBackButton(IntPtr form) {
-        var back=Item(form,1007);
-        if(back==IntPtr.Zero || !IsWindowVisible(back)) return;
-        int extra=Math.Max(0,60-Rect(back).Width);
-        if(extra==0) return;
-        foreach(int id in new int[]{1007,1014,1003}) {
-            IntPtr child=Item(form,id); Check(child);
-            Bounds box; GetWindowRect(child,out box);
-            MapWindowPoints(IntPtr.Zero,form,ref box,2);
-            int x=box.left+(id==1007?0:extra);
-            int width=box.right-box.left+(id==1007?extra:id==1003?-extra:0);
-            Place(child,x,box.top,width,box.bottom-box.top);
-        }
-    }
-    // An owner-data icon list exposes each tile's screen bounds through MSAA.
-    // Count painted covers only in the image area above the two caption lines.
-    public string CoverStatus { get; private set; }
-    public int FullCovers { get; private set; }
-    public int CoversAcross { get; private set; }
-    public double BottomArtworkFraction { get; private set; }
-    public bool TopAlbum(IntPtr list,int index) {
-        Check(list);
-        var guid=typeof(IAccessible).GUID; IAccessible acc;
-        if(AccessibleObjectFromWindow(list,0xfffffffc,ref guid,out acc)!=0) return false;
-        try {
-            Send(list,0x1013,0,0); // Get the first tile's row origin including any native header.
-            int x,top,w,h,y;
-            acc.accLocation(out x,out top,out w,out h,1);
-            Send(list,0x1013,index,0);
-            acc.accLocation(out x,out y,out w,out h,index+1);
-            if(y!=top) Send(list,0x1014,0,y-top);
-            acc.accLocation(out x,out y,out w,out h,index+1);
-            return Math.Abs(y-top)<=2;
-        } catch(COMException) { return false; }
-        catch(ArgumentException) { return false; }
-        finally {Marshal.ReleaseComObject(acc);}
-    }
-    public bool CoversPainted(IntPtr list,string[] allowedAlbums,int firstIndex) {
-        Check(list);
-        var guid=typeof(IAccessible).GUID; IAccessible acc;
-        if(AccessibleObjectFromWindow(list,0xfffffffc,ref guid,out acc)!=0) return false;
-        try {
-            var box=Rect(list);
-            int checkedTiles=0, bottomRow=Int32.MinValue;
-            FullCovers=0; CoversAcross=0; BottomArtworkFraction=0;
-            var rowCounts=new Dictionary<int,int>();
-            int background=(int)Send(list,0x1000,0,0), ink=(int)Send(list,0x1023,0,0);
-            var paper=background==-1 ? SystemColors.Window : ColorTranslator.FromWin32(background);
-            var text=ColorTranslator.FromWin32(ink);
-            var placeholder=Color.FromArgb((paper.R*7+text.R)/8,(paper.G*7+text.G)/8,(paper.B*7+text.B)/8);
-            using(var pixels=Print(list)) {
-                int rows=(int)Send(list,0x1004,0,0);
-                for(int id=Math.Max(1,firstIndex-11);id<=Math.Min(firstIndex+32,rows);id++) {
-                    int x,y,w,h;
-                    try {acc.accLocation(out x,out y,out w,out h,id);}
-                    catch(ArgumentException) {CoverStatus="No location for cover "+id;return false;}
-                    catch(COMException) {CoverStatus="Unavailable cover "+id;return false;}
-                    x-=box.X; y-=box.Y;
-                    if(y>=box.Height || h<65 || w<50) continue;
-                    var photo=Rectangle.Intersect(new Rectangle(0,0,box.Width,box.Height),
-                        new Rectangle(x+5,y+5,Math.Max(1,w-10),Math.Max(1,Math.Min(w,h)-12)));
-                    if(photo.Width<20 || photo.Height<12) continue;
-                    if(allowedAlbums!=null && Array.IndexOf(allowedAlbums,acc.get_accName(id))<0) {
-                        CoverStatus="Unexpected visible album: "+acc.get_accName(id);
-                        return false;
-                    }
-                    var colors=new HashSet<int>();
-                    for(int py=photo.Top;py<photo.Bottom && colors.Count<16;py+=4)
-                        for(int px=photo.Left;px<photo.Right && colors.Count<16;px+=4)
-                            colors.Add(pixels.GetPixel(px,py).ToArgb());
-                    colors.Remove(paper.ToArgb());
-                    colors.Remove(placeholder.ToArgb());
-                    if(colors.Count==0) {
-                        CoverStatus="Waiting for "+acc.get_accName(id)+" at "+photo+" ("+colors.Count+" colors).";
-                        return false;
-                    }
-                    checkedTiles++;
-                    int across; rowCounts.TryGetValue(y,out across);
-                    rowCounts[y]=++across;
-                    CoversAcross=Math.Max(CoversAcross,across);
-                    if(y>bottomRow) {
-                        bottomRow=y;
-                        BottomArtworkFraction=Math.Min(1,(box.Height-y)/(double)Math.Min(w,h));
-                    }
-                    if(y>=0 && y+h<=box.Height) FullCovers++;
-                }
-            }
-            return checkedTiles>0;
-        } finally {Marshal.ReleaseComObject(acc);}
-    }
+    $tint = if ($olive) {'<section name="Color Themes"><entry name="Winamp Classic Modern" value="++ Olive garden"/></section>'} else {''}
+    $xml = '<WasabiXML><configuration><section name="{00000000-0000-0000-0000-000000000000}">'+$tint+
+        '<section name="Skin:Winamp Classic Modern">'+($layouts -join '')+'</section></section></configuration></WasabiXML>'
+    $document = [xml]('<?xml version="1.0"?>'+$xml)
+    $document.Save((Join-Path $profile 'studio.xnf'))
 }
-'@
-Add-Type -TypeDefinition @'
-using System;
-using System.Diagnostics;
-using System.IO;
-using System.Security.Cryptography;
-using System.Text;
+function Set-Layout($skin) {
+    function Place($h,[int]$x,[int]$y,[int]$width,[int]$height) {
+        $ui.Place($h,$x,$y,$width,$height)
+        $placements[$h.ToInt64()]=[Drawing.Point]::new($x,$y)
+    }
+    if ($skin -eq 'Big Bento Modern') {
+        $frame = $ui.Root($tree)
+        Place $frame 32 32 1150 720
+        $lyrics=Get-Frame 'Lyrics'
+        if ($lyrics) {Place $lyrics 1182 32 320 720}
+        return $frame
+    }
+    if ($classic) {
+        $library = $ui.Root($tree)
+        $mainRect = $ui.Rect($main)
+        $editor = Get-Top 'Winamp PE'
+        $equalizer = Get-Top 'Winamp EQ'
+        foreach ($h in $main,$equalizer,$editor) {$ui.Show($h,$true)}
+        Place $main 32 32 $mainRect.Width $mainRect.Height
+        $y = 32+$mainRect.Height
+        $eqSize=$ui.Rect($equalizer)
+        Place $equalizer 32 $y $mainRect.Width $eqSize.Height
+        $y+=$eqSize.Height
+        Place $editor 32 $y $mainRect.Width 203
+        $y+=$ui.Rect($editor).Height
+        $lyrics=Get-Frame 'Lyrics'
+        if ($lyrics) {Place $lyrics 32 $y $mainRect.Width 162; $y+=$ui.Rect($lyrics).Height}
+        Place $library (32+$mainRect.Width) 32 900 ($y-32)
+        return $main
+    }
+    $library = Get-Frame 'Media Library'
+    $playlist = Get-Frame 'Playlist Editor'
+    $playerFrame = Get-Frame 'Main Window'
+    if (!$library -or !$playlist -or !$playerFrame) { throw 'Classic Modern layout is incomplete.' }
+    $playerSize = $ui.Rect($playerFrame)
+    $x = 32; $y = 32
+    if ($skin -eq 'Olive') {
+        $eq=Get-Frame 'Equalizer'
+        if ($eq) {$ui.Show($eq,$false)}
+        Place $playerFrame $x $y 550 243
+        Place $playlist $x ($y+243) 550 246
+        $lyrics = Wait-For { Get-Frame 'Lyrics' } 'Lyrics window'
+        $art = Wait-For { Get-Frame 'Album Art' } 'Album Art window'
+        Place $lyrics ($x+550) $y 490 489
+        Place $art ($x+1040) $y 460 489
+        Place $library $x ($y+489) 1500 784
+    } else {
+        $right = $x+$playerSize.Width
+        $width = 1100
+        $libraryHeight = 630
+        Place $playerFrame $x $y $playerSize.Width $playerSize.Height
+        Place (Get-Frame 'Equalizer') $x ($y+$playerSize.Height) $playerSize.Width $playerSize.Height
+        Place $playlist $x ($y+2*$playerSize.Height) $playerSize.Width ($libraryHeight-$playerSize.Height)
+        Place (Get-Frame 'Album Art') $right $y $playerSize.Height $playerSize.Height
+        $visWidth=360
+        Place (Get-Frame 'Lyrics') ($right+$playerSize.Height) $y ($width-$playerSize.Height-$visWidth) $playerSize.Height
+        Place $ui.Root($visualizer) ($right+$width-$visWidth) $y $visWidth $playerSize.Height
+        Place $library $right ($y+$playerSize.Height) $width $libraryHeight
+    }
+    return $playerFrame
+}
 
-// The verified NSIS package names and hashes the auxiliary downloads selected
-// by this WACUP release. Read its header without running the installer.
-public static class WacupPackage {
-    public static string Manifest(string installer,string sevenZip,string directory) {
-        byte[] data=File.ReadAllBytes(installer);
-        byte[] signature=Encoding.ASCII.GetBytes("NullsoftInst");
-        int offset=0;
-        for (int i=8;i<data.Length-24;i+=512) {
-            bool match=true;
-            for (int j=0;j<signature.Length;j++) if(data[i+j]!=signature[j]) {match=false;break;}
-            if (match) {offset=i;break;}
+# Private capture session
+function Start-PrivateProcess($file,$arguments,$directory,[bool]$stdin=$false,[bool]$stdout=$false,[bool]$stderr=$false) {
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $file
+    $info.Arguments = $arguments
+    $info.WorkingDirectory = $directory
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardInput = $stdin
+    $info.RedirectStandardOutput = $stdout
+    $info.RedirectStandardError = $stderr
+    if ($stdout) {$info.StandardOutputEncoding=$utf8}
+    if ($stderr) {$info.StandardErrorEncoding=$utf8}
+    return [Diagnostics.Process]::Start($info)
+}
+function Write-Login($process,$username,$password) {
+    $stream = $process.StandardInput.BaseStream
+    $bytes = $utf8.GetBytes($username + $nl + $password + $nl)
+    try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush() }
+    finally { [Array]::Clear($bytes,0,$bytes.Length); $process.StandardInput.Close() }
+}
+$hostTool=Join-Path $build 'screenshot-host.exe'
+
+function Invoke-Launcher {
+    $bootstrap=New-Object Threading.Mutex $false,'Local\TangerineStream-ScreenshotLauncher'
+    $locked=$false
+    try {
+        try {$locked=$bootstrap.WaitOne(0)} catch [Threading.AbandonedMutexException] {$locked=$true}
+        if (!$locked) {throw 'Another screenshot run is active.'}
+        Write-Host 'Preparing the WACUP screenshot tools...'
+        $buildFile=Join-Path $root 'build.bat'
+        $builder=Start-PrivateProcess $env:ComSpec ('/d /c ""'+$buildFile+'" '+$compiler+' --screenshot-host --no-pause 2>&1"') $root $false $true
+        try {
+            $log=$builder.StandardOutput.ReadToEnd()
+            $builder.WaitForExit()
+            if ($builder.ExitCode) {throw $log}
+        } finally {$builder.Dispose()}
+        $arguments='run "'+$env:TS_SHOT_FILE+'" '+$compiler+' '+$action+' '+$PID
+        $refresh=$action -eq 'refresh'
+        $secret=$null
+        if ($refresh) {
+            $secret=if ([Console]::IsInputRedirected) {ConvertTo-SecureString ([Console]::ReadLine()) -AsPlainText -Force}
+                    else {Read-Host 'Navidrome password for okeeblow at https://music.cooltrainer.org' -AsSecureString}
         }
-        if (offset==0) throw new InvalidDataException("Unrecognized WACUP installer format.");
-        int length=BitConverter.ToInt32(data,offset+12);
-        if (length<16 || length>32*1024*1024) throw new InvalidDataException("Invalid WACUP package header.");
-        string archive=Path.Combine(directory,"installer-header.lzma");
-        using (var stream=File.Create(archive)) {
-            stream.Write(data,offset+20,5);
-            for(int i=0;i<8;i++) stream.WriteByte(255);
-            stream.Write(data,offset+25,data.Length-offset-25);
-        }
-        var info=new ProcessStartInfo(sevenZip,"x -so -tlzma \""+archive+"\"");
-        info.UseShellExecute=false; info.CreateNoWindow=true; info.RedirectStandardOutput=true;
-        using (var reader=Process.Start(info)) {
+        try {
+            $supervisor=Start-PrivateProcess $hostTool $arguments $root $refresh $true $true
             try {
-                using(var binary=new BinaryReader(reader.StandardOutput.BaseStream)) {
-                    if(binary.ReadInt32()!=length) throw new InvalidDataException("WACUP header length mismatch.");
-                    byte[] header=binary.ReadBytes(length);
-                    if(header.Length!=length) throw new EndOfStreamException();
-                    return Encoding.Unicode.GetString(header);
+                $errors=$supervisor.StandardError.ReadToEndAsync()
+                if ($refresh) {
+                    $credential=[Management.Automation.PSCredential]::new('okeeblow',$secret)
+                    $bytes=$utf8.GetBytes($credential.GetNetworkCredential().Password+$nl)
+                    try {$supervisor.StandardInput.BaseStream.Write($bytes,0,$bytes.Length)}
+                    finally {[Array]::Clear($bytes,0,$bytes.Length);$supervisor.StandardInput.Close()}
                 }
-            } finally {if(!reader.HasExited) reader.Kill(); reader.WaitForExit();}
-        }
-    }
-    // WACUP ships NSIS VPatch deltas for the Winamp modern-skin plug-in and font renderer.
-    public static void ApplyPatch(string file,string patch) {
-        byte[] original=File.ReadAllBytes(file);
-        using (var md5=MD5.Create())
-        using (var delta=new BinaryReader(File.OpenRead(patch))) {
-            if(delta.ReadUInt32()!=0x54415056 || delta.ReadUInt32()!=0x80000001)
-                throw new InvalidDataException("Unrecognized WACUP skin-support patch.");
-            int blocks=delta.ReadInt32();
-            string before=BitConverter.ToString(delta.ReadBytes(16)), after=BitConverter.ToString(delta.ReadBytes(16));
-            string input=BitConverter.ToString(md5.ComputeHash(original));
-            if (input==after) return;
-            if (input!=before) throw new InvalidDataException("Incorrect source version for "+Path.GetFileName(file));
-            delta.ReadInt32();
-            using(var result=new MemoryStream()) {
-                for(int i=0;i<blocks;i++) {
-                    byte op=delta.ReadByte();
-                    if(op==255) {delta.ReadInt64();continue;}
-                    if(op<1 || op>7 || op==4) throw new InvalidDataException("Invalid VPatch operation.");
-                    int width=op&3;
-                    int count=width==1?delta.ReadByte():width==2?delta.ReadUInt16():delta.ReadInt32();
-                    if(op<4) result.Write(original,delta.ReadInt32(),count);
-                    else {var part=delta.ReadBytes(count);result.Write(part,0,part.Length);}
-                }
-                byte[] output=result.ToArray();
-                if(BitConverter.ToString(md5.ComputeHash(output))!=after) throw new InvalidDataException("Skin-support patch checksum mismatch.");
-                File.WriteAllBytes(file,output);
-            }
-        }
-    }
+                while ($null -ne ($line=$supervisor.StandardOutput.ReadLine())) {Write-Host $line}
+                $supervisor.WaitForExit()
+                if ($supervisor.ExitCode) {throw $errors.Result.Trim()}
+            } finally {$supervisor.Dispose()}
+        } finally {if ($secret) {$secret.Dispose()}}
+    } finally {if ($locked) {$bootstrap.ReleaseMutex()};$bootstrap.Dispose()}
 }
-'@
-Add-Type -AssemblyName System.Drawing
-function Write-Log($value) {
-    if ($env:TS_SHOT_WORKER) { [IO.File]::AppendAllText((Join-Path $run 'progress'), $value + $nl, $utf8) }
-    else { Write-Host $value }
+
+if (!$env:TS_SHOT_WORKER) {Invoke-Launcher;exit 0}
+$run=$env:TS_SHOT_RUN
+$shots=Join-Path $run 'shots'
+function Write-Log($value) {[IO.File]::AppendAllText((Join-Path $run 'progress'),$value+$nl,$utf8)}
+
+function Build-Tools {
+    $env:WACUP_PLUGINS_DIR = Join-Path $run 'WACUP\Plugins'
+    $log = Join-Path $run 'build.log'
+    $entry=Join-Path $root 'build-and-install.bat'
+    $builder=Start-PrivateProcess $env:ComSpec ('/d /c ""'+$entry+'" '+$compiler+' --screenshots --no-pause >"'+$log+'" 2>&1"') $root
+    try {
+        $builder.WaitForExit()
+        if ($builder.ExitCode) {throw ([IO.File]::ReadAllText($log))}
+    } finally {$builder.Dispose()}
 }
-function Remove-RunDirectory([string]$parent,[string]$name) {
-    $path = [IO.Path]::GetFullPath((Join-Path $parent $name))
-    if ([IO.Path]::GetDirectoryName($path) -ne [IO.Path]::GetFullPath($parent) -or
-        $name -notmatch '^TangerineShots-[0-9a-f]{32}$') { throw 'Invalid capture workspace.' }
-    if (Test-Path -LiteralPath $path) {
-        $item = Get-Item -Force -LiteralPath $path
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Unexpected link in $path" }
-        for ($attempt=0; ; ++$attempt) {
-            try { Remove-Item -LiteralPath $path -Force -Recurse; break }
-            catch { if ($attempt -ge 8) { throw }; Start-Sleep -Milliseconds 350 }
-        }
+function Invoke-Refresh {
+    [Console]::InputEncoding=$utf8
+    $password=[Console]::ReadLine()
+    if (!$password) {throw 'Missing Navidrome password.'}
+    Build-Tools
+    $export=Start-PrivateProcess $imposter ('refresh "'+(Join-Path $run 'demo.sqlite3')+'"') $run $true $true
+    try {
+        Write-Login $export 'okeeblow' $password
+        $password=$null
+        Write-Log $export.StandardOutput.ReadToEnd().TrimEnd()
+        $export.WaitForExit()
+        if ($export.ExitCode) {throw 'Could not refresh the demo database. Check the Navidrome login and network connection.'}
+    } finally {
+        if (!$export.HasExited) {$export.Kill(); $export.WaitForExit()}
+        $export.Dispose()
     }
 }
 function Get-LatestInstaller {
@@ -671,110 +332,69 @@ function Get-LatestInstaller {
     Write-Log ("Using " + $uri.Segments[-1])
     return $installer
 }
-function Start-PrivateProcess($file,$arguments,$directory,[bool]$stdin=$false,[bool]$stdout=$false) {
-    $info = New-Object Diagnostics.ProcessStartInfo
-    $info.FileName = $file
-    $info.Arguments = $arguments
-    $info.WorkingDirectory = $directory
-    $info.UseShellExecute = $false
-    $info.CreateNoWindow = $true
-    $info.RedirectStandardInput = $stdin
-    $info.RedirectStandardOutput = $stdout
-    return [Diagnostics.Process]::Start($info)
-}
-function Write-Login($process,$username,$password) {
-    $stream = $process.StandardInput.BaseStream
-    $bytes = $utf8.GetBytes($username + $nl + $password + $nl)
-    try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush() }
-    finally { [Array]::Clear($bytes,0,$bytes.Length); $process.StandardInput.Close() }
-}
-function Invoke-Refresh {
-    $pipe=[IO.Pipes.NamedPipeClientStream]::new('.',$env:TS_SHOT_WORKER,[IO.Pipes.PipeDirection]::In)
-    try {
-        $pipe.Connect(20000)
-        $reader=[IO.StreamReader]::new($pipe,$utf8)
-        try {$password=$reader.ReadLine()} finally {$reader.Dispose()}
-    } finally {$pipe.Dispose()}
-    Build-Tools
-    $export=Start-PrivateProcess $imposter ('refresh "'+(Join-Path $run 'demo.sqlite3')+'"') $run $true $true
-    try {
-        Write-Login $export 'okeeblow' $password
-        $password=$null
-        Write-Log $export.StandardOutput.ReadToEnd().TrimEnd()
-        $export.WaitForExit()
-        if ($export.ExitCode) {throw 'Could not refresh the demo database. Check the Navidrome login and network connection.'}
-    } finally {
-        if (!$export.HasExited) {$export.Kill(); $export.WaitForExit()}
-        $export.Dispose()
-    }
-}
-function Build-Tools {
-    $env:WACUP_PLUGINS_DIR = Join-Path $run 'WACUP\Plugins'
-    $log = Join-Path $run 'build.log'
-    $entry=Join-Path $root 'build-and-install.bat'
-    $builder=Start-PrivateProcess $env:ComSpec ('/d /c ""'+$entry+'" '+$compiler+' --screenshots --no-pause >"'+$log+'" 2>&1"') $root
-    try {
-        $builder.WaitForExit()
-        if ($builder.ExitCode) {throw ([IO.File]::ReadAllText($log))}
-    } finally {$builder.Dispose()}
-}
 function Install-PrivateWacup {
-    $app = Join-Path $run 'WACUP'
-    $installer = Get-LatestInstaller
-    $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
-    if (!$sevenZip) { $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe' }
-    if (!(Test-Path -LiteralPath $sevenZip)) { throw 'Install 7-Zip to unpack the WACUP x86 distribution.' }
-    $manifest = [WacupPackage]::Manifest($installer,$sevenZip,$run)
-    function Expand-Package($archive,$to,$entries) {
-        & $sevenZip x -y "-o$to" $archive @entries | Out-Null
-        if ($LASTEXITCODE) {throw "Could not unpack $archive."}
+    $installer=Get-LatestInstaller
+    $sevenZip=(Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+    if (!$sevenZip) {
+        $sevenZip=@($env:ProgramW6432,$env:ProgramFiles,${env:ProgramFiles(x86)} | Where-Object {$_} |
+            ForEach-Object {Join-Path $_ '7-Zip\7z.exe'} | Where-Object {Test-Path -LiteralPath $_}) | Select-Object -First 1
     }
-    function Get-Component($cacheName,$url) {
-        $cached = Join-Path $env:LOCALAPPDATA ("WACUP\"+$cacheName)
-        if ((Test-Path -LiteralPath $cached) -and $manifest.Contains((Get-FileHash -LiteralPath $cached).Hash)) {return $cached}
-        $file = Join-Path $run $cacheName
-        Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $file
-        if (!$manifest.Contains((Get-FileHash -LiteralPath $file).Hash)) {throw "WACUP component checksum mismatch for $cacheName."}
-        return $file
-    }
-    $skinUrl = [regex]::Match($manifest,'https://getwacup\.com/files/wacup_modern_skins_[0-9]+\.7z').Value
-    if (!$skinUrl) {throw 'The WACUP installer did not specify its Modern skin archive.'}
-    $skins = Get-Component 'wacup_default_modern_skins.7z' $skinUrl
-    $redux = Get-Component 'winamp_5666_full_redux_files.7z' 'https://getwacup.com/get_redux.php'
-    Expand-Package $installer $app @('*.dll','wacup.exe','winamp.exe','Microsoft.VC*.CRT','System',
-        'Plugins\in_wave.dll','Plugins\in_wav.dll','Plugins\gen_lyrics.dll','Plugins\ml_ll.dll','Plugins\ml_playlists.dll',
-        'Plugins\ml_bookmarks.dll','Plugins\ml_history.dll','Plugins\gen_ff.patch')
-    Expand-Package $redux $app @('Plugins\gen_ff.dll','Plugins\freeform','Microsoft.VC90.CRT')
-    Expand-Package $skins (Join-Path $app 'Skins') @('Winamp Classic Modern','Big Bento Modern')
-    Expand-Package $skins (Join-Path $app 'Plugins') @('freeform')
-    $eqProfile=Join-Path $run 'profile'
-    & $sevenZip e -y "-o$eqProfile" $installer '*\winamp.q1' | Out-Null
-    if ($LASTEXITCODE -or !(Test-Path -LiteralPath (Join-Path $eqProfile 'winamp.q1'))) {throw 'Missing WACUP factory EQ presets.'}
-    $presetDir=Join-Path $eqProfile 'Plugins\vis_classic'
-    & $sevenZip e -y "-o$presetDir" $installer '*\Plugins\vis_classic\*.ini' | Out-Null
-    if ($LASTEXITCODE) {throw 'Could not extract WACUP analyzer presets.'}
-    & $sevenZip e -y ('-o'+(Join-Path $app 'Plugins')) $installer '*\vis_classic.dll' | Out-Null
-    if ($LASTEXITCODE) {throw 'Could not extract the Classic Spectrum Analyzer.'}
-    [WacupPackage]::ApplyPatch((Join-Path $app 'Plugins\gen_ff.dll'),(Join-Path $app 'Plugins\gen_ff.patch'))
-    $font = Join-Path $app 'Plugins\freeform\wacs\freetype\freetype'
-    [WacupPackage]::ApplyPatch(($font+'.wac'),($font+'.patch'))
-    foreach ($folder in 'Roaming','Local','Temp') { [void][IO.Directory]::CreateDirectory((Join-Path $run $folder)) }
-    foreach ($name in 'wacup.exe','Skins\Winamp Classic Modern\skin.xml','Skins\Big Bento Modern\skin.xml','Plugins\gen_ff.dll') {
-        if (!(Test-Path -LiteralPath (Join-Path $app $name))) { throw "Portable WACUP is missing $name." }
-    }
-    $frame = Join-Path $app 'Skins\Winamp Classic Modern\xml\standardframe.xml'
-    $xml = [IO.File]::ReadAllText($frame)
-    $group = '<groupdef\b(?=[^>]*\bid="wasabi\.standardframe\.nostatusbar")[^>]*>'
-    $matchesFound = [regex]::Matches($xml,$group)
-    if ($matchesFound.Count -ne 1) { throw 'Could not identify the Classic Modern window-frame group.' }
-    $tag = $matchesFound[0].Value
-    if ($tag -notmatch '\brectrgn="1"') {
-        $fixed = if ($tag -match '\brectrgn="[^"]*"') { $tag -replace '\brectrgn="[^"]*"','rectrgn="1"' }
-                 else { $tag.Replace('id="wasabi.standardframe.nostatusbar"','id="wasabi.standardframe.nostatusbar" rectrgn="1"') }
-        [IO.File]::WriteAllText($frame,$xml.Replace($tag,$fixed),$utf8)
-    }
-    if ([regex]::Match([IO.File]::ReadAllText($frame),$group).Value -notmatch '\brectrgn="1"') { throw 'Classic Modern frame patch failed.' }
+    if (!$sevenZip) {throw 'Install 7-Zip to unpack WACUP.'}
+    & $hostTool unpack $run $installer $sevenZip
+    if ($LASTEXITCODE) {throw 'Could not unpack the private WACUP installation.'}
 }
+
+$wpf=Join-Path ([Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()) 'WPF'
+$uiAssemblies=@('System.Drawing','Accessibility')+@('UIAutomationClient.dll','UIAutomationTypes.dll','WindowsBase.dll' | ForEach-Object {Join-Path $wpf $_})
+$controls=[IO.File]::ReadAllText((Join-Path $tools 'WindowControls.cs'))
+$capture=@'
+public sealed partial class CaptureWindows {
+    [DllImport("user32.dll",SetLastError=true)] static extern bool PrintWindow(IntPtr window,IntPtr dc,uint flags);
+    public Bitmap Print(IntPtr h) {
+        var size=Rect(h).Size;
+        if (size.Width<1 || size.Height<1 || size.Width>6000 || size.Height>6000) throw new InvalidOperationException("Invalid window dimensions.");
+        var image=new Bitmap(size.Width,size.Height,System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+        try {
+            using (var g=Graphics.FromImage(image)) {
+                var dc=g.GetHdc();
+                try { if (!PrintWindow(h,dc,2)) throw new Win32Exception(); }
+                finally {g.ReleaseHdc(dc);}
+            }
+            return image;
+        } catch {image.Dispose();throw;}
+    }
+    // The Classic Modern skin defines a 62px thumb on a track starting at x=19
+    // with a 17px right margin. Locate the light handle on the dark groove in PrintWindow.
+    public double ClassicModernSeekFraction(Bitmap frame) {
+        int width=frame.Width;
+        var brightness=new int[width];
+        int minimum=765, maximum=0;
+        for(int x=20;x<width-18;x++) {
+            for(int y=146;y<=158;y+=2) {
+                var pixel=frame.GetPixel(x,y);
+                brightness[x]=Math.Max(brightness[x],pixel.R+pixel.G+pixel.B);
+            }
+            minimum=Math.Min(minimum,brightness[x]);
+            maximum=Math.Max(maximum,brightness[x]);
+        }
+        int pixels=0,sum=0,threshold=minimum+(maximum-minimum)*2/3;
+        for(int x=20;x<width-18;x++) if(brightness[x]>threshold) {pixels++;sum+=x;}
+        return pixels<12 || pixels>75 ? -1 : (sum/(double)pixels-50)/(width-98);
+    }
+    public double BentoSeekFraction(Bitmap frame) {
+        // The silver thumb on Big Bento's 428px progress bar is 43px wide.
+        for(int x=10;x<435;x++) {
+            var pixel=frame.GetPixel(x,138);
+            if(pixel.R>210 && pixel.G>210 && pixel.B>210) return (x-10)/385.0;
+        }
+        return -1;
+    }
+}
+'@
+Add-Type -ReferencedAssemblies $uiAssemblies -TypeDefinition ($controls+$nl+$capture)
+Add-Type -AssemblyName System.Drawing
+
+# Window controls, playback and capture
 function Wait-For([scriptblock]$check,[string]$description,[int]$timeoutSeconds=25) {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     do {
@@ -911,59 +531,63 @@ function Set-CapturePosition($name,$slot,$only,$visualPreset) {
             $ms -ge 1000*$seconds -and $ms -lt 1000*($seconds+2)
         } 'assigned playback position' 8)
     } catch {throw "Could not seek $name to ${seconds}s (result $seekResult, time $($ui.Send($main,0x400,0,105))ms, index $($ui.Send($main,0x400,0,125)), state $($ui.Send($main,0x400,0,104)), title $($ui.Text($main)))."}
-    if ($only -eq [IntPtr]::Zero -and !$classic) {
-        $duration=[double]$pose.queue[$slot].duration
-        $seekTimer=[Diagnostics.Stopwatch]::StartNew()
-        do {
-            $shown=if ($skin -eq 'Big Bento Modern') {$ui.BentoSeekFraction($layoutPlayer)} else {$ui.ClassicModernSeekFraction($layoutPlayer)}
-            $expected=$ui.Send($main,0x400,0,105)/(1000*$duration)
-            if ([Math]::Abs($shown-$expected) -lt 0.025) {break}
-            if ($seekTimer.Elapsed.TotalSeconds -gt 8) {throw "Seek thumb for $name shows $shown, expected $expected."}
-            Start-Sleep -Milliseconds 100
-        } while ($true)
-    }
     Start-Sleep -Milliseconds 250
     if ($visualizer -ne [IntPtr]::Zero -and $only -eq [IntPtr]::Zero) {
         [void](Wait-For {$ui.SpectrumMoving($ui.Root($visualizer))} "the $visualPreset spectrum to animate" 8)
     }
     return $seconds
 }
-function Save-Shot($name,$only=[IntPtr]::Zero) {
-    $welcomeShot=$name -eq 'classic-modern-welcome'
-    $slot=[array]::IndexOf($shotOrder,$name)
-    if (!$welcomeShot) {
-        Start-PoseTrack $name
-        $preset=Set-TrackEqualizer $pose.queue[$slot]
-        if ($visualizer -ne [IntPtr]::Zero -and $only -eq [IntPtr]::Zero) {
-            $visualPreset=$visualPresets[$slot%$visualPresets.Count]
-            Set-AnalyzerPreset $visualizer $visualPreset
-        }
-    }
+function Get-ShotFrame($window) {
+    if ($window -ne $layoutPlayer -or $stopped -or $classic) {return $ui.Print($window)}
+    # Verify the thumb in the very bitmap that will be saved. A skin can repaint after a focus change.
+    $duration=[double]$pose.queue[$slot].duration
+    $timer=[Diagnostics.Stopwatch]::StartNew()
+    do {
+        $frame=$ui.Print($window)
+        $shown=if ($skin -eq 'Big Bento Modern') {$ui.BentoSeekFraction($frame)} else {$ui.ClassicModernSeekFraction($frame)}
+        $expected=$ui.Send($main,0x400,0,105)/(1000*$duration)
+        if ([Math]::Abs($shown-$expected) -lt 0.025) {return $frame}
+        $frame.Dispose()
+        if ($timer.Elapsed.TotalSeconds -gt 8) {throw "Seek thumb for $name shows $shown, expected $expected."}
+        Start-Sleep -Milliseconds 100
+    } while ($true)
+}
+function Set-LibraryViewport($name,$slot) {
     if ($name -in 'classic-modern-album-tracks','classic-modern-playlist-tracks') {
-        $ui.FitBackButton((Find-Form 1003))
+        $form=Find-Form 1003
+        $back=$ui.Item($form,1007)
+        $extra=[Math]::Max(0,60-$ui.Rect($back).Width)
+        if ($extra) {
+            foreach ($id in 1007,1014,1003) { # Back, Search label, Search field
+                $child=$ui.Item($form,$id)
+                $box=$ui.ChildRect($form,$child)
+                if ($id -ne 1007) {$box.X+=$extra}
+                if ($id -eq 1007) {$box.Width+=$extra}
+                if ($id -eq 1003) {$box.Width-=$extra}
+                $ui.Place($child,$box.X,$box.Y,$box.Width,$box.Height)
+            }
+        }
     }
-    if ($only -eq [IntPtr]::Zero) {
-        $browser=Find-Form 1003
-        if ($browser -and $ui.ControlText($ui.Item($browser,1003)).Length) {
-            $list=$ui.Item($browser,1006)
-            if ([CaptureWindows]::IsWindowVisible($ui.Item($browser,1043))) {$list=$ui.Item($browser,1043)}
-            [void](Wait-For {$ui.Send($list,0x1004,0,0) -gt 1} "multiple visible search results for $name")
-        }
-        $section=switch ($name) {
-            'classic-modern-genres' {'genre'}
-            'classic-modern-album-artists' {'albumartist'}
-            'classic-modern-artists' {'artist'}
-            'classic-modern-tracks' {'song'}
-            'classic-modern-playlists' {'playlist'}
-            'classic-modern-playlist-tracks' {'playlistTracks'}
-        }
-        if ($section -and $pose.textWindows.$section) {
-            $view=$pose.textWindows.$section
-            $list=$ui.Item($browser,1006)
-            try {[void](Wait-For {$ui.TopReportRow($list,$view.start,$view.total,$view.first)} "the $section viewport" 45)}
-            catch {throw "$($_.Exception.Message) $($ui.RowStatus)"}
-            Write-Log "$name shows $($ui.RowStatus)"
-        }
+    $browser=Find-Form 1003
+    if ($browser -and $ui.ControlText($ui.Item($browser,1003)).Length) {
+        $list=$ui.Item($browser,1006)
+        if ([CaptureWindows]::IsWindowVisible($ui.Item($browser,1043))) {$list=$ui.Item($browser,1043)}
+        [void](Wait-For {$ui.Send($list,0x1004,0,0) -gt 1} "multiple visible search results for $name")
+    }
+    $section=switch ($name) {
+        'classic-modern-genres' {'genre'}
+        'classic-modern-album-artists' {'albumartist'}
+        'classic-modern-artists' {'artist'}
+        'classic-modern-tracks' {'song'}
+        'classic-modern-playlists' {'playlist'}
+        'classic-modern-playlist-tracks' {'playlistTracks'}
+    }
+    if ($section -and $pose.textWindows.$section) {
+        $view=$pose.textWindows.$section
+        $list=$ui.Item($browser,1006)
+        try {[void](Wait-For {$ui.TopReportRow($list,$view.start,$view.total,$view.first)} "the $section viewport" 45)}
+        catch {throw "$($_.Exception.Message) $($ui.RowStatus)"}
+        Write-Log "$name shows $($ui.RowStatus)"
     }
     if ($name -match '(-albums|-favorites|-album-search|-olive-playback)$') {
         $view=Wait-For {Find-Form 1003} 'cover browser'
@@ -990,9 +614,10 @@ function Save-Shot($name,$only=[IntPtr]::Zero) {
         }
         if ($name -eq 'big-bento-modern-albums') {
             if ($ui.FullCovers -le 4) {throw 'Big Bento must show more than four complete album tiles.'}
+            $panes=[Drawing.Rectangle[]]@([Drawing.Rectangle]::new(454,53,170,170),[Drawing.Rectangle]::new(825,377,312,312))
             $reference=Join-Path $run 'now-playing-cover.jpg'
             Get-DemoAsset 'getCoverArt' $pose.queue[$slot].coverArt $reference
-            if (!$ui.BentoArtwork($layoutPlayer,$reference)) {
+            if (!$ui.ArtworkMatches($layoutPlayer,$reference,$panes)) {
                 # Wasabi asks for both embedded covers at track start. Reload after the native sidecar is ready.
                 $marker=Wait-For {
                     Get-ChildItem -LiteralPath (Join-Path $profile 'Plugins\Tangerine Stream\items') -File -Recurse -Filter '*.tstream' |
@@ -1003,73 +628,45 @@ function Save-Shot($name,$only=[IntPtr]::Zero) {
                 $ui.Post($main,0x111,40047,0)
                 [void](Wait-For {$ui.Send($main,0x400,0,104) -eq 0} 'stopped before reloading the track artwork')
                 Start-PoseTrack $name
-                try {[void](Wait-For {$ui.BentoArtwork($layoutPlayer,$reference)} 'both Big Bento playback covers' 15)}
+                try {[void](Wait-For {$ui.ArtworkMatches($layoutPlayer,$reference,$panes)} 'both Big Bento playback covers' 15)}
                 catch {throw "$($_.Exception.Message) $($ui.ArtworkStatus)"}
             }
         }
     }
-    if ($only -eq [IntPtr]::Zero -and $browser) {
+    if ($browser) {
         foreach ($list in $ui.Windows($browser)) {
             if ($ui.Class($list) -ne 'SysListView32' -or ![CaptureWindows]::IsWindowVisible($list)) {continue}
-            $columns=$ui.FitPopulatedColumns($list)
+            $columns=$ui.FitPopulatedColumns($list,@('Cache','Length','Tracks','Albums','Year','Disc','#'))
             if ($columns) {Write-Log "$name columns - $columns"}
         }
     }
-    $focusField=switch ($name) {
-        'classic-modern-welcome' {$ui.Item((Find-Form 1001),1001)}
-        'add-server' {$ui.Item((Find-Form 1021),1021)}
-        'edit-view-mode' {$ui.Item((Find-Form 1060),1060)}
-        'edit-columns' {$ui.Item((Find-Form 1067),1067)}
-        default {$tree}
-    }
-    $focusFrame=$ui.Root($focusField)
-    if ($only -ne [IntPtr]::Zero -and $focusFrame -ne $only) {throw "Unexpected focus target for $name."}
-    $ui.FocusFrame($focusFrame,$focusField)
-    # Let the skin return from its temporary EQ adjustment text to the song title.
-    if (!$welcomeShot) {Start-Sleep -Milliseconds 1800}
-    if ($only -eq [IntPtr]::Zero) {
-        [void](Wait-For {
-            $unexpected = @(Get-Frames | Where-Object {!$placements.ContainsKey($_.ToInt64())})
-            return $unexpected.Count -eq 0
-        } 'WACUP track notification to close' 20)
-    }
-    if ($welcomeShot) {
-        if ($ui.Send($main,0x400,0,104) -ne 0 -or $ui.Send($main,0x400,0,124) -ne 0) {
-            throw 'Welcome needs a stopped player and an empty playlist.'
-        }
-        $playbackStatus='stopped with an empty playlist'
-    } else {
-        $seconds=Set-CapturePosition $name $slot $only $visualPreset
-        $playbackStatus='playing '+$pose.queue[$slot].title+' at '+$seconds+'s, EQ '+$preset
-    }
-    $ui.CheckFocus($focusFrame,$focusField)
-    [array]$frames = if ($only -ne [IntPtr]::Zero) { $only } else { Get-Frames }
+}
+function Save-WindowLayout($name,$playbackStatus) {
+    [array]$frames=Get-Frames
     if (!$frames) {throw 'WACUP has no visible frames.'}
     [array]::Reverse($frames)
     $bounds = [Drawing.Rectangle]::Empty
     $boxes = @{}
     foreach ($window in $frames) {
         $rect = $ui.Rect($window)
-        if ($only -eq [IntPtr]::Zero -and $placements.ContainsKey($window.ToInt64())) {
+        if ($placements.ContainsKey($window.ToInt64())) {
             $rect.Location = $placements[$window.ToInt64()]
         }
         $boxes[$window.ToInt64()]=$rect
         $bounds=if ($bounds.IsEmpty) {$rect} else {[Drawing.Rectangle]::Union($bounds,$rect)}
     }
-    if ($only -eq [IntPtr]::Zero) {
-        $covered=0
-        foreach ($window in $frames) {
-            $r=$boxes[$window.ToInt64()]
-            $covered+=$r.Width*$r.Height
-            foreach ($other in $frames) {
-                if ($other.ToInt64() -le $window.ToInt64()) {continue}
-                $overlap=[Drawing.Rectangle]::Intersect($r,$boxes[$other.ToInt64()])
-                if ($overlap.Width*$overlap.Height -gt 0) {throw "Overlapping WACUP frames in $name."}
-            }
+    $covered=0
+    foreach ($window in $frames) {
+        $r=$boxes[$window.ToInt64()]
+        $covered+=$r.Width*$r.Height
+        foreach ($other in $frames) {
+            if ($other.ToInt64() -le $window.ToInt64()) {continue}
+            $overlap=[Drawing.Rectangle]::Intersect($r,$boxes[$other.ToInt64()])
+            if ($overlap.Width*$overlap.Height -gt 0) {throw "Overlapping WACUP frames in $name."}
         }
-        if ($covered -ne $bounds.Width*$bounds.Height) {
-            throw ("Uneven outside edges in $name. "+(($frames|ForEach-Object {$ui.Text($_)+' '+$boxes[$_.ToInt64()]}) -join ' | '))
-        }
+    }
+    if ($covered -ne $bounds.Width*$bounds.Height) {
+        throw ("Uneven outside edges in $name. "+(($frames|ForEach-Object {$ui.Text($_)+' '+$boxes[$_.ToInt64()]}) -join ' | '))
     }
     $canvas = New-Object Drawing.Bitmap $bounds.Width,$bounds.Height
     try {
@@ -1077,7 +674,7 @@ function Save-Shot($name,$only=[IntPtr]::Zero) {
         try {
             foreach ($window in $frames) {
                 $rect = $boxes[$window.ToInt64()]
-                $image = $ui.Print($window)
+                $image = Get-ShotFrame $window
                 $clip = $ui.Shape($window)
                 try {
                     $x = $rect.X-$bounds.X; $y = $rect.Y-$bounds.Y
@@ -1091,99 +688,53 @@ function Save-Shot($name,$only=[IntPtr]::Zero) {
     } finally { $canvas.Dispose() }
 
 }
+function Save-Shot($name,$only=[IntPtr]::Zero,$focusField=$tree,[switch]$stopped) {
+    $slot=[array]::IndexOf($shotOrder,$name)
+    if (!$stopped) {
+        Start-PoseTrack $name
+        $preset=Set-TrackEqualizer $pose.queue[$slot]
+        if ($visualizer -ne [IntPtr]::Zero -and $only -eq [IntPtr]::Zero) {
+            $visualPreset=$visualPresets[$slot%$visualPresets.Count]
+            Set-AnalyzerPreset $visualizer $visualPreset
+        }
+    }
+    if ($only -eq [IntPtr]::Zero) {Set-LibraryViewport $name $slot}
+    $focusFrame=$ui.Root($focusField)
+    if ($only -ne [IntPtr]::Zero -and $focusFrame -ne $only) {throw "Unexpected focus target for $name."}
+    $ui.FocusFrame($focusFrame,$focusField)
+    # Let the skin return from its temporary EQ adjustment text to the song title.
+    if (!$stopped) {Start-Sleep -Milliseconds 1800}
+    if ($only -eq [IntPtr]::Zero) {
+        [void](Wait-For {
+            $unexpected = @(Get-Frames | Where-Object {!$placements.ContainsKey($_.ToInt64())})
+            return $unexpected.Count -eq 0
+        } 'WACUP track notification to close' 20)
+    }
+    if ($stopped) {
+        if ($ui.Send($main,0x400,0,104) -ne 0 -or $ui.Send($main,0x400,0,124) -ne 0) {
+            throw 'Welcome needs a stopped player and an empty playlist.'
+        }
+        $playbackStatus='stopped with an empty playlist'
+    } else {
+        $seconds=Set-CapturePosition $name $slot $only $visualPreset
+        $playbackStatus='playing '+$pose.queue[$slot].title+' at '+$seconds+'s, EQ '+$preset
+    }
+    $ui.CheckFocus($focusFrame,$focusField)
+    if ($only -ne [IntPtr]::Zero) {
+        $dialog=$ui.Print($only)
+        try {
+            $dialog.Save((Join-Path $shots ($name+'.png')),[Drawing.Imaging.ImageFormat]::Png)
+            Write-Log "Captured $name ($($dialog.Width) x $($dialog.Height)) $playbackStatus"
+        } finally {$dialog.Dispose()}
+        return
+    }
+    Save-WindowLayout $name $playbackStatus
+}
 
 function Get-Frame($title) {
     foreach ($h in Get-Frames) {
         if ($ui.Text($h) -eq $title) { return $h }
     }
-}
-function Set-ModernProfile($profile,$skin) {
-    $olive = $skin -eq 'Olive'
-    # Classic Modern's main, equalizer and playlist are a 550px stack.
-    # The library's stock anchor is one column right and one player-height down.
-    $windows = if ($olive) {
-        @(@('main','Main Window','normal','32,32,550,243'),
-          @('PLEdit','Playlist Editor','normalpl','32,275,550,246'),
-          @('MLibrary','Media Library','normal','32,521,1500,784'),
-          @('winamp.albumart','Album Art','normal','1072,32,460,489'),
-          @('resizable_nostatus','Lyrics','resizable_nostatus','582,32,490,489'))
-    } else {
-        @(@('main','Main Window','normal','32,32,550,242'),
-          @('equalizer','Equalizer','normaleq','32,274,550,242'),
-          @('PLEdit','Playlist Editor','normalpl','32,516,550,242'),
-          @('MLibrary','Media Library','normal','582,274,984,484'),
-          @('winamp.albumart','Album Art','normal','582,32,492,242'),
-          @('resizable_nostatus','Lyrics','resizable_nostatus','1074,32,492,242'))
-    }
-    $layouts = foreach ($w in $windows) {
-        '<section name="Container:{0}"><section name="{1}"><section name="Layout:{2}"><entry name="rect" value="{3}"/><entry name="restoredrect" value="{3}"/><entry name="r" value="1.000000"/><entry name="maximized" value="0"/></section></section></section>' -f $w
-    }
-    $tint = if ($olive) {'<section name="Color Themes"><entry name="Winamp Classic Modern" value="++ Olive garden"/></section>'} else {''}
-    $xml = '<WasabiXML><configuration><section name="{00000000-0000-0000-0000-000000000000}">'+$tint+
-        '<section name="Skin:Winamp Classic Modern">'+($layouts -join '')+'</section></section></configuration></WasabiXML>'
-    $document = [xml]('<?xml version="1.0"?>'+$xml)
-    $document.Save((Join-Path $profile 'studio.xnf'))
-}
-function Set-Layout($skin) {
-    function Place($h,[int]$x,[int]$y,[int]$width,[int]$height) {
-        $ui.Place($h,$x,$y,$width,$height)
-        $placements[$h.ToInt64()]=[Drawing.Point]::new($x,$y)
-    }
-    if ($skin -eq 'Big Bento Modern') {
-        $frame = $ui.Root($tree)
-        Place $frame 32 32 1150 720
-        $lyrics=Get-Frame 'Lyrics'
-        if ($lyrics) {Place $lyrics 1182 32 320 720}
-        return $frame
-    }
-    if ($classic) {
-        $library = $ui.Root($tree)
-        $mainRect = $ui.Rect($main)
-        $editor = Get-Top 'Winamp PE'
-        $equalizer = Get-Top 'Winamp EQ'
-        foreach ($h in $main,$equalizer,$editor) {$ui.Show($h,$true)}
-        Place $main 32 32 $mainRect.Width $mainRect.Height
-        $y = 32+$mainRect.Height
-        $eqSize=$ui.Rect($equalizer)
-        Place $equalizer 32 $y $mainRect.Width $eqSize.Height
-        $y+=$eqSize.Height
-        Place $editor 32 $y $mainRect.Width 203
-        $y+=$ui.Rect($editor).Height
-        $lyrics=Get-Frame 'Lyrics'
-        if ($lyrics) {Place $lyrics 32 $y $mainRect.Width 162; $y+=$ui.Rect($lyrics).Height}
-        Place $library (32+$mainRect.Width) 32 900 ($y-32)
-        return $main
-    }
-    $library = Get-Frame 'Media Library'
-    $playlist = Get-Frame 'Playlist Editor'
-    $playerFrame = Get-Frame 'Main Window'
-    if (!$library -or !$playlist -or !$playerFrame) { throw 'Classic Modern layout is incomplete.' }
-    $playerSize = $ui.Rect($playerFrame)
-    $x = 32; $y = 32
-    if ($skin -eq 'Olive') {
-        $eq=Get-Frame 'Equalizer'
-        if ($eq) {$ui.Show($eq,$false)}
-        Place $playerFrame $x $y 550 243
-        Place $playlist $x ($y+243) 550 246
-        $lyrics = Wait-For { Get-Frame 'Lyrics' } 'Lyrics window'
-        $art = Wait-For { Get-Frame 'Album Art' } 'Album Art window'
-        Place $lyrics ($x+550) $y 490 489
-        Place $art ($x+1040) $y 460 489
-        Place $library $x ($y+489) 1500 784
-    } else {
-        $right = $x+$playerSize.Width
-        $width = 1100
-        $libraryHeight = 630
-        Place $playerFrame $x $y $playerSize.Width $playerSize.Height
-        Place (Get-Frame 'Equalizer') $x ($y+$playerSize.Height) $playerSize.Width $playerSize.Height
-        Place $playlist $x ($y+2*$playerSize.Height) $playerSize.Width ($libraryHeight-$playerSize.Height)
-        Place (Get-Frame 'Album Art') $right $y $playerSize.Height $playerSize.Height
-        $visWidth=360
-        Place (Get-Frame 'Lyrics') ($right+$playerSize.Height) $y ($width-$playerSize.Height-$visWidth) $playerSize.Height
-        Place $ui.Root($visualizer) ($right+$width-$visWidth) $y $visWidth $playerSize.Height
-        Place $library $right ($y+$playerSize.Height) $width $libraryHeight
-    }
-    return $playerFrame
 }
 function Save-Category($category,$name,[bool]$asList=$true,[bool]$allowEmpty=$false) {
     Select-View $category
@@ -1317,97 +868,11 @@ show_art=0
             } 'Classic Spectrum Analyzer'
         }
         [IntPtr]$layoutPlayer=Set-Layout $skin
-        if ($skin -eq 'Winamp Classic Modern') {
-            $welcome = Wait-For { Find-Form 1001 } 'Add server button'
-            $ui.Post($main,0x111,40047,0)
-            [void]$ui.Send($main,0x400,0,101)
-            [void](Wait-For {$ui.Send($main,0x400,0,104) -eq 0 -and $ui.Send($main,0x400,0,124) -eq 0} 'stopped player and empty playlist')
-            Save-Shot 'classic-modern-welcome'
-            $ui.EnqueueFile($main,(New-Intro 0))
-            [void](Wait-For {$ui.Send($main,0x400,0,124) -eq 1} 'the Add Server track')
-            Start-PoseTrack 'add-server'
-            $ui.Post($ui.Item($welcome,1001),0xf5,0,0)
-            $settings = Wait-For { Find-Form 1021 } 'server settings'
-            $ui.SetText($ui.Item($settings,1020),'Demo Server')
-            $ui.SetText($ui.Item($settings,1021),'https://tangerine.stream/')
-            $ui.SetText($ui.Item($settings,1022),'okeeblow')
-            $ui.SetText($ui.Item($settings,1023),'tangerine')
-            if (!$ui.Send($ui.Item($settings,1024),0xf0,0,0)) {[void]$ui.Send($ui.Item($settings,1024),0xf5,0,0)}
-            # The settings form updates its server list when its selection changes.
-            $servers=$ui.Item($settings,1027)
-            Command $settings 1001
-            [void](Wait-For {$ui.Send($servers,0x1004,0,0) -eq 2} 'the temporary blank server row')
-            Command $settings 1034
-            [void](Wait-For {$ui.Send($servers,0x1004,0,0) -eq 1 -and
-                $ui.ControlText($ui.Item($settings,1020)) -eq 'Demo Server' -and $ui.SelectListItem($servers,'Demo Server')} 'Demo Server in both fields')
-            Save-Shot 'add-server' $ui.Root($settings)
-            $ui.SetText($ui.Item($settings,1020),'Music Library')
-            $ui.SetText($ui.Item($settings,1021),$api)
-            $ui.SetText($ui.Item($settings,1022),$demoUser)
-            $ui.SetText($ui.Item($settings,1023),$demoPassword)
-            $ok = $ui.Item($settings,1)
-            if ($ok -eq [IntPtr]::Zero) { $ok=$ui.Item($ui.Root($settings),1) }
-            $ui.Post($ok,0xf5,0,0)
-        }
-        $form = Wait-Library
+        if ($skin -eq 'Winamp Classic Modern') {Connect-DemoServer}
+        [void](Wait-Library)
         Set-DemoQueue
         if ($skin -eq 'Winamp Classic Modern') {
-            Save-Shot 'classic-modern-albums'
-            $form=Wait-Library
-            $ui.SetText($ui.Item($form,1003),$pose.albumQuery)
-            Command $form 1004
-            [void](Wait-For {$ui.Send($ui.Item($form,1006),0x1004,0,0) -eq $pose.albumMatches -and $pose.albumMatches -gt 1} 'complete multi-album search')
-            Save-Shot 'classic-modern-album-search'
-            $form=Search-Album
-            Command $form 1008
-            [void](Wait-For {$ui.ControlText($ui.Item($form,1013)).Contains($pose.album)} 'album tracks')
-            [void](Wait-Library)
-            Click-First $ui.Item($form,1006)
-            Command $form 1011
-            Save-Shot 'classic-modern-album-tracks'
-            foreach ($pair in @(@('Genres','genres'),@('Album Artists','album-artists'),@('Artists','artists'),@('Tracks','tracks'),
-                                 @('Playlists','playlists'))) {
-                Save-Category $pair[0] ('classic-modern-'+$pair[1]) $true ($pair[0] -eq 'Playlists')
-                if ($pair[0] -eq 'Playlists' -and $pose.playlist) {
-                    $form=Wait-Library
-                    $ui.SetText($ui.Item($form,1003),$pose.playlist); Command $form 1004
-                    [void](Wait-For {$ui.SelectListItem($ui.Item($form,1006),$pose.playlist)} 'the featured playlist')
-                    Command $form 1008
-                    [void](Wait-For {$ui.ControlText($ui.Item($form,1013)).Contains('  |  ')} 'opened contents view')
-                    Command $form 1051
-                    [void](Wait-Library)
-                    Save-Shot 'classic-modern-playlist-tracks'
-                }
-            }
-            Save-Category 'Favorites' 'classic-modern-favorites' $false
-            Select-View 'Tracks'
-            $form=Wait-Library
-            $ui.SetText($ui.Item($form,1003),$pose.filter)
-            Command $form 1004
-            [void](Wait-For {$count=$ui.Send($ui.Item($form,1006),0x1004,0,0); $count -gt 1 -and $count -le 23} 'multi-track catalog search')
-            Command $form 1053
-            [void](Wait-For {[CaptureWindows]::IsWindowVisible($ui.Item($form,1040))} 'filter panes')
-            [void](Wait-Library)
-            Save-Shot 'classic-modern-filtered-tracks'
-            Start-PoseTrack 'edit-view-mode'
-            Command $form 1050
-            $dialog=Wait-For {Find-Form 1060} 'view mode editor'
-            Save-Shot 'edit-view-mode' $ui.Root($dialog)
-            $ui.Post($ui.Root($dialog),0x10,0,0)
-            [void](Wait-For {!(Find-Form 1060)} 'closed view mode editor')
-            Start-PoseTrack 'edit-columns'
-            Command $form 1058
-            $dialog=Wait-For {Find-Form 1067} 'columns editor'
-            Save-Shot 'edit-columns' $ui.Root($dialog)
-            $ui.Post($ui.Root($dialog),0x10,0,0)
-            [void](Wait-For {!(Find-Form 1067)} 'closed columns editor')
-            Select-View 'Offline Cache'
-            $form=Wait-Library
-            Command $form 1015
-            [void](Wait-For {$ui.ControlText($ui.Item($form,1013)).StartsWith('Offline')} 'offline mode')
-            Save-Shot 'classic-modern-offline-cache'
-            Command $form 1015
-            [void](Wait-For {!$ui.ControlText($ui.Item($form,1013)).StartsWith('Offline')} 'online library')
+            Save-ClassicModernGallery
         } elseif ($skin -eq 'Olive') {
             Select-View 'Favorites'
             [void](Wait-Library)
@@ -1478,152 +943,7 @@ function Invoke-Capture {
         $server.Dispose()
     }
 }
-function Restore-Publish {
-    if (!(Test-Path -LiteralPath $publishDir)) {return}
-    $stage=Get-Item -LiteralPath $publishDir -Force
-    if ($stage.Parent.FullName -ne $root -or $stage.Name -ne 'build-screenshots-publish' -or
-        ($stage.Attributes -band [IO.FileAttributes]::ReparsePoint)) {throw 'Invalid gallery staging path.'}
-    $journal=Join-Path $publishDir 'new-files'
-    if ((Test-Path -LiteralPath $journal) -and !(Test-Path -LiteralPath (Join-Path $publishDir 'complete'))) {
-        foreach ($name in [IO.File]::ReadAllLines($journal)) {
-            if ($name -notmatch '^[a-z0-9-]+\.png$') {throw 'Invalid screenshot filename in the publish journal.'}
-            [IO.File]::Delete((Join-Path $gallery $name))
-        }
-        foreach ($file in Get-ChildItem -LiteralPath (Join-Path $publishDir 'backup') -File -Filter '*.png') {
-            [IO.File]::Copy($file.FullName,(Join-Path $gallery $file.Name),$true)
-        }
-    }
-    Remove-Item -LiteralPath $stage.FullName -Recurse -Force
-}
-function Publish-Gallery {
-    [void][IO.Directory]::CreateDirectory($gallery)
-    $ready=Join-Path $publishDir 'ready'
-    $backup=Join-Path $publishDir 'backup'
-    foreach ($directory in $ready,$backup) {[void][IO.Directory]::CreateDirectory($directory)}
-    $newFiles=@()
-    $files=@(Get-ChildItem -LiteralPath $shots -File -Filter '*.png')
-    try {
-        foreach ($file in $files) {
-            [IO.File]::Copy($file.FullName,(Join-Path $ready $file.Name))
-            if (!(Test-Path -LiteralPath (Join-Path $gallery $file.Name))) {$newFiles+=$file.Name}
-        }
-        $journal=Join-Path $publishDir 'new-files'
-        [IO.File]::WriteAllLines(($journal+'.tmp'),[string[]]$newFiles)
-        [IO.File]::Move(($journal+'.tmp'),$journal)
-        foreach ($file in $files) {
-            $output=Join-Path $gallery $file.Name
-            $inputFile=Join-Path $ready $file.Name
-            if (Test-Path -LiteralPath $output) {[IO.File]::Replace($inputFile,$output,(Join-Path $backup $file.Name))}
-            else {[IO.File]::Move($inputFile,$output)}
-        }
-        foreach ($retired in 'layouts.png','classic-modern-folders.png','classic-modern-folder-contents.png','classic-modern-folder-contents-library.png',
-                              'classic-modern-folders-library.png','classic-modern-playlist-tracks.png') {
-            if ($retired -notin $files.Name -and (Test-Path -LiteralPath (Join-Path $gallery $retired))) {
-                [IO.File]::Move((Join-Path $gallery $retired),(Join-Path $backup $retired))
-            }
-        }
-        [IO.File]::WriteAllText((Join-Path $publishDir 'complete'),'ok')
-    } finally {Restore-Publish}
-}
-if ($env:TS_SHOT_GUARD) {
-    # The guard has its own hidden console. Closing the batch window closes the
-    # capture job, then the guard can remove the released profiles and binaries.
-    $owner=Get-Process -Id ([int]$env:TS_SHOT_GUARD) -ErrorAction SilentlyContinue
-    if ($owner -and $owner.StartTime.ToUniversalTime().Ticks -eq [long]$env:TS_SHOT_OWNER_TICKS) {
-        $owner.WaitForExit()
-    }
-    $guardRun=$env:TS_SHOT_RUN
-    if (Test-Path -LiteralPath $guardRun) {Remove-RunDirectory ([IO.Path]::GetTempPath().TrimEnd('\')) ([IO.Path]::GetFileName($guardRun))}
-    exit 0
-}
-if ($env:TS_SHOT_WORKER) {
-    $run=$env:TS_SHOT_RUN
-    $shots=Join-Path $run 'shots'
-    try {
-        if ($action -eq 'refresh') {Invoke-Refresh} else {Invoke-Capture}
-        [IO.File]::WriteAllText((Join-Path $run 'complete'),'ok')
-        exit 0
-    }
-    catch { Write-Log ($_.Exception.Message+$nl+$_.ScriptStackTrace); exit 1 }
-}
-$gate = New-Object Threading.Mutex $false,'Local\TangerineStream-Screenshots'
-$locked=$false
-$session=$null
-$run=$null
-$pipe=$null
-$secret=$null
-$gallery=Join-Path $root 'screenshots'
-$publishDir=Join-Path $root 'build-screenshots-publish'
 try {
-    try { $locked=$gate.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked=$true }
-    if (!$locked) {throw 'Another screenshot run is active.'}
-    Restore-Publish
-    $parent = [IO.Path]::GetTempPath().TrimEnd('\')
-    foreach ($old in Get-ChildItem -LiteralPath $parent -Directory -Filter 'TangerineShots-*') {
-        if ($old.Name -match '^TangerineShots-[0-9a-f]{32}$' -and (Test-Path -LiteralPath (Join-Path $old.FullName '.capture-workspace'))) {
-            Remove-RunDirectory $parent $old.Name
-        }
-    }
-    $name = 'TangerineShots-'+[guid]::NewGuid().ToString('N')
-    $run=Join-Path $parent $name
-    $shots=Join-Path $run 'shots'
-    [void][IO.Directory]::CreateDirectory($shots)
-    [IO.File]::WriteAllText((Join-Path $run '.capture-workspace'),'Tangerine Stream')
-    $env:TS_SHOT_RUN=$run
-    $env:TS_SHOT_GUARD=[string]$PID
-    $env:TS_SHOT_OWNER_TICKS=[string][Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks
-    try {
-        $guard=Start-PrivateProcess $env:ComSpec ('/d /c ""'+$env:TS_SHOT_FILE+'" --no-pause"') $root
-        $guard.Dispose()
-    } finally {Remove-Item Env:TS_SHOT_GUARD,Env:TS_SHOT_OWNER_TICKS}
-    $workerArgs='WACUP '+$compiler+' --no-pause'
-    if ($action -eq 'refresh') {
-        $secret = if ([Console]::IsInputRedirected) {
-            ConvertTo-SecureString ([Console]::ReadLine()) -AsPlainText -Force
-        } else {Read-Host 'Navidrome password for okeeblow at https://music.cooltrainer.org' -AsSecureString}
-        $security=[IO.Pipes.PipeSecurity]::new()
-        $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User
-        $security.AddAccessRule([IO.Pipes.PipeAccessRule]::new($sid,'FullControl','Allow'))
-        $pipe=[IO.Pipes.NamedPipeServerStream]::new($name,'Out',1,'Byte','Asynchronous',4096,4096,$security)
-        $connected=$pipe.WaitForConnectionAsync()
-        $workerArgs+=' rebuild-db'
-    }
-    $session=New-Object CaptureDesktop $name
-    $env:TS_SHOT_WORKER=$name
-    $worker=$session.Start($env:ComSpec, ('"'+$env:ComSpec+'" /d /c ""'+$env:TS_SHOT_FILE+'" '+$workerArgs+'"'),$root)
-    if ($pipe) {
-        if (!$connected.Wait(25000)) {throw 'The database export worker did not connect.'}
-        $credential=[Management.Automation.PSCredential]::new('okeeblow',$secret)
-        $writer=[IO.StreamWriter]::new($pipe,$utf8)
-        try {$writer.WriteLine($credential.GetNetworkCredential().Password)} finally {$writer.Dispose()}
-        $credential=$null
-    }
-    $log=Join-Path $run 'progress'
-    $sent=0
-    do {
-        $done=$worker.WaitForExit(500)
-        if (Test-Path -LiteralPath $log) {
-            $lines=[IO.File]::ReadAllLines($log)
-            while ($sent -lt $lines.Length) {Write-Host $lines[$sent]; ++$sent}
-        }
-    } while (!$done)
-    if ($worker.ExitCode -or !(Test-Path -LiteralPath (Join-Path $run 'complete'))) {throw "WACUP $action failed."}
-    if ($action -eq 'refresh') {
-        [void][IO.Directory]::CreateDirectory($publishDir)
-        try {
-            $staged=Join-Path $publishDir 'demo.sqlite3'
-            [IO.File]::Copy((Join-Path $run 'demo.sqlite3'),$staged)
-            if (Test-Path -LiteralPath $demo) {[IO.File]::Replace($staged,$demo,(Join-Path $publishDir 'previous.sqlite3'))}
-            else {[IO.File]::Move($staged,$demo)}
-        } finally {Restore-Publish}
-    } else {
-        Publish-Gallery
-        Write-Host ("Saved screenshots to "+(Join-Path $root 'screenshots'))
-    }
-} finally {
-    if ($pipe) {$pipe.Dispose()}
-    if ($secret) {$secret.Dispose()}
-    if ($session) {$session.Dispose()}
-    try {if ($run) {Remove-RunDirectory $parent $name}}
-    finally {if ($locked) {$gate.ReleaseMutex()}; $gate.Dispose()}
-}
+    if ($action -eq 'refresh') {Invoke-Refresh} else {Invoke-Capture}
+    [IO.File]::WriteAllText((Join-Path $run 'complete'),'ok')
+} catch {Write-Log ($_.Exception.Message+$nl+$_.ScriptStackTrace);exit 1}

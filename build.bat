@@ -17,10 +17,13 @@ if /i "%~1"=="msys2" (
     set "ts_target=install"
 ) else if /i "%~1"=="--screenshots" (
     set "ts_screenshots=ON"
+) else if /i "%~1"=="--screenshot-host" (
+    set "ts_screenshots=ON"
+    set "ts_target=screenshot-host"
 ) else if /i "%~1"=="--no-pause" (
     set "ts_no_pause=1"
 ) else (
-    echo Usage: %~nx0 [msys2^|vs] [--install] [--screenshots] [--no-pause]
+    echo Usage: %~nx0 [msys2^|vs] [--install] [--screenshots^|--screenshot-host] [--no-pause]
     goto finish
 )
 shift
@@ -103,7 +106,7 @@ if "%ts_screenshots%:%ts_target%"=="ON:wacup_plugins" set "ts_target=screenshot_
 cmake.exe --build "%ts_build%" --config Release %ts_parallel% --target %ts_target%
 set "ts_exit=%errorlevel%"
 if not "%ts_exit%"=="0" goto finish
-echo Built WACUP plug-ins in "%ts_build%".
+echo Built %ts_target% in "%ts_build%".
 
 :finish
 if defined ts_pushed popd
