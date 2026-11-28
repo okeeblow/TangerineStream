@@ -892,6 +892,9 @@ function Save-Shot($name,$only=[IntPtr]::Zero) {
                 throw ("Olive shows "+$ui.CoversAcross+" covers across, "+$ui.FullCovers+" complete, and "+$ui.BottomArtworkFraction.ToString('P0')+" of the bottom covers.")
             }
         }
+        if ($name -eq 'wacup-classic-albums' -and ($ui.CoversAcross -ne 4 -or $ui.FullCovers -lt 8)) {
+            throw 'WACUP Classic must show four 150px covers across and at least two complete rows.'
+        }
         if ($name -eq 'big-bento-modern-albums') {
             if ($ui.FullCovers -le 4) {throw 'Big Bento must show more than four complete album tiles.'}
             $reference=Join-Path $run 'now-playing-cover.jpg'
@@ -1139,7 +1142,13 @@ function Set-DemoQueue {
     Select-View 'Albums'
     $view=Wait-For {Find-Form 1003} 'album grid'
     $list=$ui.Item($view,1006)
-    Command $view $(if ($skin -eq 'Big Bento Modern') {1601} else {1602})
+    if ($skin -eq 'WACUP Classic') {
+        Command $view 1050
+        $editor=Wait-For {Find-Form 1060} 'the custom cover size editor'
+        $ui.SetText($ui.Item($editor,1059),'150')
+        Command $editor 1
+        [void](Wait-For {!(Find-Form 1060)} 'the 150px WACUP Classic cover setting')
+    } else {Command $view $(if ($skin -eq 'Big Bento Modern') {1601} else {1602})}
     Command $view 1504
     [void](Wait-For {$ui.ControlText($ui.Item($view,1000)) -eq 'Most played'} 'Most played album sort')
     [void](Wait-For {
