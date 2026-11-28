@@ -46,6 +46,7 @@ struct Download {
     std::wstring filename;
     unsigned excluded;
     UINT_PTR serial;
+    bool cached = false;
     HANDLE cancel = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     std::shared_ptr<tangerine::ProgressiveInput> player;
     ~Download() { if (cancel) CloseHandle(cancel); }
@@ -196,7 +197,7 @@ bool startFile(std::unique_ptr<AudioFile>& file) {
     return true;
 }
 
-bool queueDownload(const std::wstring& filename, unsigned excluded);
+bool startSource(const std::wstring& filename, unsigned excluded, std::unique_ptr<AudioFile> cached = {});
 LRESULT CALLBACK receiverProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     if (msg == tangerine::ProgressiveInput::configure) {
         if (progressive && w == serial) progressive->configureOutput(volume, pan);
@@ -221,7 +222,7 @@ LRESULT CALLBACK receiverProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                 metadataPlayer.reset();
             }
             if (startFile(file)) return 0;
-            if (file->attempts.excluded != job->excluded && queueDownload(job->filename, file->attempts.excluded))
+            if ((job->cached || file->attempts.excluded != job->excluded) && startSource(job->filename, file->attempts.excluded))
                 return 0;
         }
     } catch (...) {}
@@ -230,7 +231,7 @@ LRESULT CALLBACK receiverProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     return 0;
 }
 
-bool queueDownload(const std::wstring& filename, unsigned excluded) {
+bool startSource(const std::wstring& filename, unsigned excluded, std::unique_ptr<AudioFile> cached) {
     if (!receiver) {
         WNDCLASSW cls{};
         cls.lpfnWndProc = receiverProc;
@@ -245,6 +246,7 @@ bool queueDownload(const std::wstring& filename, unsigned excluded) {
     job->filename = filename;
     job->excluded = excluded;
     job->serial = ++serial;
+    job->cached = bool(cached);
     job->player = std::make_shared<tangerine::ProgressiveInput>(input, selectInput, receiver, serial, duration);
     job->player->pause(paused);
     if (pendingSeek >= 0) job->player->seek(pendingSeek);
@@ -256,11 +258,17 @@ bool queueDownload(const std::wstring& filename, unsigned excluded) {
     }
     {
         std::scoped_lock lock(downloadMutex);
-        if (!downloader.joinable()) downloader = std::thread(downloadLoop);
-        loading = queued = std::move(job);
+        loading = job;
+        if (cached) {
+            completed = std::move(cached);
+            job->player->finish(completed->path.data());
+        } else {
+            if (!downloader.joinable()) downloader = std::thread(downloadLoop);
+            queued = job;
+            downloadReady.notify_one();
+        }
     }
     input.is_seekable = 1; // Remember a seek made while the file is buffering.
-    downloadReady.notify_one();
     return true;
 }
 
@@ -276,8 +284,9 @@ int play(const wchar_t* filename) {
         auto file = std::make_unique<AudioFile>();
         int status = query(InputRequest::begin, filename, nullptr, file->path.data(), file->path.size(),
                            &file->lease, &file->attempts);
-        if (status == tangerine::fileReady && startFile(file)) return 0;
-        if (status != tangerine::unavailable && queueDownload(filename, file->attempts.excluded)) return 0;
+        const unsigned excluded = file->attempts.excluded;
+        if (status == tangerine::fileReady && startSource(filename, excluded, std::move(file))) return 0;
+        if (status == tangerine::downloadNeeded && startSource(filename, excluded)) return 0;
     } catch (...) {}
     stop();
     return 1;

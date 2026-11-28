@@ -359,9 +359,7 @@ void ProgressiveInput::run() {
                 continue;
             }
             draining = false;
-            // On a fast transfer the complete file may beat the first PCM block.
-            // Let the normal input plug-in handle it in that case.
-            if (final_ && (path_.empty() || !opened_ || result == Result::delegate)) {
+            if (final_ && (path_.empty() || result == Result::delegate)) {
                 result = path_.empty() ? Result::end : Result::delegate;
                 draining = true;
                 previous = epoch_;
