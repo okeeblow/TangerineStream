@@ -6,6 +6,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace demo {
@@ -87,6 +88,7 @@ struct Fixture {
     void load(Database& db);
 };
 
+void addAlbumViews(Fixture& fixture, const std::vector<Entry>& library, std::set<std::string>& covers);
 void exportLibrary(const std::filesystem::path& destination, const std::string& user, const std::string& password);
 void serve(const std::filesystem::path& database, const std::string& user, const std::string& password);
 } // namespace demo

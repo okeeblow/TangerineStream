@@ -69,7 +69,7 @@ void loadCatalog(Fixture& fixture, Database& db) {
         if (rows.number(6)>=0) e.data+=",\"songCount\":"+rows.bytes(6);
         if (rows.bytes(7)!="0") e.data+=",\"duration\":"+rows.bytes(7);
         for (const auto& [key,value]:tangerine::decodeSortTags(rows.bytes(5))) {
-            const bool numeric=key=="year" || key=="maxYear" || key=="albumCount" || key=="playCount" ||
+            const bool numeric=key=="year" || key=="maxYear" || key=="releaseYear" || key=="albumCount" || key=="playCount" ||
                                key=="discNumber" || key=="track" || key=="trackNumber";
             const bool literal=(numeric && !value.empty() && value.find_first_not_of("0123456789")==value.npos) ||
                                (key=="isDir" && (value=="true" || value=="false"));

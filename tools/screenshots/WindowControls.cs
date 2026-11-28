@@ -351,7 +351,7 @@ public sealed partial class CaptureWindows
         catch(ArgumentException) { return false; }
         finally {Marshal.ReleaseComObject(acc);}
     }
-    public bool CoversPainted(IntPtr list,string[] allowedAlbums,int firstIndex) {
+    public bool CoversPainted(IntPtr list,string[] allowedAlbums,int firstIndex,bool ordered) {
         Check(list);
         var guid=typeof(IAccessible).GUID; IAccessible acc;
         if(AccessibleObjectFromWindow(list,0xfffffffc,ref guid,out acc)!=0) return false;
@@ -376,8 +376,11 @@ public sealed partial class CaptureWindows
                     var photo=Rectangle.Intersect(new Rectangle(0,0,box.Width,box.Height),
                         new Rectangle(x+5,y+5,Math.Max(1,w-10),Math.Max(1,Math.Min(w,h)-12)));
                     if(photo.Width<20 || photo.Height<12) continue;
-                    if(allowedAlbums!=null && Array.IndexOf(allowedAlbums,acc.get_accName(id))<0) {
-                        CoverStatus="Unexpected visible album: "+acc.get_accName(id);
+                    int slot=id-1-firstIndex;
+                    string title=acc.get_accName(id);
+                    if(ordered ? slot<0 || slot>=allowedAlbums.Length || allowedAlbums[slot]!=title :
+                            allowedAlbums!=null && Array.IndexOf(allowedAlbums,title)<0) {
+                        CoverStatus="Unexpected album at "+(id-1)+": "+title;
                         return false;
                     }
                     var colors=new HashSet<int>();
@@ -401,7 +404,8 @@ public sealed partial class CaptureWindows
                     if(y>=0 && y+h<=box.Height) FullCovers++;
                 }
             }
-            return checkedTiles>0;
+            CoverStatus="Painted "+checkedTiles+" album tiles starting at "+firstIndex;
+            return ordered ? checkedTiles==allowedAlbums.Length : checkedTiles>0;
         } finally {Marshal.ReleaseComObject(acc);}
     }
 }

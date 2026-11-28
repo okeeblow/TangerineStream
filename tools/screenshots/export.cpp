@@ -136,6 +136,10 @@ Entry project(const std::string& kind, Element node) {
             Element value;
             if (!node[key].get(value)) e.data+=","+jsonString(key)+":"+simdjson::minify(value);
         }
+        int64_t releaseYear=0;
+        if ((node["releaseYear"].get_int64().get(releaseYear) || releaseYear<=0) &&
+            node["releaseDate"]["year"].get_int64().get(releaseYear)) releaseYear=0;
+        if (releaseYear>0) e.data+=",\"releaseYear\":"+std::to_string(releaseYear);
     }
     if (kind == "song") e.data += ",\"suffix\":\"wav\",\"contentType\":\"audio/wav\"";
     e.data += "}";
@@ -160,7 +164,16 @@ public:
         auto favorites = starred.root["starred2"].value();
         std::set<std::string> starredAlbums;
         for (auto entry : rows(favorites,"album")) starredAlbums.insert(field(entry,"id"));
-        albumShowcase(starredAlbums);
+        std::vector<Entry> libraryAlbums;
+        int albumTotal=0;
+        constexpr int albumPage=200;
+        for (int start=0; ;start+=albumPage) {
+            Document page(source_.list("album",albumPage,{},albumTotal,"name",false,start));
+            for (auto node:page.root.get_array().value()) libraryAlbums.push_back(project("album",node));
+            if (start+albumPage>=albumTotal) break;
+        }
+        if (static_cast<int>(libraryAlbums.size())!=albumTotal) throw Error("Album library changed during export.");
+        albumShowcase(libraryAlbums,starredAlbums,albumTotal);
         std::vector<Entry> allFavorites;
         for (const char* kind : {"album","artist","song"}) {
             const auto values = rows(favorites,kind);
@@ -173,6 +186,7 @@ public:
                 allFavorites.push_back(entry);
             }
         }
+        addAlbumViews(fixture_,libraryAlbums,covers_);
         auto featured = std::find_if(allFavorites.begin(),allFavorites.end(),[](const Entry& entry) {
             return entry.kind == "album" && entry.name == "Speaking In Tongues";
         });
@@ -251,44 +265,34 @@ private:
             left.c_str(),-1,right.c_str(),-1,nullptr,nullptr,0)==CSTR_LESS_THAN;
     }
     void wantCover(const Entry& entry) { if (!entry.cover.empty()) covers_.insert(entry.cover); }
-    void albumShowcase(const std::set<std::string>& favorites) {
-        struct RankedAlbum {Entry entry; int64_t plays; bool eligible;};
+    void albumShowcase(const std::vector<Entry>& library,const std::set<std::string>& favorites,int total) {
+        struct RankedAlbum {const Entry* entry; int64_t plays; bool eligible;};
         std::vector<RankedAlbum> ranked;
-        constexpr int pageSize=128, visible=12, rowAlignment=12; // three rows in Big Bento's smaller cover grid
-        int total=0;
-        for(int start=0; ;start+=pageSize) {
-            Document page(source_.list("album",pageSize,{},total,"playCount",true,start));
-            for(auto node : page.root.get_array().value()) {
-                auto album=project("album",node);
-                auto label=field(node,"albumArtist")+" "+album.name;
-                std::transform(label.begin(),label.end(),label.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
-                int64_t plays=0;
-                if (node["playCount"].get_int64().get(plays)) plays=0;
-                bool eligible=plays>0 && !favorites.count(album.id) && label.find("death in june")==label.npos;
-                ranked.push_back({std::move(album),plays,eligible});
+        constexpr int rankedPage=12, visible=8; // Classic Modern paints two rows of four.
+        for (const auto& album:library) {
+            Document doc(album.data);
+            auto label=field(doc.root,"albumArtist")+" "+field(doc.root,"artist")+" "+album.name;
+            std::transform(label.begin(),label.end(),label.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
+            int64_t plays=0;
+            if (doc.root["playCount"].get_int64().get(plays)) plays=0;
+            ranked.push_back({&album,plays,plays>0 && !favorites.count(album.id) && label.find("death in june")==label.npos});
+        }
+        std::stable_sort(ranked.begin(),ranked.end(),[](const auto& a,const auto& b){
+            return a.plays!=b.plays ? a.plays>b.plays : byName(*a.entry,*b.entry);
+        });
+        for(size_t first=0;first+rankedPage<=ranked.size();first+=rankedPage) {
+            auto begin=ranked.begin()+first;
+            if (!std::all_of(begin,begin+rankedPage,[](const auto& album){return album.eligible;})) continue;
+            collection("album",total);
+            collection("album-showcase",visible);
+            for(auto it=begin;it!=begin+visible;++it) {
+                add("album-showcase",*it->entry);
+                add("album",*it->entry);
+                wantCover(*it->entry);
             }
-            std::stable_sort(ranked.begin(),ranked.end(),[&](const auto& a,const auto& b){
-                return a.plays!=b.plays ? a.plays>b.plays : byName(a.entry,b.entry);
-            });
-            for(size_t first=0;first+visible<=ranked.size();first+=rowAlignment) {
-                auto begin=ranked.begin()+first, end=begin+visible;
-                if (start+pageSize<total && (end-1)->plays==ranked.back().plays) break;
-                if (!std::all_of(begin,end,[](const auto& album){return album.eligible;})) continue;
-                collection("album",total);
-                collection("album-showcase",visible);
-                for(auto it=begin;it!=end;++it) {
-                    add("album-showcase",it->entry);
-                    add("album",it->entry);
-                    wantCover(it->entry);
-                }
-                firstAlbum_=begin->entry;
-                int omitted=static_cast<int>(std::count_if(ranked.begin(),begin,[&](const auto& a){return !favorites.count(a.entry.id);}));
-                pose("albumStart",std::to_string(first));
-                fixture_.collections.at("album").leadingBlanks=omitted;
-                std::cout<<"album: "<<total<<", unstarred most-played viewport at "<<first<<"\n";
-                return;
-            }
-            if(start+pageSize>=total || (!ranked.empty() && ranked.back().plays==0)) break;
+            firstAlbum_=*begin->entry;
+            pose("albumStart",std::to_string(first));
+            return;
         }
         throw Error("Could not find two rows of played, unstarred albums for the gallery.");
     }

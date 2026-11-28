@@ -33,6 +33,13 @@ class Catalog {
 public:
     explicit Catalog(const std::filesystem::path& file) : db_(file,SQLITE_OPEN_READONLY|SQLITE_OPEN_FULLMUTEX) {
         fixture_.load(db_);
+        auto albumWindows=fixture_.poses.find("albumWindows");
+        if (albumWindows==fixture_.poses.end()) throw Error("Update the demo library with regenerate-screenshots.bat WACUP rebuild-db.");
+        simdjson::dom::parser parser;
+        auto views=parser.parse(albumWindows->second).value();
+        namePadding_=static_cast<int>(views["name"]["padding"].get_int64().value());
+        songCountPadding_=static_cast<int>(views["songCount"]["padding"].get_int64().value());
+        yearPadding_=static_cast<int>(views["releaseYear"]["padding"].get_int64().value());
     }
     std::string pose(const std::string& key) const { return fixture_.poses.at(key); }
     int total(const std::string& collection) const { return fixture_.collections.at(collection).total; }
@@ -71,7 +78,9 @@ public:
         // Two counts stand in for the unphotographed rows. Expand only the requested page.
         auto padTo=[&](int end,bool leading) {
             for (int i=std::max(index,start);i<end && emitted<count;++i) {
-                const std::string blank=leading?" ":"\xe2\xa0\x80"; // U+2800 sorts after the visible titles.
+                const int blankIndex=leading?i:i-static_cast<int>(list.members.size());
+                const bool earlyName=name=="album"?blankIndex<namePadding_:leading;
+                const std::string blank=earlyName?" ":"\xe2\xa0\x80"; // U+2800 sorts after the visible titles.
                 if (name=="genre") {
                     // OpenSubsonic uses the genre label itself as its key.
                     std::string label=blank;
@@ -79,8 +88,13 @@ public:
                     append("{"+property("value",jsonString(label))+"}");
                 } else {
                     auto id=jsonString("padding-"+name+"-"+std::to_string(i));
-                    auto plays=leading && name=="album" ? ",\"playCount\":2147483647" : "";
-                    append("{"+property("id",id)+","+property("name",jsonString(blank))+","+property("title",jsonString(blank))+plays+"}");
+                    std::string sortFields;
+                    if (name=="album") {
+                        if (leading) sortFields+=",\"playCount\":2147483647";
+                        if (blankIndex<songCountPadding_) sortFields+=",\"songCount\":2147483647";
+                        if (blankIndex<yearPadding_) sortFields+=",\"releaseYear\":9999";
+                    }
+                    append("{"+property("id",id)+","+property("name",jsonString(blank))+","+property("title",jsonString(blank))+sortFields+"}");
                 }
             }
             index=end;
@@ -112,6 +126,7 @@ public:
 private:
     Database db_;
     Fixture fixture_;
+    int namePadding_, songCountPadding_, yearPadding_;
 };
 
 void visualizationAudio(Reply& reply,int seconds,const std::string& trackId) {
@@ -222,7 +237,7 @@ void serve(const std::filesystem::path& file,const std::string& user,const std::
         if (kind=="pose") return json(reply,"{"+property("album",jsonString(catalog.pose("album")))+","+
             property("song",jsonString(catalog.pose("song")))+","+property("playlist",jsonString(catalog.pose("playlist")))+","+
             property("albums",std::to_string(catalog.total("album")))+","+property("filter",jsonString(catalog.pose("filter")))+","+
-            property("albumStart",catalog.pose("albumStart"))+","+property("albumShowcase",catalog.list("album-showcase",0,INT_MAX))+","+
+            property("albumWindows",catalog.pose("albumWindows"))+","+
             property("bentoSeek",catalog.pose("bentoSeek"))+","+property("winamp3Seek",catalog.pose("winamp3Seek"))+","+
             property("textWindows",catalog.pose("textWindows"))+","+
             property("albumQuery",jsonString(catalog.pose("albumQuery")))+","+property("albumMatches",std::to_string(catalog.total("album-search")))+","+

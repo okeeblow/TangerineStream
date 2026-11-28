@@ -628,17 +628,29 @@ function Set-LibraryViewport($name,$slot) {
         $view=Wait-For {Find-Form 1003} 'cover browser'
         $allowed=$null
         $firstIndex=0
-        if ($name.EndsWith('-albums')) {
-            $firstIndex=[int]$pose.albumStart
-            $allowed=[string[]]$pose.albumShowcase.name
-            [void](Wait-For {$ui.TopAlbum($ui.Item($view,1006),$firstIndex)} 'the unstarred most-played album row')
+        $ordered=$name.EndsWith('-albums')
+        if ($ordered) {
+            $sort=switch ($name) {
+                'classic-modern-albums'        {@{command=1504;label='Most played';key='playCount'}}
+                'wacup-classic-albums'         {@{command=1505;label='Name';key='name'}}
+                'big-bento-modern-albums'      {@{command=1510;label='Song count';key='songCount'}}
+                'classic-modern-winamp3-albums' {@{command=1512;label='Release year';key='releaseYear'}}
+            }
+            $window=$pose.albumWindows.($sort.key)
+            if (!$window.titles.Count) {throw "Missing album viewport for $name. Rebuild the demo database."}
+            $firstIndex=[int]$window.start
+            $allowed=[string[]]$window.titles
+            Command $view $sort.command
+            [void](Wait-For {$ui.ControlText($ui.Item($view,1000)) -eq $sort.label} $sort.label)
+            [void](Wait-For {$ui.TopAlbum($ui.Item($view,1006),$firstIndex)} "album row for $name")
         } elseif ($name -in 'classic-modern-favorites','classic-modern-olive-playback') {
             Command $view 1510
             [void](Wait-For {$ui.ControlText($ui.Item($view,1000)) -eq 'Song count'} 'Favorites sorted by song count')
             $allowed=[string[]]$pose.favoriteAlbums.name
         }
-        try {[void](Wait-For {$ui.CoversPainted($ui.Item($view,1006),$allowed,$firstIndex)} 'all visible covers to paint' 35)}
+        try {[void](Wait-For {$ui.CoversPainted($ui.Item($view,1006),$allowed,$firstIndex,$ordered)} 'all visible covers to paint' 35)}
         catch {throw "$($_.Exception.Message) $($ui.CoverStatus)"}
+        if ($ordered) {Write-Log "$name sorted by $($sort.label), albums $($firstIndex+1)-$($firstIndex+$allowed.Count) of $($pose.albums), $($allowed[0]) through $($allowed[-1])"}
         if ($name -eq 'classic-modern-olive-playback') {
             if ($ui.CoversAcross -ne 6 -or $ui.FullCovers -ne 12 -or [Math]::Abs($ui.BottomArtworkFraction-0.77) -gt 0.045) {
                 throw ("Olive shows "+$ui.CoversAcross+" covers across, "+$ui.FullCovers+" complete, and "+$ui.BottomArtworkFraction.ToString('P0')+" of the bottom covers.")
@@ -821,8 +833,6 @@ function Set-DemoQueue([int]$trackCount) {
         Command $editor 1
         [void](Wait-For {!(Find-Form 1060)} 'the 150px WACUP Classic cover setting')
     } else {Command $view $(if ($skin -eq 'Big Bento Modern') {1601} else {1602})}
-    Command $view 1504
-    [void](Wait-For {$ui.ControlText($ui.Item($view,1000)) -eq 'Most played'} 'Most played album sort')
     [void](Wait-For {
         $count=$ui.Send($list,0x1004,0,0)
         if ($count -ge $pose.albums) {return $true}
