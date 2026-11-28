@@ -223,7 +223,8 @@ void serve(const std::filesystem::path& file,const std::string& user,const std::
             property("song",jsonString(catalog.pose("song")))+","+property("playlist",jsonString(catalog.pose("playlist")))+","+
             property("albums",std::to_string(catalog.total("album")))+","+property("filter",jsonString(catalog.pose("filter")))+","+
             property("albumStart",catalog.pose("albumStart"))+","+property("albumShowcase",catalog.list("album-showcase",0,INT_MAX))+","+
-            property("bentoSeek",catalog.pose("bentoSeek"))+","+property("textWindows",catalog.pose("textWindows"))+","+
+            property("bentoSeek",catalog.pose("bentoSeek"))+","+property("winamp3Seek",catalog.pose("winamp3Seek"))+","+
+            property("textWindows",catalog.pose("textWindows"))+","+
             property("albumQuery",jsonString(catalog.pose("albumQuery")))+","+property("albumMatches",std::to_string(catalog.total("album-search")))+","+
             property("favoriteAlbums",catalog.list("starred/album",0,INT_MAX))+","+
             property("queue",catalog.queue())+"}");

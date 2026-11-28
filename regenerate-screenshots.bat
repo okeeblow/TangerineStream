@@ -131,11 +131,10 @@ function Save-ClassicModernGallery {
     [void](Wait-For {!$ui.ControlText($ui.Item($form,1013)).StartsWith('Offline')} 'online library')
 }
 
-function Set-ModernProfile($profile,$skin) {
-    $olive = $skin -eq 'Olive'
+function Set-ModernProfile($profile,$theme) {
     # Classic Modern's main, equalizer and playlist are a 550px stack.
     # The library's stock anchor is one column right and one player-height down.
-    $windows = if ($olive) {
+    $windows = if ($theme -eq '++ Olive garden') {
         @(@('main','Main Window','normal','32,32,550,243'),
           @('PLEdit','Playlist Editor','normalpl','32,275,550,246'),
           @('MLibrary','Media Library','normal','32,521,1500,784'),
@@ -152,7 +151,12 @@ function Set-ModernProfile($profile,$skin) {
     $layouts = foreach ($w in $windows) {
         '<section name="Container:{0}"><section name="{1}"><section name="Layout:{2}"><entry name="rect" value="{3}"/><entry name="restoredrect" value="{3}"/><entry name="r" value="1.000000"/><entry name="maximized" value="0"/></section></section></section>' -f $w
     }
-    $tint = if ($olive) {'<section name="Color Themes"><entry name="Winamp Classic Modern" value="++ Olive garden"/></section>'} else {''}
+    $tint = if ($theme) {
+        $themeFile=Join-Path $app 'Skins\Winamp Classic Modern\xml\color-themes.xml'
+        $themes=[xml]('<themes>'+[IO.File]::ReadAllText($themeFile)+'</themes>')
+        if ($themes.themes.gammaset.id -cnotcontains $theme) {throw "Classic Modern is missing the $theme color theme."}
+        '<section name="Color Themes"><entry name="Winamp Classic Modern" value="'+$theme+'"/></section>'
+    }
     $xml = '<WasabiXML><configuration><section name="{00000000-0000-0000-0000-000000000000}">'+$tint+
         '<section name="Skin:Winamp Classic Modern">'+($layouts -join '')+'</section></section></configuration></WasabiXML>'
     $document = [xml]('<?xml version="1.0"?>'+$xml)
@@ -194,7 +198,7 @@ function Set-Layout($skin) {
     if (!$library -or !$playlist -or !$playerFrame) { throw 'Classic Modern layout is incomplete.' }
     $playerSize = $ui.Rect($playerFrame)
     $x = 32; $y = 32
-    if ($skin -eq 'Olive') {
+    if ($olive) {
         $eq=Get-Frame 'Equalizer'
         if ($eq) {$ui.Show($eq,$false)}
         Place $playerFrame $x $y 550 243
@@ -500,7 +504,7 @@ function Set-TrackEqualizer($song) {
     $preset=switch -Regex ($song.genre) {
         'reggae|dub(?!step)' {'Reggae';break}
         'ska\b' {'Ska';break}
-        'big beat|house|disco|dance' {'Dance';break}
+        'big beat|house|disco|dance|new wave' {'Dance';break}
         'techno|breakcore|drum.*bass|trance|dubstep' {'Techno';break}
         'jazz|big band|swing' {'Live';break}
         'hip.?hop|trip.?hop|rap|slice of life' {'Party';break}
@@ -725,7 +729,7 @@ function Save-Shot($name,$only=[IntPtr]::Zero,$focusField=$tree,[switch]$stopped
         Start-PoseTrack $name
         $preset=Set-TrackEqualizer $pose.queue[$slot]
         if ($visualizer -ne [IntPtr]::Zero -and $only -eq [IntPtr]::Zero) {
-            $visualPreset=$visualPresets[$slot%$visualPresets.Count]
+            $visualPreset=if ($name -eq 'classic-modern-winamp3-albums') {'Blue on Grey'} else {$visualPresets[$slot%$visualPresets.Count]}
             Set-AnalyzerPreset $visualizer $visualPreset
         }
     }
@@ -783,8 +787,8 @@ function Search-Album {
     Click-First $ui.Item($form,1006)
     return $form
 }
-function Set-DemoQueue {
-    if ($ui.Send($main,0x400,0,124) -ne $pose.queue.Count) {
+function Set-DemoQueue([int]$trackCount) {
+    if ($ui.Send($main,0x400,0,124) -ne $trackCount) {
         $ui.Post($main,0x111,40047,0)
         [void](Wait-For {$ui.Send($main,0x400,0,104) -eq 0} 'stopped before assembling the library playlist')
         [void]$ui.Send($main,0x400,0,101)
@@ -796,7 +800,7 @@ function Set-DemoQueue {
             if ($candidate -and $ui.Send($ui.Item($candidate,1006),0x1004,0,0) -eq $pose.textWindows.song.total) {return $candidate}
         } 'the connected Tracks view' 150
         Command $view 1051
-        for ($i=0;$i -lt $pose.queue.Count;++$i) {
+        for ($i=0;$i -lt $trackCount;++$i) {
             $song=$pose.queue[$i]
             $ui.SetText($ui.Item($view,1003),$song.title)
             Command $view 1004
@@ -843,8 +847,11 @@ function Get-DemoAsset($method,$id,$path) {
         Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $path
     } finally {$md5.Dispose()}
 }
-function Pose-Player($skin) {
+function Pose-Player($skin,$theme='') {
     $classic = $skin -eq 'WACUP Classic'
+    $modern = $skin -eq 'Winamp Classic Modern'
+    $olive = $theme -eq '++ Olive garden'
+    $winamp3 = $theme -eq '+ Winamp 3.0'
     $visualizer=[IntPtr]::Zero
     $placements=@{}
     $profile = Join-Path $run 'profile'
@@ -852,7 +859,7 @@ function Pose-Player($skin) {
     [IO.File]::WriteAllText((Join-Path $profile 'Plugins\gen_ml.ini'),"[gen_ml_config]"+$nl+'ldivpos=190'+$nl)
     $app = Join-Path $run 'WACUP'
     [IO.File]::WriteAllText((Join-Path $app 'paths.ini'),"[winamp]"+$nl+"inidir=$profile"+$nl+'portable=0'+$nl)
-    $skinName = if ($classic) {''} elseif ($skin -eq 'Olive') {'Winamp Classic Modern'} else {$skin}
+    $skinName = if (!$classic) {$skin}
     $ini = @"
 [Winamp]
 skin=$skinName
@@ -867,9 +874,9 @@ visplugin_num=0
 lyrics=1
 show_art=0
 "@
-    if ($skin -eq 'Olive' -or $skin -eq 'Winamp Classic Modern') { Set-ModernProfile $profile $skin }
+    if ($modern) { Set-ModernProfile $profile $theme }
     [IO.File]::WriteAllText((Join-Path $profile 'winamp.ini'),$ini+$nl,$utf8)
-    Write-Log "Starting $skin"
+    Write-Log ("Starting "+(@($skin,$theme) -ne '' -join ' / '))
     $player = Start-PrivateProcess (Join-Path $app 'wacup.exe') '/NEW' $app
     $ui = New-Object CaptureWindows $player.Id,$env:TS_SHOT_WORKER
     $main = [IntPtr]::Zero
@@ -889,7 +896,7 @@ show_art=0
         if (![CaptureWindows]::IsWindowVisible($tree)) { $ui.Post($main,0x111,40379,0) }
         [void](Wait-For { [CaptureWindows]::IsWindowVisible($tree) } 'visible Media Library')
         Start-Sleep -Milliseconds 450
-        if ($skin -eq 'Winamp Classic Modern') {
+        if ($modern -and !$olive) {
             [IO.File]::WriteAllText((Join-Path $profile 'Plugins\vis_classic.ini'),"[Classic Analyzer]"+$nl+'Profile=Aurora Borealis'+$nl)
             $ui.Post($main,0x111,40192,0)
             $visualizer=Wait-For {
@@ -899,12 +906,15 @@ show_art=0
             } 'Classic Spectrum Analyzer'
         }
         [IntPtr]$layoutPlayer=Set-Layout $skin
-        if ($skin -eq 'Winamp Classic Modern') {Connect-DemoServer}
+        if ($modern -and !$theme) {Connect-DemoServer}
         [void](Wait-Library)
-        Set-DemoQueue
-        if ($skin -eq 'Winamp Classic Modern') {
+        # The extra track joins the playlist for its own pose. Keep the earlier playlists as pictured.
+        Set-DemoQueue $(if ($winamp3) {$pose.queue.Count} else {$pose.queue.Count-1})
+        if ($modern -and !$theme) {
             Save-ClassicModernGallery
-        } elseif ($skin -eq 'Olive') {
+        } elseif ($winamp3) {
+            Save-Shot 'classic-modern-winamp3-albums'
+        } elseif ($olive) {
             Select-View 'Favorites'
             [void](Wait-Library)
             Save-Shot 'classic-modern-olive-playback'
@@ -954,7 +964,8 @@ function Invoke-Capture {
             'classic-modern-tracks','classic-modern-playlists')
         if ($pose.playlist) {$shotOrder+='classic-modern-playlist-tracks'}
         $shotOrder+=@('classic-modern-favorites','classic-modern-filtered-tracks','edit-view-mode','edit-columns',
-            'classic-modern-offline-cache','big-bento-modern-albums','wacup-classic-albums','classic-modern-olive-playback')
+            'classic-modern-offline-cache','big-bento-modern-albums','wacup-classic-albums','classic-modern-olive-playback',
+            'classic-modern-winamp3-albums')
         if ($shotOrder.Count -ne $pose.queue.Count) {throw 'Refresh the demo database to match the current screenshot poses.'}
         $seekPositions=@()
         for ($i=0;$i -lt $pose.queue.Count;++$i) {
@@ -962,10 +973,13 @@ function Invoke-Capture {
             $percent=12+(24+37*$i)%79
             $position=[int][Math]::Floor($duration*$percent/100)
             if ($shotOrder[$i] -eq 'big-bento-modern-albums') {$position=[int]$pose.bentoSeek}
+            if ($shotOrder[$i] -eq 'classic-modern-winamp3-albums') {$position=[int]$pose.winamp3Seek}
             while ($position -in $seekPositions) {$position=1+($position%($duration-2))}
             $seekPositions+=$position
         }
-        foreach ($skin in 'Winamp Classic Modern','Big Bento Modern','WACUP Classic','Olive') { Pose-Player $skin }
+        foreach ($skin in 'Winamp Classic Modern','Big Bento Modern','WACUP Classic') { Pose-Player $skin }
+        Pose-Player 'Winamp Classic Modern' '++ Olive garden'
+        Pose-Player 'Winamp Classic Modern' '+ Winamp 3.0'
         $captured=@(Get-ChildItem -LiteralPath $shots -File -Filter '*.png' | ForEach-Object BaseName)
         $expected=@('classic-modern-welcome')+$shotOrder
         if (Compare-Object $expected $captured) {throw 'The captured PNGs do not match the requested gallery.'}

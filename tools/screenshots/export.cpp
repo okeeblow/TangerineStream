@@ -180,9 +180,9 @@ public:
             [](const Entry& entry) { return entry.kind == "album"; });
         auto album = featured != allFavorites.end() ? *featured : firstAlbum_;
         if (album.id.empty()) throw Error("The library has no album to pose.");
-        detail(album);
+        const auto openingTrack=detail(album);
         std::sort(allFavorites.begin(),allFavorites.end(),byName);
-        playbackQueue(allFavorites);
+        playbackQueue(allFavorites,openingTrack);
         filterExamples();
         albumSearch();
         // The Favorites poses use the browser's descending song-count sort.
@@ -429,10 +429,10 @@ private:
         }
         throw Error("The album search pose needs two to eight matching albums.");
     }
-    void playbackQueue(const std::vector<Entry>& favorites) {
+    void playbackQueue(const std::vector<Entry>& favorites,const std::string& openingTrack) {
         std::vector<Entry> queue;
         std::set<std::string> titles;
-        const size_t required=havePlaylist_?18:17;
+        const size_t required=havePlaylist_?19:18;
         auto choose=[&](const Entry& song) {
             Document doc(song.data);
             double seconds=0;
@@ -458,7 +458,7 @@ private:
         if(queue.size()<required) throw Error("The demo needs a different playable track for every playing pose.");
         std::vector<SongLyrics> lyrics;
         for(const auto& song:queue) lyrics.push_back(songLyrics(source_,song));
-        const size_t bento=required-3;
+        const size_t bento=required-4;
         auto richest=std::max_element(lyrics.begin(),lyrics.end(),[](const auto& a,const auto& b) {
             return a.distinctTimedLines<b.distinctTimedLines;
         });
@@ -469,13 +469,23 @@ private:
         std::swap(lyrics[bento],lyrics[chosen]);
         // Olive also has a tall Lyrics pane. Prefer a remaining track with enough
         // distinct timed lines to fill it, keeping the other poses' songs in place.
-        const size_t olive=required-1;
+        const size_t olive=required-2;
         auto oliveLyrics=std::max_element(lyrics.begin()+olive,lyrics.end(),[](const auto& a,const auto& b) {
             return a.distinctTimedLines<b.distinctTimedLines;
         });
         const size_t oliveTrack=static_cast<size_t>(oliveLyrics-lyrics.begin());
         std::swap(queue[olive],queue[oliveTrack]);
         std::swap(lyrics[olive],lyrics[oliveTrack]);
+        const size_t winamp3=required-1;
+        // Reuse the featured album's artwork when its opening track is still available.
+        auto opener=std::find_if(queue.begin()+winamp3,queue.end(),[&](const Entry& song) {
+            return song.id==openingTrack;
+        });
+        if(opener!=queue.end()) {
+            const auto index=static_cast<size_t>(opener-queue.begin());
+            std::swap(queue[winamp3],queue[index]);
+            std::swap(lyrics[winamp3],lyrics[index]);
+        }
         queue.resize(required);
         for(size_t i=0;i<queue.size();++i) {
             const auto& song=queue[i];
@@ -485,18 +495,19 @@ private:
             const size_t firstEditor = havePlaylist_ ? 12 : 11;
             if (i>=1 && i!=firstEditor && i!=firstEditor+1) {
                 wantCover(song);
-                size_t first=0, count=i+1==queue.size()?26:12;
-                if(i==bento) {
-                    count=40; // visible rows in the tall native Lyrics pane
+                size_t first=0, count=i==olive?26:12;
+                if(i==bento || i==winamp3) {
+                    if(i==bento) count=40; // visible rows in the tall native Lyrics pane
                     Document track(song.data);
-                    auto targetMs=static_cast<int64_t>(track.root["duration"].get_double().value()*330);
+                    const auto targetMs=static_cast<int64_t>(track.root["duration"].get_double().value()*(i==bento?330:400));
                     const auto& lines=lyrics[i].lines;
                     size_t cue=0;
                     for(size_t n=0;n<lines.size();++n)
                         if(lines[n].startMs>=0 && lines[n].startMs<=targetMs && !lines[n].text.empty()) cue=n;
                     first=std::min(cue>2?cue-2:0,lines.size()>count?lines.size()-count:0);
-                    pose("bentoSeek",std::to_string(std::max<int64_t>(1,lines[cue].startMs/1000)));
-                    std::cout<<"Big Bento: "<<song.name<<", "<<lyrics[i].distinctTimedLines<<" distinct timed lines\n";
+                    const auto seekMs=lines.empty() || lines[cue].startMs<0 ? targetMs : lines[cue].startMs;
+                    pose(i==bento?"bentoSeek":"winamp3Seek",std::to_string(std::max<int64_t>(1,seekMs/1000)));
+                    if(i==bento) std::cout<<"Big Bento: "<<song.name<<", "<<lyrics[i].distinctTimedLines<<" distinct timed lines\n";
                 }
                 excerpt=lyricExcerpt(lyrics[i],first,count);
             }
@@ -504,7 +515,7 @@ private:
             fixture_.lyrics.emplace(song.id,std::move(excerpt));
         }
     }
-    void detail(const Entry& album) {
+    std::string detail(const Entry& album) {
         pose("album",album.name);
         wantCover(album);
         Document doc(source_.sub("getAlbum",{{"id",album.id}}));
@@ -520,6 +531,7 @@ private:
                 wantCover(song);
             }
         }
+        return field(songs.front(),"id");
     }
 };
 } // namespace
