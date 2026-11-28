@@ -1,4 +1,6 @@
 #include "store.hpp"
+#include "migrations.hpp"
+#include "sqlite_statement.hpp"
 #include "server.hpp"
 #include "tangerine_product.h"
 
@@ -17,130 +19,6 @@ namespace {
 
 constexpr int defaultBudget = 1024;
 constexpr std::int64_t artworkBudget = 128 * MiB;
-
-[[noreturn]] void databaseError(sqlite3* db) {
-    throw Error(std::string(TS_PRODUCT_NAME " storage: ") + (db ? sqlite3_errmsg(db) : "out of memory"));
-}
-
-} // namespace
-
-class Statement {
-public:
-    Statement(sqlite3* db, const char* sql, sqlite3_stmt** slot = nullptr) : db_(db), slot_(slot) {
-        if (slot_) statement_ = std::exchange(*slot_, nullptr);
-        if (!statement_ && sqlite3_prepare_v3(db_, sql, -1, slot_ ? SQLITE_PREPARE_PERSISTENT : 0,
-                                             &statement_, nullptr) != SQLITE_OK) databaseError(db_);
-    }
-    ~Statement() {
-        if (slot_ && !*slot_) {
-            sqlite3_reset(statement_);
-            sqlite3_clear_bindings(statement_);
-            *slot_ = statement_;
-        } else {
-            sqlite3_finalize(statement_);
-        }
-    }
-    Statement(const Statement&) = delete;
-    Statement& operator=(const Statement&) = delete;
-    Statement& bind(std::int64_t value) {
-        if (sqlite3_bind_int64(statement_, next_++, value) != SQLITE_OK) databaseError(db_);
-        return *this;
-    }
-    Statement& bind(const std::string& value) {
-        if (sqlite3_bind_text(statement_, next_++, value.c_str(), static_cast<int>(value.size()),
-                              SQLITE_TRANSIENT) != SQLITE_OK) databaseError(db_);
-        return *this;
-    }
-    Statement& bindBlob(const std::string& value) {
-        if (sqlite3_bind_blob(statement_, next_++, value.data(), static_cast<int>(value.size()),
-                              SQLITE_TRANSIENT) != SQLITE_OK) databaseError(db_);
-        return *this;
-    }
-    bool row() {
-        auto result = sqlite3_step(statement_);
-        if (result == SQLITE_ROW) return true;
-        if (result == SQLITE_DONE) return false;
-        databaseError(db_);
-    }
-    void run() { while (row()) {} }
-    std::int64_t integer(int index) const { return sqlite3_column_int64(statement_, index); }
-    std::string text(int index) const {
-        auto text = sqlite3_column_text(statement_, index);
-        return text ? reinterpret_cast<const char*>(text) : "";
-    }
-    std::string blob(int index) const {
-        auto bytes = static_cast<const char*>(sqlite3_column_blob(statement_, index));
-        return bytes ? std::string(bytes, sqlite3_column_bytes(statement_, index)) : std::string{};
-    }
-
-private:
-    sqlite3* db_;
-    sqlite3_stmt** slot_;
-    sqlite3_stmt* statement_ = nullptr;
-    int next_ = 1;
-};
-
-namespace {
-
-class Transaction {
-public:
-    explicit Transaction(sqlite3* db) : db_(db) { Statement(db, "BEGIN IMMEDIATE").run(); }
-    ~Transaction() {
-        if (!committed_) {
-            try { Statement(db_, "ROLLBACK").run(); } catch (...) {}
-        }
-    }
-    void commit() {
-        Statement(db_, "COMMIT").run();
-        committed_ = true;
-    }
-
-private:
-    sqlite3* db_;
-    bool committed_ = false;
-};
-
-void migrate(sqlite3* db) {
-    static constexpr const char* migrations[] = {
-#include "migrations.inc"
-    };
-    Transaction transaction(db);
-    Statement version(db, "PRAGMA user_version");
-    if (!version.row()) databaseError(db);
-    auto schema = version.integer(0);
-    version.run();
-    const auto latest = static_cast<std::int64_t>(std::size(migrations));
-    if (schema < 0 || schema > latest)
-        throw Error("Unsupported library database version " + std::to_string(schema) +
-                    ". This plug-in supports versions 0 through " + std::to_string(latest) + ".");
-    // Submit listens queued by earlier releases using their original playback times.
-    if (schema <= 8 && sqlite3_table_column_metadata(db, "main", "reports", "key",
-            nullptr, nullptr, nullptr, nullptr, nullptr) == SQLITE_OK) {
-        Statement(db, "ALTER TABLE reports RENAME TO pending_listens").run();
-        Statement(db, "ALTER TABLE pending_listens RENAME COLUMN time TO listened_at_ms").run();
-        Statement(db, "DROP INDEX IF EXISTS reports_server").run();
-        Statement(db, "CREATE INDEX pending_listens_submission_order ON pending_listens(server, key)").run();
-    }
-    // Keep covers already cached by preview builds that used the original column names.
-    if (schema >= 6 && schema <= 8) {
-        auto renameArtworkColumn = [db](const char* previous, const char* current) {
-            if (sqlite3_table_column_metadata(db, "main", "artwork", previous, nullptr, nullptr,
-                                              nullptr, nullptr, nullptr) != SQLITE_OK) return;
-            const auto sql = std::string("ALTER TABLE artwork RENAME COLUMN ") + previous + " TO " + current;
-            Statement(db, sql.c_str()).run();
-        };
-        renameArtworkColumn("requested_size", "requested_max_edge_px");
-        renameArtworkColumn("pixel_size", "cached_longest_edge_px");
-    }
-    for (; schema < latest; ++schema) {
-        if (sqlite3_exec(db, migrations[schema], nullptr, nullptr, nullptr) != SQLITE_OK)
-            throw Error("Library database migration " + std::to_string(schema + 1) +
-                        " failed: " + sqlite3_errmsg(db));
-        auto update = "PRAGMA user_version=" + std::to_string(schema + 1);
-        Statement(db, update.c_str()).run();
-    }
-    transaction.commit();
-}
 
 constexpr char trackColumns[] =
     "key,server,remote_id,title,artist,album,suffix,mime,duration,pinned,favorite,bytes,"
@@ -232,7 +110,7 @@ Store::Store(const std::filesystem::path& directory) : cache_(directory / L"cach
         Statement(db_, "PRAGMA foreign_keys=ON").run();
         Statement(db_, "PRAGMA journal_mode=WAL").run();
         Statement(db_, "PRAGMA synchronous=FULL").run();
-        migrate(db_);
+        migrateLibrary(db_);
         Statement accounts(db_, "SELECT id FROM servers WHERE configured=1");
         while (accounts.row()) configured_.insert(accounts.integer(0));
         auto budget = setting("rolling_mib");

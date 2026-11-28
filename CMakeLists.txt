@@ -139,8 +139,14 @@ add_wacup_plugin(ml_tangerinestream
     src/plugin.cpp src/list_scroll.cpp src/server.cpp src/store.cpp src/playback.cpp src/artwork.cpp src/browse_sort.cpp
     src/library_view.cpp src/view_editor.cpp
     src/host_metadata.cpp src/plugin.rc)
+add_library(tangerine_migrations STATIC src/migrations.cpp)
+target_compile_features(tangerine_migrations PRIVATE cxx_std_17)
+target_link_libraries(tangerine_migrations PUBLIC tangerine_sqlite)
+if(MSVC)
+    set_property(TARGET tangerine_migrations PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 include(cmake/Migrations.cmake)
-embed_migrations(ml_tangerinestream)
+embed_migrations(tangerine_migrations)
 # The 5.666 package omits the Wasabi service headers.
 foreach(target IN ITEMS in_tangerinestream ml_tangerinestream)
     target_include_directories(${target} SYSTEM PRIVATE
@@ -148,7 +154,7 @@ foreach(target IN ITEMS in_tangerinestream ml_tangerinestream)
         "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Agave")
 endforeach()
 target_link_libraries(ml_tangerinestream PRIVATE
-    date::date simdjson::simdjson uriparser::uriparser tangerine_sqlite comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
+    date::date simdjson::simdjson uriparser::uriparser tangerine_migrations comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
 
 if(TANGERINE_SCREENSHOTS)
     add_subdirectory(tools/screenshots)

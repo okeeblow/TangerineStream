@@ -4,7 +4,9 @@
 #include <simdjson.h>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <memory>
+#include <vector>
 
 namespace demo {
 using tangerine::Error;
@@ -64,6 +66,24 @@ private:
     sqlite3* db_;
     std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement_{nullptr, sqlite3_finalize};
     int parameter_ = 0;
+};
+
+struct Entry {
+    std::string kind, id, name, cover, data;
+};
+using ObjectKey = std::pair<std::string,std::string>;
+struct Collection {
+    int total = 0;
+    std::vector<ObjectKey> members;
+};
+struct Fixture {
+    std::map<ObjectKey,Entry> objects;
+    std::map<std::string,Collection> collections;
+    std::map<std::string,std::string> poses, coverAliases, lyrics;
+    std::vector<std::string> playback;
+
+    void save(Database& db) const;
+    void load(Database& db);
 };
 
 void exportLibrary(const std::filesystem::path& destination, const std::string& user, const std::string& password);

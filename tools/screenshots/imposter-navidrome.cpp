@@ -29,42 +29,34 @@ std::string lower(std::string text) {
     std::transform(text.begin(),text.end(),text.begin(),[](unsigned char ch){return static_cast<char>(std::tolower(ch));});
     return text;
 }
-struct Item {
-    std::string id,name,data;
-};
-struct Collection {
-    int total=0;
-    std::vector<Item> items;
-};
-
 class Catalog {
 public:
     explicit Catalog(const std::filesystem::path& file) : db_(file,SQLITE_OPEN_READONLY|SQLITE_OPEN_FULLMUTEX) {
-        Query version(db_,"PRAGMA user_version");
-        if (!version.next() || version.number()!=2) throw Error("Refresh the demo database with regenerate-screenshots.bat WACUP rebuild-db.");
-        Query lists(db_,"SELECT name,total FROM collection");
-        while (lists.next()) collections_[lists.bytes()].total=lists.number(1);
-        Query rows(db_,R"SQL(SELECT m.collection,o.remote_id,COALESCE(json_extract(o.data,'$.name'),
-            json_extract(o.data,'$.title'),json_extract(o.data,'$.value')),o.data
-            FROM member m JOIN object o ON o.id=m.object ORDER BY m.collection,m.position)SQL");
-        while (rows.next()) collections_.at(rows.bytes()).items.push_back({rows.bytes(1),rows.bytes(2),rows.bytes(3)});
-        Query settings(db_,"SELECT key,value FROM pose");
-        while (settings.next()) pose_[settings.bytes()]=settings.bytes(1);
+        fixture_.load(db_);
     }
-    std::string pose(const std::string& key) const { return pose_.at(key); }
-    int total(const std::string& collection) const { return collections_.at(collection).total; }
-    std::string queue() {
-        Query rows(db_,"SELECT json_group_array(json(data)) FROM (SELECT data FROM playback p JOIN object o ON o.id=p.object ORDER BY p.position)");
-        if (!rows.next()) throw Error("Missing demo queue.");
-        return rows.bytes();
+    std::string pose(const std::string& key) const { return fixture_.poses.at(key); }
+    int total(const std::string& collection) const { return fixture_.collections.at(collection).total; }
+    std::string queue() const {
+        std::string result="[";
+        for (const auto& id:fixture_.playback) {
+            if (result.size()>1) result+=',';
+            result+=fixture_.objects.at({"song",id}).data;
+        }
+        return result+"]";
     }
-    std::string lyrics(const std::string& id,const std::string& title="") {
-        Query row(db_,"SELECT lyrics FROM playback p JOIN object o ON o.id=p.object WHERE o.remote_id=? OR json_extract(data,'$.title')=?");
-        return row.bind(id).bind(title).next()?row.bytes():"[]";
+    std::string lyrics(const std::string& id,const std::string& title="") const {
+        auto where=fixture_.lyrics.find(id);
+        if (where!=fixture_.lyrics.end()) return where->second;
+        for (const auto& track:fixture_.playback) {
+            if (fixture_.objects.at({"song",track}).name!=title) continue;
+            where=fixture_.lyrics.find(track);
+            if (where!=fixture_.lyrics.end()) return where->second;
+        }
+        return "[]";
     }
     std::string list(const std::string& name,int start,int count,const std::string& filter="",int* totalOut=nullptr) const {
-        auto where=collections_.find(name);
-        if (where==collections_.end()) {
+        auto where=fixture_.collections.find(name);
+        if (where==fixture_.collections.end()) {
             if (totalOut) *totalOut=0;
             return "[]";
         }
@@ -76,7 +68,8 @@ public:
             if (emitted++) result+=',';
             result+=object;
         };
-        for (const auto& item:list.items) {
+        for (const auto& key:list.members) {
+            const auto& item=fixture_.objects.at(key);
             if (!needle.empty() && lower(item.name).find(needle)==std::string::npos) continue;
             if (matching++>=start && emitted<count) append(item.data);
         }
@@ -102,12 +95,14 @@ public:
         return result+"]";
     }
     std::string object(const std::string& kind,const std::string& id) {
-        Query row(db_,"SELECT data FROM object WHERE kind=? AND remote_id=?");
-        return row.bind(kind).bind(id).next()?row.bytes():"{}";
+        auto found=fixture_.objects.find({kind,id});
+        return found==fixture_.objects.end()?"{}":found->second.data;
     }
     bool cover(Reply& reply,const std::string& id) {
-        Query row(db_,"SELECT data FROM cover JOIN image USING(digest) WHERE remote_id=?");
-        if (!row.bind(id).next()) return false;
+        auto found=fixture_.coverAliases.find(id);
+        if (found==fixture_.coverAliases.end()) return false;
+        Query row(db_,"SELECT data FROM artwork WHERE server=1 AND cover_key=?");
+        if (!row.bind(found->second).next()) return false;
         auto bytes=row.bytes();
         auto mime=bytes.compare(0,2,"\xff\xd8")==0?"image/jpeg":bytes.compare(0,4,"RIFF")==0?"image/webp":"image/png";
         reply.set_content(std::move(bytes),mime);
@@ -115,8 +110,7 @@ public:
     }
 private:
     Database db_;
-    std::map<std::string,Collection> collections_;
-    std::map<std::string,std::string> pose_;
+    Fixture fixture_;
 };
 
 void visualizationAudio(Reply& reply,int seconds,const std::string& trackId) {

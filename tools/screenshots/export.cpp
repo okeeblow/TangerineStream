@@ -1,4 +1,5 @@
 #include "demo.hpp"
+#include "migrations.hpp"
 #include <algorithm>
 #include <cctype>
 #include <set>
@@ -65,10 +66,6 @@ private:
     tangerine::HttpClient client_;
     std::string user_, password_;
     std::wstring authorization_;
-};
-
-struct Entry {
-    std::string kind, id, name, cover, data;
 };
 
 struct LyricLine {std::string text; int64_t startMs;};
@@ -149,20 +146,12 @@ class Export {
 public:
     Export(Database& db, Source& source) : db_(db), source_(source) {}
     void run() {
-        db_.exec(R"SQL(
-          PRAGMA foreign_keys=ON;
-          BEGIN;
-          CREATE TABLE object(id INTEGER PRIMARY KEY, kind TEXT NOT NULL, remote_id TEXT NOT NULL, data TEXT NOT NULL,
-                              UNIQUE(kind,remote_id));
-          CREATE TABLE collection(name TEXT PRIMARY KEY, total INTEGER NOT NULL CHECK(total>=0)) WITHOUT ROWID;
-          CREATE TABLE member(collection TEXT REFERENCES collection, object INTEGER REFERENCES object, position INTEGER NOT NULL,
-                              PRIMARY KEY(collection,position)) WITHOUT ROWID;
-          CREATE TABLE image(digest TEXT PRIMARY KEY, data BLOB NOT NULL) WITHOUT ROWID;
-          CREATE TABLE cover(remote_id TEXT PRIMARY KEY, digest TEXT REFERENCES image) WITHOUT ROWID;
-          CREATE TABLE pose(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
-          CREATE TABLE playback(position INTEGER PRIMARY KEY, object INTEGER NOT NULL UNIQUE REFERENCES object, lyrics TEXT NOT NULL);
-          PRAGMA user_version=2;
-        )SQL");
+        db_.exec("PRAGMA foreign_keys=ON");
+        tangerine::migrateLibrary(db_.get());
+        db_.exec("BEGIN IMMEDIATE");
+        // The migrated library tables require a server key. Demo credentials exist only at runtime.
+        db_.exec("INSERT INTO servers(id,name,url,user,password,native,cache_favorites,configured) "
+                 "VALUES(1,'Demo Server','https://tangerine.stream/','','',1,0,0)");
         native("artist","artist",listRows);
         native("albumartist","artist",listRows,{{"role","albumartist"}});
         native("song","song",listRows);
@@ -238,29 +227,29 @@ public:
             if (data.size()<12 || (data.compare(0,2,"\xff\xd8") && data.compare(0,4,"\x89PNG") && data.compare(0,4,"RIFF")))
                 throw Error("Expected a 200-pixel cover image.");
             auto digest = tangerine::md5(data);
-            Query(db_,"INSERT OR IGNORE INTO image VALUES(?,?)").bind(digest).blob(data).next();
-            Query(db_,"INSERT INTO cover VALUES(?,?)").bind(id).bind(digest).next();
+            Query(db_,"INSERT OR IGNORE INTO artwork(server,cover_key,data,last_use,requested_max_edge_px,cached_longest_edge_px) "
+                      "VALUES(1,?,?,0,200,200)").bind(digest).blob(data).next();
+            fixture_.coverAliases.emplace(id,digest);
         }
-        // Navidrome's native browser also requests the unversioned album or media ID.
-        // Point those aliases at the same 200px image already kept for the photo.
-        db_.exec(R"SQL(
-          INSERT OR IGNORE INTO cover
-          SELECT 'al-'||o.remote_id,c.digest FROM object o JOIN cover c ON c.remote_id=o.data->>'$.coverArt'
-          WHERE o.kind='album';
-          INSERT OR IGNORE INTO cover
-          SELECT 'mf-'||o.remote_id,c.digest FROM object o JOIN cover c ON c.remote_id=o.data->>'$.coverArt'
-          WHERE o.kind='song';
-          INSERT OR IGNORE INTO cover
-          SELECT 'al-'||(o.data->>'$.albumId'),c.digest FROM object o JOIN cover c ON c.remote_id=o.data->>'$.coverArt'
-          WHERE o.kind='song' AND o.data->>'$.albumId' IS NOT NULL ORDER BY o.id;
-        )SQL");
-        Query invalid(db_,"SELECT name FROM collection WHERE total<(SELECT count(*) FROM member WHERE collection=name)");
-        if (invalid.next()) throw Error("The library changed during export. Run the refresh again.");
+        // Navidrome's unversioned album and media IDs identify the same artwork.
+        for (const auto& [key,entry]:fixture_.objects) {
+            auto cover=fixture_.coverAliases.find(entry.cover);
+            if (cover==fixture_.coverAliases.end()) continue;
+            if (entry.kind=="album") fixture_.coverAliases.emplace("al-"+entry.id,cover->second);
+            if (entry.kind=="song") {
+                fixture_.coverAliases.emplace("mf-"+entry.id,cover->second);
+                Document song(entry.data);
+                auto albumId=field(song.root,"albumId");
+                if (!albumId.empty()) fixture_.coverAliases.emplace("al-"+albumId,cover->second);
+            }
+        }
+        fixture_.save(db_);
         db_.exec("COMMIT; VACUUM;");
         std::cout << allFavorites.size() << " favorites and " << covers_.size() << " cover references exported.\n";
     }
 private:
     Database& db_;
+    Fixture fixture_;
     Source& source_;
     Entry firstAlbum_;
     std::set<std::string> covers_;
@@ -312,14 +301,14 @@ private:
         throw Error("Could not find two rows of played, unstarred albums for the gallery.");
     }
     void collection(const std::string& name,int total) {
-        Query(db_,"INSERT INTO collection VALUES(?,?)").bind(name).bind(total).next();
+        if (!fixture_.collections.emplace(name,Collection{total,{}}).second) throw Error("Duplicate demo collection: "+name);
     }
     void add(const std::string& list,const Entry& entry) {
-        Query(db_,"INSERT OR IGNORE INTO object(kind,remote_id,data) VALUES(?,?,?)")
-            .bind(entry.kind).bind(entry.id).bind(entry.data).next();
-        Query(db_,"INSERT INTO member SELECT ?,o.id,(SELECT count(*) FROM member WHERE collection=?) FROM object o "
-                  "WHERE kind=? AND remote_id=? AND (? OR NOT EXISTS(SELECT 1 FROM member WHERE collection=? AND object=o.id))")
-            .bind(list).bind(list).bind(entry.kind).bind(entry.id).bind(list.rfind("playlist/",0)==0).bind(list).next();
+        ObjectKey key{entry.kind,entry.id};
+        fixture_.objects.emplace(key,entry);
+        auto& members=fixture_.collections.at(list).members;
+        if (list.rfind("playlist/",0)==0 || std::find(members.begin(),members.end(),key)==members.end())
+            members.push_back(std::move(key));
     }
     void native(const std::string& list,const std::string& kind,int limit,tangerine::Parameters params={},
                 const std::string& sort="",bool descending=false) {
@@ -359,12 +348,10 @@ private:
         std::cout << "playlist: " << total << '\n';
     }
     void pose(const std::string& key,const std::string& value) {
-        Query(db_,"INSERT INTO pose VALUES(?,?)").bind(key).bind(value).next();
+        fixture_.poses.emplace(key,value);
     }
     void filterExamples() {
-        Query featured(db_,"SELECT value FROM pose WHERE key='song'");
-        featured.next();
-        const std::string fallback=featured.bytes();
+        const std::string& fallback=fixture_.poses.at("song");
         for (const std::string& title : std::vector<std::string>{"Blue Monday","Helter Skelter","Burning Down",fallback}) {
             int total=0;
             Document page(source_.list("song",listRows,{{"title",title}},total));
@@ -414,10 +401,9 @@ private:
                 if(choose(project("song",node))) break;
         }
         if(queue.size()<required) {
-            Query candidates(db_,"SELECT data FROM object WHERE kind='song' ORDER BY id");
-            while(queue.size()<required && candidates.next()) {
-                Document doc(candidates.bytes());
-                choose(project("song",doc.root));
+            for (const auto& key:fixture_.collections.at("song").members) {
+                if (queue.size()==required) break;
+                choose(fixture_.objects.at(key));
             }
         }
         if(queue.size()!=required) throw Error("The demo needs a different playable track for every screenshot.");
@@ -455,8 +441,8 @@ private:
                 }
                 excerpt=lyricExcerpt(lyrics[i],first,count);
             }
-            Query(db_,"INSERT INTO playback SELECT ?,id,? FROM object WHERE kind='song' AND remote_id=?")
-                .bind(static_cast<int>(i)).bind(excerpt).bind(song.id).next();
+            fixture_.playback.push_back(song.id);
+            fixture_.lyrics.emplace(song.id,std::move(excerpt));
         }
     }
     void detail(const Entry& album) {
