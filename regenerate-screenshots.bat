@@ -371,6 +371,7 @@ public sealed class CaptureWindows
         if(!GetClientRect(list,out bounds)) throw new Win32Exception();
         int viewportBottom=Rect(list).Bottom;
         var names=new string[columns];
+        var heading=new int[columns];
         var minimum=new int[columns];
         var preferred=new int[columns];
         var flex=new int[columns];
@@ -381,24 +382,33 @@ public sealed class CaptureWindows
         using(var g=Graphics.FromHwnd(list)) {
             for(int col=0;col<columns;col++) {
                 names[col]=headers[col].Current.Name;
-                int widest=0;
+                var widths=new List<int>();
                 for(int row=first;row<last;row++) {
                     var cell=grid.GetItem(row,col);
                     if(cell==null || cell.Current.BoundingRectangle.Top>=viewportBottom) continue;
                     string value=cell.Current.Name;
                     if(String.IsNullOrWhiteSpace(value) || value.Trim() == "\u2800") continue;
-                    widest=Math.Max(widest,(int)Math.Ceiling(g.MeasureString(value,SystemFonts.MessageBoxFont).Width)+12);
+                    widths.Add((int)Math.Ceiling(g.MeasureString(value,SystemFonts.MessageBoxFont).Width)+18);
                 }
-                if(widest==0) {report.Add(names[col]+" hidden");continue;}
-                minimum[col]=(int)Math.Ceiling(g.MeasureString(names[col],SystemFonts.MessageBoxFont).Width)+18;
-                preferred[col]=Math.Max(minimum[col],widest);
+                if(widths.Count==0) {report.Add(names[col]+" hidden");continue;}
+                widths.Sort();
+                heading[col]=(int)Math.Ceiling(g.MeasureString(names[col],SystemFonts.MessageBoxFont).Width)+18;
                 bool compact=Array.IndexOf(new[]{"Cache","Length","Tracks","Albums","Year","Disc","#"},names[col])>=0;
+                // Fit fixed values such as "EA TRAX™" in full. A single long artist credit
+                // should not consume space that would display the titles of many tracks.
+                minimum[col]=Math.Max(heading[col],widths[compact?widths.Count-1:widths.Count/4]);
+                preferred[col]=Math.Max(minimum[col],widths[widths.Count-1-widths.Count/10]);
                 flex[col]=compact?0:preferred[col];
                 minimumTotal+=minimum[col]; contentTotal+=preferred[col]; flexTotal+=flex[col];
             }
         }
         if(contentTotal==0) throw new InvalidOperationException("The nonempty library table returned no visible values.");
         int space=bounds.right-3, weighted=0, assigned=0;
+        if(minimumTotal>space) {
+            minimum=heading;
+            minimumTotal=0;
+            foreach(int pixels in heading) minimumTotal+=pixels;
+        }
         bool shrink=contentTotal>space;
         int extra=shrink?Math.Max(0,space-minimumTotal):space-contentTotal;
         int weights=shrink?contentTotal-minimumTotal:(flexTotal==0?contentTotal:flexTotal);
