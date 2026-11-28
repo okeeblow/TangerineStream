@@ -1,0 +1,147 @@
+<xhd>
+  <cpp type="h"><![CDATA[#ifndef __ROOTOBJECTI_IMPL_H
+#define __ROOTOBJECTI_IMPL_H
+
+/*<?<autoheader/>*/
+#include "rootobject.h"
+#include "rootobjectx.h"
+
+class RootObjectCallback;
+class ScriptObject;
+/*?>*/
+
+/*[interface.header.h]
+#include "common/script/rootobjcontroller.h"
+*/
+
+extern RootScriptObjectController *rootScriptObjectController;
+
+]]></cpp>
+  <cpp type="cpp"><![CDATA[#include "precomp.h"
+
+//<?#include "<class data="implementationheader"/>"
+#include "rootobjecti.h"
+//?>
+
+#include "../../bfc/std.h"
+#include "scriptmgr.h"
+#include "../../common/script/scriptobj.h"
+#include "../../bfc/foreach.h"
+
+
+// --------------------------------------------------------------------------------------------
+
+]]></cpp>
+  <class name="RootObject" implementation="RootObjectI" orig_classname="RootObjectI" target_dir="Studio%5CScript" project_folder="APIs%2FScript" interface_module="rootobject.cpp" interface_header="rootobject.h" class_module="rootobjecti.cpp" class_header="rootobjecti.h" dispatchable_module="rootobjectx.cpp" dispatchable_header="rootobjectx.h" dispatchable="1" hcrc="-328977037" cppcrc="-1697728810" Interface_n="4" Interface_0="rootobject.h" Interface_1="rootobject.cpp" Interface_2="rootobjectx.h" Interface_3="rootobjectx.cpp" xhd_factories="Interface" friends="" kw="">
+    <cpp type="class"><![CDATA[
+public:
+]]></cpp>
+    <method name="RootObjectI" scope="0" static="0" inline="0" inlinebody="0" virtual="0" pure="0" scriptable="0" isevent="0">
+      <param name="o" type="ScriptObject%20%2A"/>
+      <cpp type="hcpp"><![CDATA[ ]]></cpp>
+      <cpp type="fcpp"><![CDATA[
+]]></cpp>
+      <cpp type="fh"><![CDATA[
+]]></cpp>
+      <cpp type="cpp"><![CDATA[
+  my_script_object = o;
+]]></cpp>
+    </method>
+    <cpp type="cpp"><![CDATA[
+]]></cpp>
+    <method name="%7ERootObjectI" scope="0" static="0" inline="0" inlinebody="0" virtual="1" pure="0" scriptable="0" isevent="0">
+      <cpp type="hcpp"><![CDATA[ ]]></cpp>
+      <cpp type="fcpp"><![CDATA[
+]]></cpp>
+      <cpp type="fh"><![CDATA[
+]]></cpp>
+      <cpp type="cpp"><![CDATA[
+]]></cpp>
+    </method>
+    <cpp type="cpp"><![CDATA[
+]]></cpp>
+    <method name="rootobject_getClassName" type="const%20char%20%2A" scope="0" static="0" inline="0" inlinebody="0" virtual="1" pure="0" dispatch_id="10" dispatch="1" scriptable="0" isevent="0">
+      <cpp type="hcpp"><![CDATA[ ]]></cpp>
+      <cpp type="fcpp"><![CDATA[
+]]></cpp>
+      <cpp type="fh"><![CDATA[
+]]></cpp>
+      <cpp type="cpp"><![CDATA[
+  if (!my_script_object) return NULL;
+  return my_script_object->vcpu_getClassName();
+]]></cpp>
+    </method>
+    <cpp type="cpp"><![CDATA[
+]]></cpp>
+    <method name="rootobject_notify" type="void" scope="0" static="0" inline="0" inlinebody="0" virtual="1" pure="0" dispatch_id="20" dispatch="1" scriptable="0" isevent="0">
+      <param name="s" type="const%20char%20%2A"/>
+      <param name="t" type="const%20char%20%2A"/>
+      <param name="u" type="int"/>
+      <param name="v" type="int"/>
+      <cpp type="hcpp"><![CDATA[ ]]></cpp>
+      <cpp type="fcpp"><![CDATA[
+]]></cpp>
+      <cpp type="fh"><![CDATA[
+]]></cpp>
+      <cpp type="cpp"><![CDATA[
+  foreach(cbs) 
+    cbs.getfor()->rootobjectcb_onNotify(s, t, u, v);
+  endfor;
+  RootObject_ScriptMethods::onNotify(SCRIPT_CALL, rootobject_getScriptObject(), MAKE_SCRIPT_STRING(s), MAKE_SCRIPT_STRING(t), MAKE_SCRIPT_INT(u), MAKE_SCRIPT_INT(v));
+]]></cpp>
+    </method>
+    <cpp type="cpp"><![CDATA[
+]]></cpp>
+    <method name="rootobject_getScriptObject" type="ScriptObject%20%2A" scope="0" static="0" inline="0" inlinebody="0" virtual="1" pure="0" dispatch_id="30" dispatch="1" scriptable="0" isevent="0">
+      <cpp type="hcpp"><![CDATA[ ]]></cpp>
+      <cpp type="fcpp"><![CDATA[
+]]></cpp>
+      <cpp type="fh"><![CDATA[
+]]></cpp>
+      <cpp type="cpp"><![CDATA[
+  return my_script_object;
+]]></cpp>
+    </method>
+    <cpp type="cpp"><![CDATA[
+]]></cpp>
+    <method name="rootobject_setScriptObject" type="void" scope="0" static="0" inline="0" inlinebody="0" virtual="1" pure="0" dispatch_id="40" dispatch="1" scriptable="0" isevent="0">
+      <param name="obj" type="ScriptObject%20%2A"/>
+      <cpp type="hcpp"><![CDATA[ ]]></cpp>
+      <cpp type="fcpp"><![CDATA[
+]]></cpp>
+      <cpp type="fh"><![CDATA[
+]]></cpp>
+      <cpp type="cpp"><![CDATA[
+  my_script_object = obj;
+]]></cpp>
+    </method>
+    <cpp type="cpp"><![CDATA[
+]]></cpp>
+    <method name="rootobject_addCB" type="void" scope="0" static="0" inline="0" inlinebody="0" virtual="1" pure="0" dispatch_id="50" dispatch="1" scriptable="0" isevent="0">
+      <param name="cb" type="RootObjectCallback%20%2A"/>
+      <cpp type="hcpp"><![CDATA[ ]]></cpp>
+      <cpp type="fcpp"><![CDATA[
+]]></cpp>
+      <cpp type="fh"><![CDATA[
+]]></cpp>
+      <cpp type="cpp"><![CDATA[
+  cbs.addItem(cb);
+]]></cpp>
+    </method>
+    <data  name="cbs" type="PtrList%20%3C%20RootObjectCallback%20%3E" static="0" scope="0">
+    </data>
+    <data  name="my_script_object" type="ScriptObject%20%2A" static="0" scope="0">
+    </data>
+    <cpp type="interface.header.h"><![CDATA[
+#include "common/script/rootobjcontroller.h"
+]]></cpp>
+  </class>
+    <cpp type="class"><![CDATA[
+]]></cpp>
+  <cpp type="h"><![CDATA[
+
+#endif // __ROOTOBJECTI_IMPL_H
+]]></cpp>
+  <cpp type="cpp"><![CDATA[
+]]></cpp>
+</xhd>

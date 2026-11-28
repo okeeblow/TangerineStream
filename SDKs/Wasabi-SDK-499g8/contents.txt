@@ -1,0 +1,120 @@
+
+addons/
+	source to addons.wac, which allows dynamic loading and unloading
+	of scripts and skin mods
+
+bfc/
+	A collection of C++ classes, which Wasabi is based upon.
+
+bfc.dsp
+bfcjnetlib.dsp
+
+cnv_pcmdsound/
+	DirectSound output plugin source.
+
+cnv_pcmwaveout/
+	WAVEOUT output plugin source.
+
+cnv_tonepcm/
+	Tone generator WAC source.
+
+common/
+	BFC source code that has not been filed into the bfc/ dir properly yet.
+
+config/
+	Source code to the Configurification Registry WAC, which allows
+	the user to browse and interact with public config items.
+	See bfc/attribs
+
+contents.txt
+	This file.
+
+docs/
+	Some random docs on Wasabi. Don't expect too much, they're kind of
+	old.
+
+Examples/
+	Example projects for Wasabi.
+
+guiobjects/
+	Source code for guiobjects wac, which implements all the basic
+	Wasabi GUI objects
+
+httpread/
+	Source code for httpread wac, which implements FOPEN("http://...")
+	and also HTTP streaming for the core.
+
+imggen/
+	Source code for imggen wac, which implements all the basic
+	Wasabi image generators ("$solid", "$gradient", etc...)
+
+jnetlib/
+	jnetlib, a simple, portable C++ TCP/IP sockets layer. Used by
+	httpread, urlgrab, and others.
+
+jpgload/
+	Source code for jpgload wac, which implements JPEG image loading.
+
+library/
+	Source code for the Media Library wac.
+
+normal/
+	Source code for normal wac, which uses WavGain to set the preamp
+	setting for each song that plays. Not entirely finished or stable,
+	but basically works.
+
+pledit/
+	Source code for pledit wac, the Winamp3 playlist editor.
+
+pngload/
+	Source code for pngload wac, which implements PNG image loading.
+
+precomp.cpp
+precomp.h
+	Precompiled headers files. precomp.h includes the most common
+	header files. If you want to use precompiled headers, tell msvc
+	to use them "through" precomp.cpp, and make ALL your .cpp files
+	begin with #include <precomp.h>
+
+readme.txt
+sdklicense.txt
+	The license for the SDK. Basically it's the zlib license, which
+	boils down to: open source, ok for commercial use, ok to redistribute,
+	but can't claim false credit for having written it.
+
+sdkwhatsnew.txt
+	A log file with notes explaining changes between SDK releases. Not
+	updated very often.
+
+shoutcast/
+	Source code for shoutcast wac. Does Shoutcasting. Uses the LAME DLL
+	if it's installed, otherwise just uses the .mp3 bits as is.
+
+skinswitch/
+	Source code for skinswitch wac, that pane in the Preferences.
+
+studio/
+	System-y type files go here. Basically files that a wac needs to
+	talk to the Wasabi runtime.
+
+uninst-wsdk.exe
+	SDK uninstaller. You can run it to uninstall the SDK, or you can
+	go into "Add/Remove Programs", or uninstall from the Start menu.
+
+video/
+	Source code for video wac. Implements the GUI control that displays
+	the video code. Can do both DirectDraw and overlay modes.
+
+vnc/
+	Source code for vnc wac, a VNC server for Wasabi. Broken right now.
+
+wa2skin/
+	Source code for wa2skin wac, which loads Winamp 2.x skins.
+
+waclient/
+	A project that all wacs should link to. Linking to this is what
+	makes a plain DLL into a wac.
+
+wasabi/
+	Contains header files that pertain to locating, loading, starting,
+	and stopping, wasabi.dll.

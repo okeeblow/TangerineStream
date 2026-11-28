@@ -1,0 +1,117 @@
+//Microsoft Developer Studio generated resource script.
+//
+#include "resource.h"
+
+#define APSTUDIO_READONLY_SYMBOLS
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 2 resource.
+//
+#include "afxres.h"
+
+/////////////////////////////////////////////////////////////////////////////
+#undef APSTUDIO_READONLY_SYMBOLS
+
+/////////////////////////////////////////////////////////////////////////////
+// Neutral (Default) resources
+
+#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_NEUD)
+#ifdef _WIN32
+LANGUAGE LANG_NEUTRAL, SUBLANG_DEFAULT
+#pragma code_page(1252)
+#endif //_WIN32
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Dialog
+//
+
+IDD_HTTPAUTH DIALOG DISCARDABLE  0, 0, 156, 105
+STYLE DS_SETFOREGROUND | DS_CENTER | WS_POPUP | WS_CAPTION | WS_THICKFRAME
+CAPTION "HTTP login required"
+FONT 8, "MS Sans Serif"
+BEGIN
+    EDITTEXT        IDC_LOGIN,57,38,92,14,ES_AUTOHSCROLL
+    LTEXT           "Enter your login and password for this site.",
+                    IDC_STATIC,7,18,142,17,SS_CENTERIMAGE
+    LTEXT           "Realm: ",IDC_STATIC,7,7,25,8
+    LTEXT           "",IDC_REALM,36,7,113,8
+    RTEXT           "Login:",IDC_STATIC,7,38,41,12,SS_CENTERIMAGE
+    EDITTEXT        IDC_PASS,57,57,92,14,ES_PASSWORD | ES_AUTOHSCROLL
+    RTEXT           "Password:",IDC_STATIC,7,57,41,14,SS_CENTERIMAGE
+    DEFPUSHBUTTON   "OK",IDOK,43,84,50,14
+    PUSHBUTTON      "Cancel",IDCANCEL,99,84,50,14
+END
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// DESIGNINFO
+//
+
+#ifdef APSTUDIO_INVOKED
+GUIDELINES DESIGNINFO DISCARDABLE 
+BEGIN
+    IDD_HTTPAUTH, DIALOG
+    BEGIN
+        LEFTMARGIN, 7
+        RIGHTMARGIN, 149
+        TOPMARGIN, 7
+        BOTTOMMARGIN, 98
+    END
+END
+#endif    // APSTUDIO_INVOKED
+
+#endif    // Neutral (Default) resources
+/////////////////////////////////////////////////////////////////////////////
+
+
+/////////////////////////////////////////////////////////////////////////////
+// French (France) resources
+
+#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_FRA)
+#ifdef _WIN32
+LANGUAGE LANG_FRENCH, SUBLANG_FRENCH
+#pragma code_page(1252)
+#endif //_WIN32
+
+#ifdef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// TEXTINCLUDE
+//
+
+1 TEXTINCLUDE DISCARDABLE 
+BEGIN
+    "resource.h\0"
+END
+
+2 TEXTINCLUDE DISCARDABLE 
+BEGIN
+    "#include ""afxres.h""\r\n"
+    "\0"
+END
+
+3 TEXTINCLUDE DISCARDABLE 
+BEGIN
+    "\r\n"
+    "\0"
+END
+
+#endif    // APSTUDIO_INVOKED
+
+#endif    // French (France) resources
+/////////////////////////////////////////////////////////////////////////////
+
+
+
+#ifndef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 3 resource.
+//
+
+
+/////////////////////////////////////////////////////////////////////////////
+#endif    // not APSTUDIO_INVOKED
+

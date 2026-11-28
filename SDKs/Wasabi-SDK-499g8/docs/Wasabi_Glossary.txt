@@ -1,0 +1,4 @@
+
+WAC: WAsabi Component. Can be compiled into a ".wac" file and loaded dynamically
+or can be statically linked into a project. Also includes any XML or image
+resources loaded by the component.

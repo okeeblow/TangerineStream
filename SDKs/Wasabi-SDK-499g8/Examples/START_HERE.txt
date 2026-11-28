@@ -1,0 +1,65 @@
+All of the Example Projects are in ExampleStudio.dsw and fully use the bfc and waclient projects, now.
+
+In order to use any of the example projects on their own, place it, bfc.dsp, and waclient.dsp into a new "myproject.dsw" and you should be able to compile.  Remember to make your project settings link you against the "Multithreaded-DLL" runtime libraries, otherwise you'll go through linker hell.
+
+If you know how to clone projects in VC, we wholeheartedly endorse that behaviour until we get a wizard thing built to help you make wasabi projectfiles (someday, but don't hold your breath).
+
+
+EXAMPLE EXECUTABLE
+------------------
+
+The latest SDKs provide you the ability to create your own wasabi executable, so if you want to make your own Wasabi program (instead of "just" winamp3 components), you're able to.  
+
+To make your own executable WACloader, simply add the three modules in $/studio/wasabi to a standard "Win32 Application" project, and change the settings to link through the "Multithreaded" runtime library.  If you look at $/studio/wasabi/winmain.cpp you'll see it's honestly and truly the Winamp3 winmain.  You'll want to make your own version of that module.
+
+To help you in this process, ExampleStudio.dsp has been altered to build Example.exe into the $/studio/studio folder, based off of $/studio/Examples/ExampleStudio.winmain.cpp 
+
+This currently requires you to install a version of Winamp3 build #491 or greater.  If you do not do this and try to run the executable, you'll get the following error messagebox:
+
+---------------------------
+OS error while loading Wasabi
+---------------------------
+The filename or extension is too long.
+---------------------------
+
+You should also copy common.dll from your winamp install (with the same build number!) to your SDK install.  We currently omit this file for download size issues, we hope for this to be only a temporary requirement.
+
+If you get an assertion in std.cpp on startup, this is a known bug currently within the config system.  Try copying studio.xnf over to your program folder and this may fix the problem.
+
+We're still putting it all together (including the formal documentation), but we thought you would like a peek at it.
+
+
+
+EXAMPLE PROJECTS
+----------------
+
+Example1             - How to setup a component object to hold all your other objects.
+ExampleAttrib        - How to use attributes to save data between winamp sessions.
+ExampleCanvas        - How to use the lowest level drawing & blitting routines.
+ExampleCodeGui       - Advanced project to use GUI objs created and setup in code.
+                 (ExampleFreeFormWac is the "better" way to do it through XML)
+ExampleCoreCallback  - How to get told what the system is doing.
+ExampleExternElement - How to use external graphic elements with an XML GUI.
+ExampleFreeFormWac   - How to setup a GUI for your WAC with XML.
+ExampleHTTPXML       - Advanced project to download an XML file and parse it.
+ExampleItemSequencer - Advanced project to play media files in an HTML page.
+ExampleMetaData      - How to add your own metadata fields to play items.
+ExampleMW            - Advanced project for making and using custom windows.
+ExamplePaintCB       - How to get callbacks when the system is painting your content.
+ExamplePl            - How to get some info about the current playstring.
+ExamplePopup         - How to make a popup menu appear and be handled.
+ExamplePrefsGroup    - How to add an XML group to the Preferences dialog.
+ExampleScriptObject  - How to expose custom functionality from C++ into MAKI.
+ExampleVidSource     - How to create a core video source & display in the Video wnd.
+ExampleVisData       - How to get and interpret visualization data from the core.
+
+
+
+TEMPLATE PROJECTS
+-----------------
+
+GenericWACTemplate   - Clone this project for a component (example1 w/ no comments).
+xuiobject_template   - Clone this project to easily expose your own objects to XML.
+
+
+

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+
+<WinampAbstractionLayer version="0.6">
+
+  <groupdef id="ehb.main.window" register_autopopup="1" name="ExampleHButton">
+
+    <Wasabi:button id="TheIDOfTheButtonWeWannaHook" x="5" y="5" w="-10" h="-10"	relatw="1" relath="1"/>
+
+  </groupdef>
+
+
+</WinampAbstractionLayer>

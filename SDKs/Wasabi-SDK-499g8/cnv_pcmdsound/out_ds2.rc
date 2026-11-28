@@ -1,0 +1,167 @@
+//Microsoft Developer Studio generated resource script.
+//
+#include "resource.h"
+
+#define APSTUDIO_READONLY_SYMBOLS
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 2 resource.
+//
+#include "afxres.h"
+
+/////////////////////////////////////////////////////////////////////////////
+#undef APSTUDIO_READONLY_SYMBOLS
+
+/////////////////////////////////////////////////////////////////////////////
+// English (U.S.) resources
+
+#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_ENU)
+#ifdef _WIN32
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+#pragma code_page(1252)
+#endif //_WIN32
+
+#ifdef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// TEXTINCLUDE
+//
+
+1 TEXTINCLUDE DISCARDABLE 
+BEGIN
+    "resource.h\0"
+END
+
+2 TEXTINCLUDE DISCARDABLE 
+BEGIN
+    "#include ""afxres.h""\r\n"
+    "\0"
+END
+
+3 TEXTINCLUDE DISCARDABLE 
+BEGIN
+    "\r\n"
+    "\0"
+END
+
+#endif    // APSTUDIO_INVOKED
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Dialog
+//
+
+IDD_CONFIG DIALOG DISCARDABLE  0, 0, 246, 266
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "DirectSound output settings"
+FONT 8, "MS Sans Serif"
+BEGIN
+    DEFPUSHBUTTON   "OK",IDOK,174,230,32,14
+    PUSHBUTTON      "Cancel",IDCANCEL,210,230,32,14
+    PUSHBUTTON      "Help",IDC_RTFM,210,248,32,14
+    LTEXT           "Device:",IDC_STATIC,16,8,26,8
+    COMBOBOX        IDC_DEVICE,44,6,172,66,CBS_DROPDOWNLIST | WS_VSCROLL | 
+                    WS_TABSTOP
+    PUSHBUTTON      "info...",IDC_INFO,216,6,24,12
+    GROUPBOX        "Fading",IDC_STATIC,4,24,238,76
+    LTEXT           "Default fade length:",IDC_STATIC,14,40,63,8
+    EDITTEXT        IDC_FADE,80,38,48,12,ES_AUTOHSCROLL | ES_NUMBER
+    CONTROL         "Spin1",IDC_SPIN3,"msctls_updown32",UDS_SETBUDDYINT | 
+                    UDS_ALIGNRIGHT | UDS_AUTOBUDDY | UDS_ARROWKEYS | 
+                    UDS_NOTHOUSANDS,120,38,11,14
+    LTEXT           "ms",IDC_STATIC,130,40,10,8
+    CONTROL         "Old-style fade on pause (buggy)",IDC_PAUSEFADE2,"Button",
+                    BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP,18,56,88,17
+    CONTROL         "Full fadeout when exiting Winamp",IDC_WAITx,"Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP,18,80,122,10
+    LISTBOX         IDC_LIST,146,38,88,54,LBS_NOINTEGRALHEIGHT | WS_VSCROLL | 
+                    WS_TABSTOP
+    GROUPBOX        "Buffering",IDC_STATIC,4,102,238,90
+    LTEXT           "Buffer length:",IDC_STATIC,51,112,43,8
+    CONTROL         "Slider1",IDC_BUFFER,"msctls_trackbar32",TBS_BOTH | 
+                    TBS_NOTICKS | WS_TABSTOP,98,112,138,11
+    CTEXT           "z",IDC_BUF_DISP,102,123,130,8
+    LTEXT           "Prebuffer:",IDC_STATIC,62,134,32,8
+    CONTROL         "Slider1",IDC_PREBUFFER_1,"msctls_trackbar32",TBS_BOTH | 
+                    TBS_NOTICKS | WS_TABSTOP,98,134,138,11
+    CTEXT           "z",IDC_PREBUF_DISP_1,102,145,130,8
+    LTEXT           "Gapless transition check:",IDC_STATIC,16,156,80,8
+    CONTROL         "Slider1",IDC_PREBUFFER_2,"msctls_trackbar32",TBS_BOTH | 
+                    TBS_NOTICKS | WS_TABSTOP,98,156,138,11
+    CTEXT           "z",IDC_PREBUF_DISP_2,102,167,130,8
+    CONTROL         "Create primary buffer",IDC_CREATE_PRIMARY,"Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP,12,176,80,10
+    PUSHBUTTON      "Reset to default values",IDC_BUF_RESET,158,180,81,10
+    CONTROL         "Enable volume control",IDC_VOLUME,"Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP,4,198,86,10
+    CONTROL         "Auto-remove silence at beginning / end of track",
+                    IDC_KILLSIL,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,4,214,
+                    166,10
+    LTEXT           "cutoff:",IDC_STATIC,8,224,21,8
+    CONTROL         "Slider1",IDC_DB,"msctls_trackbar32",TBS_BOTH | 
+                    TBS_NOTICKS | WS_TABSTOP,4,233,164,12
+    CTEXT           "",IDC_DB_DISPLAY,8,244,156,8
+    LTEXT           "Note: most of settings take effect after restarting playback",
+                    IDC_STATIC,4,252,182,8
+END
+
+IDD_FADE DIALOG DISCARDABLE  0, 0, 156, 53
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+FONT 8, "MS Sans Serif"
+BEGIN
+    DEFPUSHBUTTON   "OK",IDOK,84,34,30,14
+    PUSHBUTTON      "Cancel",IDCANCEL,120,34,30,14
+    CONTROL         "Enabled",IDC_ENABLED,"Button",BS_AUTOCHECKBOX | 
+                    WS_TABSTOP,8,4,42,10
+    CONTROL         "Use custom fade time:",IDC_FADETIME,"Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP,8,17,84,10
+    EDITTEXT        IDC_TIME,96,16,40,12,ES_AUTOHSCROLL
+    CONTROL         "Spin1",IDC_SPIN1,"msctls_updown32",UDS_SETBUDDYINT | 
+                    UDS_ALIGNRIGHT | UDS_AUTOBUDDY | UDS_ARROWKEYS | 
+                    UDS_NOTHOUSANDS,124,4,11,14
+    LTEXT           "ms",IDC_STATIC_MS,138,18,10,8
+END
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// DESIGNINFO
+//
+
+#ifdef APSTUDIO_INVOKED
+GUIDELINES DESIGNINFO DISCARDABLE 
+BEGIN
+    IDD_CONFIG, DIALOG
+    BEGIN
+        LEFTMARGIN, 7
+        RIGHTMARGIN, 239
+        TOPMARGIN, 7
+        BOTTOMMARGIN, 259
+    END
+
+    IDD_FADE, DIALOG
+    BEGIN
+        LEFTMARGIN, 7
+        RIGHTMARGIN, 149
+        TOPMARGIN, 7
+        BOTTOMMARGIN, 46
+    END
+END
+#endif    // APSTUDIO_INVOKED
+
+#endif    // English (U.S.) resources
+/////////////////////////////////////////////////////////////////////////////
+
+
+
+#ifndef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 3 resource.
+//
+
+
+/////////////////////////////////////////////////////////////////////////////
+#endif    // not APSTUDIO_INVOKED
+

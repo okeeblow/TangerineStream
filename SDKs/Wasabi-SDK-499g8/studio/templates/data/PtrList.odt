@@ -1,0 +1,119 @@
+<Ode:DataServerTemplate>
+ <module id="decl">
+
+    <!-- there will be only one param, our list template class/type -->
+
+    <foreach objects="templateparam"> 
+
+    <!-- if template param is a template, expose only the list -->
+
+    <if object="templateparam" isoftype="template">
+
+      //--------------------------------------------------------<br/>
+      // Accessor for <data data="type"/><data data="name"/>%20(member pointer list)<br/>
+      //--------------------------------------------------------<br/>
+      <helperdatamethods>
+        virtual <data data="type"/> *get<data data="name" uclead="1" delprefix="m_" delsuffix="s"/>List();<br/>
+      </helperdatamethods>
+
+      <else>
+
+        <!-- otherwise expose the list accessors -->
+
+        //--------------------------------------------------------<br/>
+        // Accessors for <data data="type"/><data data="name"/>%20(member pointer list)<br/>
+        //--------------------------------------------------------<br/>
+        <helperdatamethods>
+          virtual int getNum<data data="name" uclead="1" delprefix="m_" enforcesuffix="s"/>(); // Returns the number of items in <data data="name"/><br/>
+          virtual <templateparam data="type"/> *enum<data data="name" uclead="1" delprefix="m_" delsuffix="s"/>(int itemIdx); // Enumerates the items in <data data="name"/><br/>
+          virtual <templateparam data="type"/> *add<data data="name" uclead="1" delprefix="m_" delsuffix="s"/>(<templateparam data="type"/> *_<data data="name" delprefix="m_" delsuffix="s"/>, int insertPos = -1); // Adds an item to <data data="name"/><br/>
+          virtual <templateparam data="type"/> *remove<data data="name" uclead="1" delprefix="m_" delsuffix="s"/>(<templateparam data="type"/> *_<data data="name" delprefix="m_" delsuffix="s"/>); // Removes an item from <data data="name"/><br/>
+          virtual int search<data data="name" uclead="1" delprefix="m_" delsuffix="s"/>(<templateparam data="type"/> *_<data data="name" delprefix="m_" delsuffix="s"/>); // Returns the position of the item in <data data="name"/> or -1 if not found. (linear search)<br/>
+        </helperdatamethods>
+
+      </else>
+
+    </if>
+
+  </foreach>
+
+ </module>
+
+ <module id="impl">
+
+    <!-- there will be only one param, our list template class/type -->
+
+    <foreach objects="templateparam"> 
+
+    <!-- if template param is a template, expose only the list -->
+
+    <if object="templateparam" isoftype="template">
+
+      //--------------------------------------------------------<br/>
+      // Accessor for <data data="type"/><data data="name"/>%20(member template list)<br/>
+      //--------------------------------------------------------<br/>
+      <data data="type"/> *<class data="classlayer"/>::get<data data="name" uclead="1" delprefix="m_" delsuffix="s"/>List()<ob/><br/>
+       <indent>
+         return %26CASTTHIS-><data data="name"/>;<br/>
+       </indent>
+       <cb/><br/>
+
+      <else>
+
+        <!-- otherwise expose the list accessors -->
+
+        //--------------------------------------------------------<br/>
+        // Accessors for <data data="type"/><data data="name"/>%20(member pointer list)<br/>
+        //--------------------------------------------------------<br/>
+        <br/>
+
+        // Returns the number of items in <data data="name"/><br/>
+        int <class data="classlayer"/>::getNum<data data="name" uclead="1" delprefix="m_" enforcesuffix="s"/>()<ob/><br/>
+        <indent>
+          return CASTTHIS-><data data="name"/>.getNumItems();<br/>
+        </indent>
+        <cb/><br/>
+        <br/>
+
+        // Enumerates the items in <data data="name"/><br/>
+        <templateparam data="type"/> *<class data="classlayer"/>::enum<data data="name" uclead="1" delprefix="m_" delsuffix="s"/>(int itemIdx)<ob/><br/>
+        <indent>
+          return CASTTHIS-><data data="name"/>.enumItem(itemIdx);<br/>
+        </indent>
+        <cb/><br/>
+        <br/>
+
+        // Adds an item to <data data="name"/><br/>
+        <templateparam data="type"/> *<class data="classlayer"/>::add<data data="name" uclead="1" delprefix="m_" delsuffix="s"/>(<templateparam data="type"/> *_<data data="name" delprefix="m_" delsuffix="s"/>, int insertPos)<ob/><br/>
+        <indent>
+          return CASTTHIS-><data data="name"/>.addItem(_<data data="name" delprefix="m_" delsuffix="s"/>, insertPos = -1);<br/>
+        </indent>
+        <cb/><br/>
+        <br/>
+
+        // Removes an item from <data data="name"/><br/>
+        <templateparam data="type"/> *<class data="classlayer"/>::remove<data data="name" uclead="1" delprefix="m_" delsuffix="s"/>(<templateparam data="type"/> *_<data data="name" delprefix="m_" delsuffix="s"/>)<ob/><br/>
+        <indent>
+          CASTTHIS-><data data="name"/>.removeItem(_<data data="name" delprefix="m_" delsuffix="s"/>);<br/>
+          return _<data data="name" delprefix="m_" delsuffix="s"/>;<br/>
+        </indent>
+        <cb/><br/>
+        <br/>
+
+        // Returns the position of the item in <data data="name"/> or -1 if not found. (linear search)<br/>
+        int <class data="classlayer"/>::search<data data="name" uclead="1" delprefix="m_" delsuffix="s"/>(<templateparam data="type"/> *_<data data="name" delprefix="m_" delsuffix="s"/>)<ob/><br/>
+        <indent>
+          return CASTTHIS-><data data="name"/>.searchItem(_<data data="name" delprefix="m_" delsuffix="s"/>);<br/>
+        </indent>
+        <cb/><br/>
+
+      </else>
+
+    </if>
+
+  </foreach>
+
+
+ </module>
+
+</Ode:DataServerTemplate>

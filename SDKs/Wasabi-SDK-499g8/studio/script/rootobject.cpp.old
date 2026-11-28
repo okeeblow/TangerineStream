@@ -1,0 +1,113 @@
+#include "precomp.h"
+#include "../../bfc/std.h"
+#include "scriptmgr.h"
+#include "../../common/script/scriptobj.h"
+#include "../../bfc/foreach.h"
+#include "rootobject.h"
+
+#define CBCLASS RootObjectI
+START_DISPATCH;
+  CB(ROOT_GETCLASSNAME,     rootobject_getClassName);
+  CB(ROOT_GETSCRIPTOBJECT,  rootobject_getScriptObject);
+  VCB(ROOT_ADDCB,           rootobject_addCB);
+  VCB(ROOT_SCRIPTNOTIFY,    rootobject_notify);
+END_DISPATCH;
+
+
+// --------------------------------------------------------------------------------------------
+ScriptObject *RootObjectI::rootobject_getScriptObject() {
+  return my_script_object;
+}
+
+const char *RootObjectI::rootobject_getClassName() {
+  if (!my_script_object) return NULL;
+  return my_script_object->vcpu_getClassName();
+}
+
+void RootObjectI::rootobject_notify(const char *s, const char *t, int u, int v) {
+  foreach(cbs) 
+    cbs.getfor()->rootobjectcb_onNotify(s, t, u, v);
+  endfor;
+  RootObject_ScriptMethods::onNotify(SCRIPT_CALL, rootobject_getScriptObject(), MAKE_SCRIPT_STRING(s), MAKE_SCRIPT_STRING(t), MAKE_SCRIPT_INT(u), MAKE_SCRIPT_INT(v));
+}
+
+void RootObjectI::rootobject_addCB(RootObjectCallback *cb) {
+  cbs.addItem(cb);
+}
+
+// -------------------------------------------------------------------------------------------------------------------------------------
+// Script Methods and Events for RootObject (Object)
+// -------------------------------------------------------------------------------------------------------------------------------------
+
+scriptVar RootObject_ScriptMethods::getClassName(SCRIPT_FUNCTION_PARAMS, ScriptObject *o) {
+  SCRIPT_FUNCTION_INIT; 
+  return MAKE_SCRIPT_STRING(o->vcpu_getClassName());
+} 
+
+scriptVar RootObject_ScriptMethods::onNotify(SCRIPT_FUNCTION_PARAMS, ScriptObject *o, scriptVar s, scriptVar s2, scriptVar i1, scriptVar i2) {
+  SCRIPT_FUNCTION_INIT
+  PROCESS_HOOKS4(o, rootScriptObjectController, s, s2, i1, i2);
+  SCRIPT_FUNCTION_CHECKABORTEVENT;
+  SCRIPT_EXEC_EVENT4(o, s, s2, i1, i2);
+}
+
+scriptVar RootObject_ScriptMethods::notify(SCRIPT_FUNCTION_PARAMS, ScriptObject *o, scriptVar s, scriptVar s2, scriptVar i1, scriptVar i2) {
+  SCRIPT_FUNCTION_INIT
+  RootObject *ro = static_cast<RootObject*>(o->vcpu_getInterface(rootObjectGuid));
+  if (ro) ro->rootobject_notify(GET_SCRIPT_STRING(s), GET_SCRIPT_STRING(s2), GET_SCRIPT_INT(i1), GET_SCRIPT_INT(i2));
+  RETURN_SCRIPT_VOID;
+}
+
+// -------------------------------------------------------------------------------------------------------------------------------------
+
+RootScriptObjectController _rootScriptObjectController;
+RootScriptObjectController *rootScriptObjectController = &_rootScriptObjectController;
+
+// -- Functions table -------------------------------------
+function_descriptor_struct RootScriptObjectController::exportedFunction[] = {
+  {"getClassName",  0, RootObject_ScriptMethods::getClassName },
+  {"notify",        4, RootObject_ScriptMethods::notify },
+  {"onNotify",      4, RootObject_ScriptMethods::onNotify },
+};
+
+
+const char *RootScriptObjectController::getClassName() {
+  return "Object";
+}
+
+ScriptObject *RootScriptObjectController::instantiate() {
+  RootObjectInstance *o = new RootObjectInstance;
+  ASSERT(o != NULL);
+  return o->getScriptObject();
+}
+
+void *RootScriptObjectController::encapsulate(ScriptObject *o) {
+  return new RootObjectI(o);
+}
+
+void RootScriptObjectController::destroy(ScriptObject *o) {
+  RootObjectInstance *obj = static_cast<RootObjectInstance *>(o->vcpu_getInterface(rootObjectGuid)); 
+  ASSERT(obj != NULL);
+  delete obj;
+}
+
+void RootScriptObjectController::deencapsulate(void *o) {
+  RootObjectI *obj = static_cast<RootObjectI *>(o); 
+  delete obj;
+}
+
+const char *RootScriptObjectController::getAncestorClassName() {
+  return NULL;
+}
+
+int RootScriptObjectController::getNumFunctions() {
+  return sizeof(exportedFunction) / sizeof(function_descriptor_struct); 
+}
+
+const function_descriptor_struct *RootScriptObjectController::getExportedFunctions() {
+  return exportedFunction;
+}
+
+GUID RootScriptObjectController::getClassGuid() {
+  return rootObjectGuid;
+}
