@@ -30,13 +30,13 @@ CREATE TABLE IF NOT EXISTS tracks (
     retry_at INTEGER NOT NULL DEFAULT 0,
     UNIQUE (server, remote_id)
 );
-CREATE TABLE IF NOT EXISTS reports (
+CREATE TABLE IF NOT EXISTS pending_listens (
     key INTEGER PRIMARY KEY,
     server INTEGER NOT NULL REFERENCES servers(id),
     remote_id TEXT NOT NULL,
-    time INTEGER NOT NULL
+    listened_at_ms INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS reports_server ON reports(server, key);
+CREATE INDEX IF NOT EXISTS pending_listens_submission_order ON pending_listens(server, key);
 
 ALTER TABLE tracks ADD COLUMN cover_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE tracks ADD COLUMN album_id TEXT NOT NULL DEFAULT '';

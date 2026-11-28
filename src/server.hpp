@@ -76,7 +76,7 @@ public:
     virtual BrowsePage favorites(const std::atomic_bool& stopping) = 0;
     virtual AudioStream stream(const Track& track, const StreamQuality& quality,
                                const InputExtensions& inputs, unsigned excluded = 0) = 0;
-    virtual void submit(const std::vector<Report>& reports) = 0;
+    virtual void submitListens(const std::vector<PendingListen>& listens) = 0;
 };
 
 std::string normalizeUrl(std::string url);

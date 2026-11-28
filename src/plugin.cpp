@@ -185,11 +185,11 @@ struct Playing {
     std::int64_t listened = 0;
     std::int64_t started = 0;
     Clock::time_point sampled;
-    bool reported = false;
+    bool listenQueued = false;
 };
 
 struct ServiceStatus {
-    std::string reports, favorites, downloads, playback;
+    std::string listenSubmissionError, favorites, downloads, playback;
 };
 
 enum class AlbumAction { play, enqueue, drop };
@@ -210,7 +210,7 @@ public:
             refreshInputs();
             browser = std::thread([this] { browse(); });
             maintenance = std::thread([this] { maintain(); });
-            reporter = std::thread([this] { report(); });
+            listenWorker = std::thread([this] { submitPendingListens(); });
         } catch (...) {
             stop();
             throw;
@@ -270,16 +270,16 @@ public:
             std::scoped_lock lock(maintenanceMutex);
             pendingMaintenance = true;
             refreshFavorites |= refresh;
-            refreshReports |= refresh;
+            retryListens |= refresh;
         }
         maintenanceReady.notify_one();
-        if (refresh) reportsReady.notify_one();
+        if (refresh) listenQueueReady.notify_one();
     }
     std::string maintenanceError(Id server) {
         std::scoped_lock lock(maintenanceMutex);
         const auto& status = serviceStatus[server];
         if (!status.playback.empty()) return status.playback;
-        if (!status.reports.empty()) return status.reports;
+        if (!status.listenSubmissionError.empty()) return status.listenSubmissionError;
         if (!status.favorites.empty()) return status.favorites;
         return status.downloads;
     }
@@ -337,14 +337,14 @@ public:
     std::vector<std::pair<Id, std::string>> serverBranches;
     const UINT navigationChanged = RegisterWindowMessageW(L"ml_tangerinestream.navigationChanged");
     bool attached = false;
-    std::string reportError;
+    std::string playbackTrackingError;
 
 private:
     std::deque<AlbumJob> albumJobs;
     std::atomic_bool stopping{false};
-    std::thread browser, maintenance, reporter;
+    std::thread browser, maintenance, listenWorker;
     std::mutex searchMutex, maintenanceMutex;
-    std::condition_variable searchReady, maintenanceReady, reportsReady;
+    std::condition_variable searchReady, maintenanceReady, listenQueueReady;
     std::uint64_t serial = 0;
     std::uint64_t detailsSerial = 0;
     HWND detailsView = nullptr;
@@ -353,7 +353,7 @@ private:
     void clearDetails() { ++detailsSerial; detailsView = nullptr; detailsTask = {}; details.reset(); }
     std::optional<Search> request;
     std::optional<SearchResult> result;
-    bool pendingMaintenance = false, refreshFavorites = false, refreshReports = false;
+    bool pendingMaintenance = false, refreshFavorites = false, retryListens = false;
     std::map<Id, ServiceStatus> serviceStatus;
     InputExtensions extensions;
     std::mutex sidecarMutex;
@@ -362,12 +362,12 @@ private:
     std::filesystem::path lyricsFile;
     Playing playing;
     bool sampling = false;
-    std::deque<std::pair<Track, std::int64_t>> unwrittenReports;
+    std::deque<std::pair<Track, std::int64_t>> unsavedListens;
 
     void browse();
     void maintain();
-    void report();
-    void flushReports();
+    void submitPendingListens();
+    void saveNewListens();
     void stop() {
         {
             std::scoped_lock lock(searchMutex, maintenanceMutex);
@@ -375,10 +375,10 @@ private:
         }
         searchReady.notify_all();
         maintenanceReady.notify_all();
-        reportsReady.notify_all();
+        listenQueueReady.notify_all();
         if (browser.joinable()) browser.join();
         if (maintenance.joinable()) maintenance.join();
-        if (reporter.joinable()) reporter.join();
+        if (listenWorker.joinable()) listenWorker.join();
     }
 };
 
@@ -730,16 +730,16 @@ void App::maintain() {
     }
 }
 
-void App::report() {
+void App::submitPendingListens() {
     using namespace std::chrono;
     std::map<Id, Clock::time_point> retryAfter;
     for (;;) {
         {
             std::unique_lock lock(maintenanceMutex);
-            reportsReady.wait_for(lock, seconds(15), [this] { return stopping || refreshReports; });
+            listenQueueReady.wait_for(lock, seconds(15), [this] { return stopping || retryListens; });
             if (stopping) return;
-            if (refreshReports) retryAfter.clear();
-            refreshReports = false;
+            if (retryListens) retryAfter.clear();
+            retryListens = false;
         }
         std::vector<Server> profiles;
         try { profiles = store.servers(); } catch (...) {}
@@ -750,35 +750,35 @@ void App::report() {
             std::string failure;
             try {
                 std::unique_ptr<ServerApi> api;
-                // Bound each round so one backlog cannot monopolize reporting.
+                // Give each server a turn even when another has a large backlog.
                 for (int i = 0; i < 4 && !stopping; ++i) {
                     if (!store.networkAvailable(profile.id)) break;
-                    auto batch = store.reports(profile.id);
+                    auto batch = store.nextListenBatch(profile.id);
                     if (batch.empty()) break;
                     if (!api) api = http.connect(store.server(profile.id));
-                    api->submit(batch);
-                    store.acknowledge(batch);
+                    api->submitListens(batch);
+                    store.acknowledgeListens(batch);
                 }
             } catch (const std::exception& error) {
                 if (dynamic_cast<const ConnectionError*>(&error)) store.connectionFailed(profile.id);
-                failure = std::string("Report delivery: ") + error.what();
+                failure = std::string("Could not submit listens: ") + error.what();
                 retryAfter[profile.id] = Clock::now() + seconds(30);
             }
             std::scoped_lock lock(maintenanceMutex);
-            serviceStatus[profile.id].reports = std::move(failure);
+            serviceStatus[profile.id].listenSubmissionError = std::move(failure);
         }
     }
 }
 
-void App::flushReports() {
-    while (!unwrittenReports.empty()) {
+void App::saveNewListens() {
+    while (!unsavedListens.empty()) {
         try {
-            const auto& [track, time] = unwrittenReports.front();
-            store.enqueueReport(track, time);
-            unwrittenReports.pop_front();
-            reportError.clear();
+            const auto& [track, listenedAtMs] = unsavedListens.front();
+            store.enqueueListen(track, listenedAtMs);
+            unsavedListens.pop_front();
+            playbackTrackingError.clear();
         } catch (const std::exception& error) {
-            reportError = error.what();
+            playbackTrackingError = error.what();
             return;
         }
     }
@@ -788,7 +788,7 @@ void App::sample(Id startedKey) {
     if (sampling) return;
     struct Reset { bool& flag; ~Reset() { flag = false; } } reset{sampling};
     sampling = true;
-    flushReports();
+    saveNewListens();
     const auto state = static_cast<int>(player(IPC_ISPLAYING));
     const auto index = static_cast<int>(player(IPC_GETLISTPOS));
     const auto output = static_cast<int>(player(IPC_GETOUTPUTTIME));
@@ -821,10 +821,10 @@ void App::sample(Id startedKey) {
     constexpr std::int64_t fourMinutes = 240'000;
     auto threshold = playing.track.duration > 0 ?
         std::min(fourMinutes, std::int64_t(playing.track.duration) * 500) : fourMinutes;
-    if (playing.track.key && !playing.reported && playing.listened >= threshold) {
-        unwrittenReports.emplace_back(playing.track, playing.started);
-        playing.reported = true;
-        flushReports();
+    if (playing.track.key && !playing.listenQueued && playing.listened >= threshold) {
+        unsavedListens.emplace_back(playing.track, playing.started);
+        playing.listenQueued = true;
+        saveNewListens();
     }
 }
 
@@ -944,7 +944,7 @@ LRESULT CALLBACK playerProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, D
             }
             auto key = msg == WM_WA_IPC ? app->playback.key(reinterpret_cast<const wchar_t*>(w)) : 0;
             app->sample(key);
-        } catch (const std::exception& error) { app->reportError = error.what(); }
+        } catch (const std::exception& error) { app->playbackTrackingError = error.what(); }
     }
     return DefSubclassProc(hwnd, msg, w, l);
 }
@@ -981,7 +981,7 @@ struct Settings {
             reinterpret_cast<LPARAM>(keep ? L"Leave blank to keep saved password" : L""));
         const bool replacing = selected < profiles.size() && profiles[selected].id && !keep;
         const wchar_t* note = L"";
-        if (replacing || !removed.empty()) note = L"Cached music and pending scrobbles stay with their account.";
+        if (replacing || !removed.empty()) note = L"Cached music and pending listens stay with their account.";
         else if (profiles.empty()) note = L"Choose Add server to connect a library.";
         SetDlgItemTextW(hwnd, IDC_ACCOUNT_NOTE, note);
     }
@@ -2424,15 +2424,15 @@ void View::updateStatus() {
         status = loaded ? L"Loading... " + std::to_wstring(loaded) : L"Loading...";
     }
     else if (!message.empty()) status = wide(message);
-    else if (!app->reportError.empty()) status = wide(app->reportError);
+    else if (!app->playbackTrackingError.empty()) status = wide(app->playbackTrackingError);
     else {
         if (rowCount() == 0) status = showTracks() ? L"No tracks" : L"No results";
         else status = selectionSummary;
         if (loading) status += L"  |  Loading more...";
         const bool offline = app->store.offlineMode();
-        std::int64_t reports = 0;
+        std::int64_t pendingListens = 0;
         for (const auto& source : sources) {
-            reports += app->store.reportCount(source.server);
+            pendingListens += app->store.pendingListenCount(source.server);
             auto error = source.error.empty() ? app->maintenanceError(source.server) : source.error;
             if (error.empty() && !offline && source.cached && location.kind != BrowseKind::offline &&
                 !localLocation(location)) error = "Server offline";
@@ -2444,7 +2444,8 @@ void View::updateStatus() {
                 status += wide(error);
             }
         }
-        if (reports) status += L"  |  " + std::to_wstring(reports) + L" play reports queued";
+        if (pendingListens) status += L"  |  " + std::to_wstring(pendingListens) +
+            (pendingListens == 1 ? L" listen pending" : L" listens pending");
     }
     if (server && app->store.offlineMode()) status = L"Offline  |  " + status;
     if (!history.empty()) status += L"  |  " + wide(location.title);

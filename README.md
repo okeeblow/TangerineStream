@@ -30,4 +30,4 @@ Open **≡** at the right of the search bar, or press **F2** to edit the current
 
 Select tracks and choose **Cache → Keep offline**, or enable **Automatically keep server favorites offline** in Configure. Pinned tracks and downloaded favorites use space outside the shared rolling cache, which defaults to 1 GiB.
 
-Choose **≡ → Work offline** to browse what you’ve already visited. Downloaded tracks play offline, and Tangerine Stream saves your scrobbles across restarts until it can send them to the server.
+Choose **≡ → Work offline** to browse what you’ve already visited. Downloaded tracks play offline. Tangerine Stream saves your listens across restarts and submits them when your server is reachable.

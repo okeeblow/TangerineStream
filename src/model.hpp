@@ -104,10 +104,10 @@ inline bool trackView(BrowseKind kind) {
         kind == BrowseKind::song;
 }
 
-struct Report {
-    Id key;
-    std::string id;
-    std::int64_t time;
+struct PendingListen {
+    Id queueKey;
+    std::string remoteTrackId;
+    std::int64_t listenedAtMs;
 };
 
 class Error : public std::runtime_error {

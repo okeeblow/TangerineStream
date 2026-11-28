@@ -113,6 +113,14 @@ void migrate(sqlite3* db) {
     if (schema < 0 || schema > latest)
         throw Error("Unsupported library database version " + std::to_string(schema) +
                     ". This plug-in supports versions 0 through " + std::to_string(latest) + ".");
+    // Submit listens queued by earlier releases using their original playback times.
+    if (schema <= 8 && sqlite3_table_column_metadata(db, "main", "reports", "key",
+            nullptr, nullptr, nullptr, nullptr, nullptr) == SQLITE_OK) {
+        Statement(db, "ALTER TABLE reports RENAME TO pending_listens").run();
+        Statement(db, "ALTER TABLE pending_listens RENAME COLUMN time TO listened_at_ms").run();
+        Statement(db, "DROP INDEX IF EXISTS reports_server").run();
+        Statement(db, "CREATE INDEX pending_listens_submission_order ON pending_listens(server, key)").run();
+    }
     // Keep covers already cached by preview builds that used the original column names.
     if (schema >= 6 && schema <= 8) {
         auto renameArtworkColumn = [db](const char* previous, const char* current) {
@@ -1071,19 +1079,19 @@ void Store::trim() {
     trimUnlocked(0);
 }
 
-void Store::enqueueReport(const Track& track, std::int64_t time) {
+void Store::enqueueListen(const Track& track, std::int64_t listenedAtMs) {
     std::scoped_lock lock(mutex_);
     if (configured_.count(track.server))
-        prepare("INSERT INTO reports(server,remote_id,time) VALUES(?,?,?)")
-            .bind(track.server).bind(track.id).bind(time).run();
+        prepare("INSERT INTO pending_listens(server,remote_id,listened_at_ms) VALUES(?,?,?)")
+            .bind(track.server).bind(track.id).bind(listenedAtMs).run();
 }
 
-std::vector<Report> Store::reports(Id server) {
+std::vector<PendingListen> Store::nextListenBatch(Id server) {
     std::scoped_lock lock(mutex_);
     if (!configured_.count(server)) return {};
-    auto statement = prepare("SELECT key,remote_id,time FROM reports WHERE server=? ORDER BY key LIMIT 25");
+    auto statement = prepare("SELECT key,remote_id,listened_at_ms FROM pending_listens WHERE server=? ORDER BY key LIMIT 25");
     statement.bind(server);
-    std::vector<Report> result;
+    std::vector<PendingListen> result;
     std::size_t querySize = 0;
     while (statement.row()) {
         auto id = statement.text(1);
@@ -1094,17 +1102,17 @@ std::vector<Report> Store::reports(Id server) {
     return result;
 }
 
-void Store::acknowledge(const std::vector<Report>& reports) {
+void Store::acknowledgeListens(const std::vector<PendingListen>& listens) {
     std::scoped_lock lock(mutex_);
     Transaction transaction(db_);
-    for (const auto& report : reports)
-        prepare("DELETE FROM reports WHERE key=?").bind(report.key).run();
+    for (const auto& listen : listens)
+        prepare("DELETE FROM pending_listens WHERE key=?").bind(listen.queueKey).run();
     transaction.commit();
 }
 
-std::int64_t Store::reportCount(Id server) {
+std::int64_t Store::pendingListenCount(Id server) {
     std::scoped_lock lock(mutex_);
-    auto statement = prepare("SELECT COUNT(*) FROM reports WHERE server=?");
+    auto statement = prepare("SELECT COUNT(*) FROM pending_listens WHERE server=?");
     statement.bind(server);
     return statement.row() ? statement.integer(0) : 0;
 }

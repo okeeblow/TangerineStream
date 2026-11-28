@@ -84,10 +84,10 @@ public:
     void touch(Id key);
     void trim();
 
-    void enqueueReport(const Track& track, std::int64_t time);
-    std::vector<Report> reports(Id server);
-    void acknowledge(const std::vector<Report>& reports);
-    std::int64_t reportCount(Id server);
+    void enqueueListen(const Track& track, std::int64_t listenedAtMs);
+    std::vector<PendingListen> nextListenBatch(Id server);
+    void acknowledgeListens(const std::vector<PendingListen>& listens);
+    std::int64_t pendingListenCount(Id server);
 
 private:
     Statement prepare(const char* sql);

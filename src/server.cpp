@@ -716,11 +716,11 @@ public:
         throw Error(reason.empty() ? "The server could not supply a format playable by the enabled WACUP inputs." : reason.substr(0, 300));
     }
 
-    void submit(const std::vector<Report>& reports) override {
+    void submitListens(const std::vector<PendingListen>& listens) override {
         Parameters parameters{{"submission", "true"}};
-        for (const auto& report : reports) {
-            parameters.emplace_back("id", report.id);
-            parameters.emplace_back("time", std::to_string(report.time));
+        for (const auto& listen : listens) {
+            parameters.emplace_back("id", listen.remoteTrackId);
+            parameters.emplace_back("time", std::to_string(listen.listenedAtMs));
         }
         api("scrobble", std::move(parameters));
     }
