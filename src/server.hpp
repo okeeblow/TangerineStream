@@ -13,6 +13,10 @@ namespace tangerine {
 
 using Parameters = std::vector<std::pair<std::string, std::string>>;
 
+std::string md5(const std::string& value);
+std::string queryString(const Parameters& parameters);
+std::string jsonString(std::string_view value);
+
 bool acceptsCodec(const InputExtensions& inputs, std::string_view codec);
 
 constexpr unsigned originalSource = 1;

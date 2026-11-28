@@ -28,24 +28,6 @@ std::string hex(const unsigned char* data, std::size_t count) {
     return result;
 }
 
-std::string md5(const std::string& value) {
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    unsigned char digest[16];
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_MD5_ALGORITHM, nullptr, 0))
-        throw Error("Windows could not initialize Subsonic token authentication.");
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    auto status = BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0);
-    if (BCRYPT_SUCCESS(status)) {
-        status = BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
-                                static_cast<ULONG>(value.size()), 0);
-        if (BCRYPT_SUCCESS(status)) status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
-        BCryptDestroyHash(hash);
-    }
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-    if (!BCRYPT_SUCCESS(status)) throw Error("Windows could not create a Subsonic token.");
-    return hex(digest, sizeof(digest));
-}
-
 // uriparser's string APIs stop at NUL even with an explicit end pointer.
 void appendEscaped(std::string& output, std::string_view bytes) {
     while (!bytes.empty()) {
@@ -60,30 +42,6 @@ void appendEscaped(std::string& output, std::string_view bytes) {
         output += "%00";
         bytes.remove_prefix(part.size() + 1);
     }
-}
-
-std::string queryString(const Parameters& parameters) {
-    if (parameters.empty()) return {};
-    std::vector<UriQueryListA> list(parameters.size());
-    for (std::size_t i = 0; i < list.size(); ++i) {
-        const auto& [key, value] = parameters[i];
-        if (key.find('\0') != key.npos || value.find('\0') != value.npos) {
-            std::string query;
-            for (const auto& [k, v] : parameters) {
-                query += query.empty() ? '?' : '&';
-                appendEscaped(query, k);
-                query += '=';
-                appendEscaped(query, v);
-            }
-            return query;
-        }
-        list[i] = {key.c_str(), value.c_str(), i + 1 < list.size() ? &list[i + 1] : nullptr};
-    }
-    char* raw = nullptr;
-    if (uriComposeQueryMallocExA(&raw, list.data(), URI_FALSE, URI_FALSE) != URI_SUCCESS)
-        throw Error("The request URL could not be encoded.");
-    std::unique_ptr<char, decltype(&std::free)> query(raw, &std::free);
-    return std::string("?") + query.get();
 }
 
 struct Address {
@@ -181,14 +139,6 @@ JsonDocument parseJson(const std::string& input) {
     if (document.value.error())
         throw Error(std::string("Invalid JSON: ") + simdjson::error_message(document.value.error()));
     return document;
-}
-
-std::string jsonString(std::string_view value) {
-    simdjson::builder::string_builder builder;
-    builder.escape_and_append_with_quotes(value);
-    auto text = builder.view();
-    if (text.error()) throw Error(simdjson::error_message(text.error()));
-    return std::string(text.value_unsafe());
 }
 
 std::string windowsLines(std::string_view text) {
@@ -952,6 +902,56 @@ private:
 };
 
 } // namespace
+
+std::string md5(const std::string& value) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    unsigned char digest[16];
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_MD5_ALGORITHM, nullptr, 0))
+        throw Error("Windows could not initialize Subsonic token authentication.");
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    auto status = BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0);
+    if (BCRYPT_SUCCESS(status)) {
+        status = BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
+                                static_cast<ULONG>(value.size()), 0);
+        if (BCRYPT_SUCCESS(status)) status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
+        BCryptDestroyHash(hash);
+    }
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (!BCRYPT_SUCCESS(status)) throw Error("Windows could not create a Subsonic token.");
+    return hex(digest, sizeof(digest));
+}
+
+std::string queryString(const Parameters& parameters) {
+    if (parameters.empty()) return {};
+    std::vector<UriQueryListA> list(parameters.size());
+    for (std::size_t i = 0; i < list.size(); ++i) {
+        const auto& [key, value] = parameters[i];
+        if (key.find('\0') != key.npos || value.find('\0') != value.npos) {
+            std::string query;
+            for (const auto& [k, v] : parameters) {
+                query += query.empty() ? '?' : '&';
+                appendEscaped(query, k);
+                query += '=';
+                appendEscaped(query, v);
+            }
+            return query;
+        }
+        list[i] = {key.c_str(), value.c_str(), i + 1 < list.size() ? &list[i + 1] : nullptr};
+    }
+    char* raw = nullptr;
+    if (uriComposeQueryMallocExA(&raw, list.data(), URI_FALSE, URI_FALSE) != URI_SUCCESS)
+        throw Error("The request URL could not be encoded.");
+    std::unique_ptr<char, decltype(&std::free)> query(raw, &std::free);
+    return std::string("?") + query.get();
+}
+
+std::string jsonString(std::string_view value) {
+    simdjson::builder::string_builder builder;
+    builder.escape_and_append_with_quotes(value);
+    auto text = builder.view();
+    if (text.error()) throw Error(simdjson::error_message(text.error()));
+    return std::string(text.value_unsafe());
+}
 
 std::string encodeSortTags(const SortTags& tags) {
     if (tags.empty()) return {};

@@ -62,9 +62,10 @@ foreach(header IN ITEMS gen_ml/ml.h gen_ml/ml_ipc_0313.h Winamp/wa_ipc.h Winamp/
 endforeach()
 message(STATUS "Using Winamp SDK at ${sdk_directory}")
 
+option(TANGERINE_SCREENSHOTS "Build the screenshot tools and imposter-navidrome" OFF)
 set(WACUP_PLUGINS_DIR "" CACHE PATH "WACUP Plugins directory (empty to detect the installed copy)")
 set(plugin_destination "${WACUP_PLUGINS_DIR}")
-if(NOT plugin_destination)
+if(NOT plugin_destination OR (TANGERINE_SCREENSHOTS AND DEFINED ENV{WACUP_PLUGINS_DIR}))
     set(plugin_destination "$ENV{WACUP_PLUGINS_DIR}")
 endif()
 
@@ -148,3 +149,7 @@ foreach(target IN ITEMS in_tangerinestream ml_tangerinestream)
 endforeach()
 target_link_libraries(ml_tangerinestream PRIVATE
     date::date simdjson::simdjson uriparser::uriparser tangerine_sqlite comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
+
+if(TANGERINE_SCREENSHOTS)
+    add_subdirectory(tools/screenshots)
+endif()

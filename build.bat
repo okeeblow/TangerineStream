@@ -2,6 +2,7 @@
 setlocal EnableExtensions DisableDelayedExpansion
 set "ts_toolchain=msys2"
 set "ts_target=wacup_plugins"
+set "ts_screenshots=OFF"
 set "ts_no_pause="
 set "ts_pushed="
 set "ts_exit=1"
@@ -14,10 +15,12 @@ if /i "%~1"=="msys2" (
     set "ts_toolchain=vs"
 ) else if /i "%~1"=="--install" (
     set "ts_target=install"
+) else if /i "%~1"=="--screenshots" (
+    set "ts_screenshots=ON"
 ) else if /i "%~1"=="--no-pause" (
     set "ts_no_pause=1"
 ) else (
-    echo Usage: %~nx0 [msys2^|vs] [--install] [--no-pause]
+    echo Usage: %~nx0 [msys2^|vs] [--install] [--screenshots] [--no-pause]
     goto finish
 )
 shift
@@ -48,13 +51,14 @@ if not defined ts_ninja (
     goto finish
 )
 set "ts_build=build-mingw32"
+if "%ts_screenshots%"=="ON" set "ts_build=build-screenshots-mingw32"
 set "ts_parallel=--parallel"
 set "ts_mingw_cmake=%ts_mingw:\=/%"
 set "ts_ninja_cmake=%ts_ninja:\=/%"
 cmake.exe -S . -B "%ts_build%" -G Ninja -DCMAKE_BUILD_TYPE=Release ^
     "-DCMAKE_C_COMPILER=%ts_mingw_cmake%/gcc.exe" ^
     "-DCMAKE_CXX_COMPILER=%ts_mingw_cmake%/g++.exe" "-DCMAKE_RC_COMPILER=%ts_mingw_cmake%/windres.exe" ^
-    "-DCMAKE_MAKE_PROGRAM=%ts_ninja_cmake%"
+    "-DCMAKE_MAKE_PROGRAM=%ts_ninja_cmake%" -DTANGERINE_SCREENSHOTS=%ts_screenshots%
 goto build
 
 :setup_vs
@@ -81,8 +85,9 @@ set "CXX=cl.exe"
 where /q cmake.exe
 if errorlevel 1 goto missing_cmake
 set "ts_build=build-vs-v143"
+if "%ts_screenshots%"=="ON" set "ts_build=build-screenshots-vs-v143"
 set "ts_parallel="
-cmake.exe -S . -B "%ts_build%" -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake.exe -S . -B "%ts_build%" -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release -DTANGERINE_SCREENSHOTS=%ts_screenshots%
 goto build
 
 :missing_cmake
@@ -94,6 +99,7 @@ if errorlevel 1 (
     set "ts_exit=%errorlevel%"
     goto finish
 )
+if "%ts_screenshots%:%ts_target%"=="ON:wacup_plugins" set "ts_target=screenshot_tools"
 cmake.exe --build "%ts_build%" --config Release %ts_parallel% --target %ts_target%
 set "ts_exit=%errorlevel%"
 if not "%ts_exit%"=="0" goto finish
