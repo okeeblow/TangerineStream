@@ -120,6 +120,13 @@ public sealed class CaptureWindows
     [DllImport("user32.dll")] static extern IntPtr SetFocus(IntPtr window);
     [DllImport("user32.dll")] static extern IntPtr GetActiveWindow();
     [DllImport("user32.dll")] static extern IntPtr GetFocus();
+    [StructLayout(LayoutKind.Sequential)] struct GuiThread {
+        public int size,flags;
+        public IntPtr active,focus,capture,menu,move,caret;
+        public Bounds caretRect;
+    }
+    [DllImport("user32.dll",SetLastError=true)] static extern bool GetGUIThreadInfo(uint thread,ref GuiThread state);
+    [DllImport("user32.dll")] static extern bool IsChild(IntPtr parent,IntPtr child);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern bool GetUserObjectInformation(IntPtr handle,int index,StringBuilder data,int bytes,out int needed);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window,out int process);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr window,StringBuilder text,int count);
@@ -191,17 +198,28 @@ public sealed class CaptureWindows
         GetPrivateProfileString(section,key,"",value,value.Capacity,file);
         return value.ToString();
     }
-    public void ActivateDialog(IntPtr dialog,IntPtr field) {
-        Check(dialog);Check(field);
+    public void FocusFrame(IntPtr frame,IntPtr field) {
+        Check(frame);Check(field);
+        if(field!=frame && !IsChild(frame,field)) throw new InvalidOperationException("Focus target is outside the capture frame.");
         int owner;
-        uint from=GetCurrentThreadId(),to=GetWindowThreadProcessId(dialog,out owner);
+        uint from=GetCurrentThreadId(),to=GetWindowThreadProcessId(frame,out owner);
         if(!AttachThreadInput(from,to,true)) throw new Win32Exception();
         try {
-            SetWindowPos(dialog,IntPtr.Zero,0,0,0,0,3);
-            SetActiveWindow(dialog); SetFocus(field);
-            if(GetActiveWindow()!=dialog || GetFocus()!=field) throw new InvalidOperationException("Could not activate the private WACUP dialog.");
-            Send(dialog,0x86,1,0); // WM_NCACTIVATE paints the active nonclient title.
+            SetWindowPos(frame,IntPtr.Zero,0,0,0,0,3);
+            SetActiveWindow(frame); SetFocus(field);
+            var focused=GetFocus();
+            if(GetActiveWindow()!=frame || (focused!=field && !IsChild(field,focused)))
+                throw new InvalidOperationException("Could not activate "+Text(frame)+" and focus its "+Class(field)+" control.");
+            Send(frame,0x86,1,0); // WM_NCACTIVATE paints the active nonclient title.
         } finally {AttachThreadInput(from,to,false);}
+    }
+    public void CheckFocus(IntPtr frame,IntPtr field) {
+        Check(frame); Check(field);
+        int owner;
+        uint thread=GetWindowThreadProcessId(field,out owner);
+        var state=new GuiThread {size=Marshal.SizeOf(typeof(GuiThread))};
+        if(!GetGUIThreadInfo(thread,ref state)) throw new Win32Exception();
+        if(state.active!=frame || (state.focus!=field && !IsChild(field,state.focus))) FocusFrame(frame,field);
     }
     public long Send(IntPtr h,uint msg,long w,long l) {
         Check(h); IntPtr result;
@@ -884,6 +902,16 @@ function Save-Shot($name,$only=[IntPtr]::Zero) {
             }
         }
     }
+    $focusField=switch ($name) {
+        'classic-modern-welcome' {$ui.Item((Find-Form 1001),1001)}
+        'add-server' {$ui.Item((Find-Form 1021),1021)}
+        'edit-view-mode' {$ui.Item((Find-Form 1060),1060)}
+        'edit-columns' {$ui.Item((Find-Form 1067),1067)}
+        default {$tree}
+    }
+    $focusFrame=$ui.Root($focusField)
+    if ($only -ne [IntPtr]::Zero -and $focusFrame -ne $only) {throw "Unexpected focus target for $name."}
+    $ui.FocusFrame($focusFrame,$focusField)
     # Let the skin return from its temporary EQ adjustment text to the song title.
     Start-Sleep -Milliseconds 1800
     if ($only -eq [IntPtr]::Zero) {
@@ -916,9 +944,6 @@ function Save-Shot($name,$only=[IntPtr]::Zero) {
     if ($visualizer -ne [IntPtr]::Zero -and $only -eq [IntPtr]::Zero) {
         [void](Wait-For {$ui.SpectrumMoving($ui.Root($visualizer))} "the $visualPreset spectrum to animate" 8)
     }
-    if ($name -eq 'add-server') {
-        $ui.ActivateDialog($only,$ui.Item((Find-Form 1021),1021))
-    }
     if ($only -eq [IntPtr]::Zero -and $browser) {
         foreach ($list in $ui.Windows($browser)) {
             if ($ui.Class($list) -ne 'SysListView32' -or ![CaptureWindows]::IsWindowVisible($list)) {continue}
@@ -926,6 +951,7 @@ function Save-Shot($name,$only=[IntPtr]::Zero) {
             if ($columns) {Write-Log "$name columns - $columns"}
         }
     }
+    $ui.CheckFocus($focusFrame,$focusField)
     [array]$frames = if ($only -ne [IntPtr]::Zero) { $only } else { Get-Frames }
     if (!$frames) {throw 'WACUP has no visible frames.'}
     [array]::Reverse($frames)
