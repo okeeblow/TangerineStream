@@ -23,13 +23,19 @@ inline std::filesystem::path settingsDirectory(HWND player) {
     auto wide = reinterpret_cast<const wchar_t*>(SendMessageW(player, WM_WA_IPC, 0, getIniDirectoryW));
     if (reinterpret_cast<UINT_PTR>(wide) > 1 && *wide) return wide;
     auto ansi = reinterpret_cast<const char*>(SendMessageW(player, WM_WA_IPC, 0, IPC_GETINIDIRECTORY));
+    bool filename = false;
+    if (reinterpret_cast<UINT_PTR>(ansi) <= 1 || !*ansi) {
+        // WinampPE 2.96 supplies the INI filename but not the directory IPC.
+        ansi = reinterpret_cast<const char*>(SendMessageW(player, WM_WA_IPC, 0, IPC_GETINIFILE));
+        filename = true;
+    }
     if (reinterpret_cast<UINT_PTR>(ansi) <= 1 || !*ansi) return {};
     int size = MultiByteToWideChar(CP_ACP, 0, ansi, -1, nullptr, 0);
     if (size <= 1) return {};
     std::wstring directory(size, L'\0');
     if (!MultiByteToWideChar(CP_ACP, 0, ansi, -1, directory.data(), size)) return {};
     directory.pop_back();
-    return directory;
+    return filename ? std::filesystem::path(directory).parent_path() : std::filesystem::path(directory);
 }
 
 // WACUP reads the subtitle in its Preferences list from this per-profile catalog.

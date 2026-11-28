@@ -11,7 +11,7 @@ namespace tangerine {
 class Playback {
 public:
     Playback(Store& store, const std::filesystem::path& profile);
-    std::wstring playlistFile(const Track& track) const;
+    std::wstring playlistFile(const Track& track, bool ansiHost = false) const;
     Id key(std::wstring_view filename) const;
 
 private:

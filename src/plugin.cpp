@@ -28,6 +28,8 @@
 
 #include "ml_sdk.hpp"
 #include "host_profile.hpp"
+#include "host_player.hpp"
+#include "host_library.hpp"
 
 namespace tangerine {
 namespace {
@@ -47,6 +49,8 @@ constexpr UINT_PTR searchTimer = 2;
 constexpr UINT_PTR splitTimer = 4;
 constexpr UINT_PTR playerSubclass = 0x7151;
 using Clock = std::chrono::steady_clock;
+HostPlayer hostPlayer;
+HostLibrary hostLibrary;
 
 int init();
 void quit();
@@ -73,24 +77,7 @@ LRESULT player(UINT command, WPARAM value = 0) {
 }
 
 InputExtensions enabledExtensions() {
-    // Mode 0 is the host's double-NUL list of extensions from loaded input modules.
-    const auto raw = player(IPC_GET_EXTLISTW);
-    if (static_cast<UINT_PTR>(raw) <= 1) return {};
-    std::unique_ptr<void, decltype(&GlobalFree)> memory(reinterpret_cast<void*>(raw), GlobalFree);
-    InputExtensions result;
-    for (auto entry = static_cast<const wchar_t*>(memory.get()); *entry; entry += wcslen(entry) + 1) {
-        const std::wstring_view group(entry);
-        size_t pos = 0;
-        while ((pos = group.find_first_not_of(L" ;*.\t", pos)) != group.npos) {
-            auto end = group.find_first_of(L" ;\t", pos);
-            auto suffix = utf8(group.substr(pos, end - pos));
-            std::transform(suffix.begin(), suffix.end(), suffix.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            result.insert(std::move(suffix));
-            if (end == group.npos) break;
-            pos = end + 1;
-        }
-    }
-    return result;
+    return hostPlayer.inputExtensions();
 }
 
 LRESULT library(UINT command, WPARAM value = 0) {
@@ -98,8 +85,7 @@ LRESULT library(UINT command, WPARAM value = 0) {
 }
 
 bool skinWindow(HWND hwnd, UINT type, UINT style = 0) {
-    MLSKINWINDOW window{hwnd, type, style | SWS_USESKINFONT | SWS_USESKINCOLORS | SWS_USESKINCURSORS};
-    return library(ML_IPC_SKINWINDOW, reinterpret_cast<WPARAM>(&window)) != 0;
+    return hostLibrary.skin(hwnd, type, style);
 }
 
 struct Category {
@@ -308,7 +294,7 @@ public:
     void finishPlayback();
     void updateLyrics(Id key);
     std::wstring playlistFile(const Track& track) {
-        auto name = playback.playlistFile(track);
+        auto name = playback.playlistFile(track, !hostPlayer.unicode());
         artwork.stageCover(track);
         artwork.requestTrack(track.key);
         return name;
@@ -320,8 +306,8 @@ public:
         }
         const auto index = static_cast<int>(player(IPC_GETLISTPOS));
         if (index < 0) return {};
-        const auto file = reinterpret_cast<const wchar_t*>(player(IPC_GETPLAYLISTFILEW, index));
-        return reinterpret_cast<UINT_PTR>(file) > 1 && playback.key(file) == key ? file : L"";
+        const auto file = hostPlayer.playlistFile(index);
+        return !file.empty() && playback.key(file) == key ? file : L"";
     }
 
     HttpClient http;
@@ -560,16 +546,7 @@ void App::sendTrackRecords(const std::vector<Track>& tracks, AlbumAction action,
     }
     const int count = static_cast<int>(records.size());
     itemRecordListW list{records.data(), count, count};
-    if (action != AlbumAction::drop) {
-        // Bit 1 makes the explicit Play / Enqueue choice override the ML default.
-        mlSendToWinampStruct send{ML_TYPE_ITEMRECORDLISTW, &list, action == AlbumAction::enqueue ? 3 : 2};
-        library(ML_IPC_SENDTOWINAMP, reinterpret_cast<WPARAM>(&send));
-        return;
-    }
-    drop.flags = 0;
-    drop.result = 0;
-    drop.data = &list;
-    library(ML_IPC_HANDLEDROP, reinterpret_cast<WPARAM>(&drop));
+    hostLibrary.sendTracks(list, action == AlbumAction::enqueue, action == AlbumAction::drop ? &drop : nullptr);
 }
 
 void App::browse() {
@@ -792,9 +769,8 @@ void App::sample(Id startedKey) {
     const auto state = static_cast<int>(player(IPC_ISPLAYING));
     const auto index = static_cast<int>(player(IPC_GETLISTPOS));
     const auto output = static_cast<int>(player(IPC_GETOUTPUTTIME));
-    auto filename = index < 0 ? nullptr : reinterpret_cast<const wchar_t*>(player(IPC_GETPLAYLISTFILEW, index));
-    const auto key = startedKey ? startedKey : (filename && reinterpret_cast<UINT_PTR>(filename) > 1 ?
-                                               playback.key(filename) : 0);
+    const auto filename = hostPlayer.playlistFile(index);
+    const auto key = startedKey ? startedKey : (!filename.empty() ? playback.key(filename) : 0);
     const auto now = Clock::now();
     if (!state || !key) {
         playing = {};
@@ -926,7 +902,7 @@ LRESULT CALLBACK playerProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, D
                     app->hostMetadata.artworkChanged(filename.c_str());
                 } else {
                     app->updateLyrics(key);
-                    player(IPC_FILE_TAG_MAY_HAVE_UPDATEDW, reinterpret_cast<WPARAM>(filename.c_str()));
+                    hostPlayer.metadataChanged(filename.c_str());
                 }
             }
         } catch (const std::exception&) {}
@@ -1328,7 +1304,7 @@ public:
                 legacySkins.push_back(library(ML_IPC_SKIN_LISTVIEW, reinterpret_cast<WPARAM>(control)));
             // WACUP installs its window procedure above the common-controls subclass chain.
             auto proc = GetWindowLongPtrW(control, GWLP_WNDPROC);
-            if (SetPropW(control, listSkinProc, reinterpret_cast<HANDLE>(proc)) &&
+            if (hostLibrary.nativeControls() && SetPropW(control, listSkinProc, reinterpret_cast<HANDLE>(proc)) &&
                 !SetWindowLongPtrW(control, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(libraryListProc)))
                 RemovePropW(control, listSkinProc);
             attachListScrollbars(control);
@@ -1342,8 +1318,7 @@ public:
         }
         for (int id : {IDC_DIVIDER_H, IDC_DIVIDER_V}) {
             auto divider = GetDlgItem(hwnd, id);
-            skinWindow(divider, SKINNEDWND_TYPE_DIVIDER, id == IDC_DIVIDER_V ? SWDIV_VERT : 0);
-            MLSkinnedDivider_SetCallback(divider, dividerMoved, reinterpret_cast<LPARAM>(this));
+            hostLibrary.divider(divider, id == IDC_DIVIDER_V, dividerMoved, reinterpret_cast<LPARAM>(this));
         }
         skinWindow(GetDlgItem(hwnd, IDC_QUERY), SKINNEDWND_TYPE_EDIT, SWES_VCENTER);
         for (int id : {IDC_SEARCH_LABEL, IDC_STATUS})
@@ -2527,7 +2502,7 @@ void View::cancelDrag() {
 void View::drag(POINT point, bool released) {
     if (draggedAlbums.empty() && draggedTracks.empty()) return;
     mlDropItemStruct drop{};
-    drop.type = ML_TYPE_ITEMRECORDLISTW;
+    drop.type = hostLibrary.recordType();
     drop.p = point;
     if (!ClientToScreen(hwnd, &drop.p)) { cancelDrag(); return; }
     drop.flags = released ? ML_HANDLEDRAG_FLAG_NOCURSOR : 0;
@@ -2577,8 +2552,7 @@ void View::play(bool enqueue) {
     for (const auto& track : items) {
         auto url = app->playlistFile(track);
         auto title = wide(playlistTitle(track));
-        enqueueFileWithMetaStructW item{url.c_str(), title.c_str(), track.duration ? track.duration : -1};
-        player(IPC_ENQUEUEFILEW, reinterpret_cast<WPARAM>(&item));
+        hostPlayer.enqueue(url.c_str(), title.c_str(), track.duration ? track.duration : -1);
     }
     if (!enqueue) player(IPC_STARTPLAY);
 }
@@ -2665,6 +2639,7 @@ void View::popup(int button) {
             option(IDC_EDIT_COLUMNS, filtered() || hasPreview() ? L"Edit results columns..." : L"Edit view columns...");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING | (app->store.offlineMode() ? MF_CHECKED : 0), IDC_OFFLINE, L"Work offline");
+        if (!hostLibrary.nativeControls()) option(IDC_SERVER_SETTINGS, L"Server settings...");
     } else {
         const Id filter = treeServer ? treeServer : app->filterServer;
         AppendMenuW(menu, MF_STRING | (!filter ? MF_CHECKED : 0), allServersCommand, L"<All>");
@@ -2687,12 +2662,13 @@ void View::popup(int button) {
     popup.x = button == IDC_CACHE_MENU ? anchor.left : anchor.right;
     popup.y = button == IDC_CACHE_MENU ? anchor.top : anchor.bottom;
     popup.skinStyle = SMS_USESKINFONT;
-    const UINT chosen = static_cast<UINT>(library(ML_IPC_TRACKSKINNEDPOPUPEX, reinterpret_cast<WPARAM>(&popup)));
+    const UINT chosen = hostLibrary.popup(popup);
     DestroyMenu(menu);
     if (chosen) command(chosen, 0);
 }
 
 void View::command(int id, int notification) {
+    if (id == IDC_SERVER_SETTINGS) { configure(hwnd, app->selectedServer); return; }
     if (servers.empty()) {
         if (id == IDC_ADD_SERVER) configure(hwnd, 0, true);
         return;
@@ -2844,13 +2820,16 @@ void View::configureView(int id) {
     setCoverSize(size);
 }
 
-void CALLBACK View::dividerMoved(HWND, INT, LPARAM param) {
+void CALLBACK View::dividerMoved(HWND, INT position, LPARAM param) {
     auto& view = *reinterpret_cast<View*>(param);
     if (view.splitLength <= 0) return;
-    POINT pt{};
-    if (!GetCursorPos(&pt) || !ScreenToClient(view.hwnd, &pt)) return;
     const bool right = view.filtered() ? view.options.filtersRight : view.options.albumsRight;
-    const int pos = right ? pt.x : pt.y;
+    int pos = position;
+    if (hostLibrary.nativeControls()) {
+        POINT pt{};
+        if (!GetCursorPos(&pt) || !ScreenToClient(view.hwnd, &pt)) return;
+        pos = right ? pt.x : pt.y;
+    }
     view.options.splitPercent = std::clamp(MulDiv(pos - view.splitStart, 100, view.splitLength), 15, 85);
     RECT rc{};
     GetClientRect(view.hwnd, &rc);
@@ -3210,21 +3189,7 @@ INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 }
 
 UINT_PTR addTreeItem(std::wstring label, std::wstring invariant, UINT_PTR parent, bool branch) {
-    NAVINSERTSTRUCT insert{};
-    insert.hParent = parent ? MLNavCtrl_FindItemById(plugin.hwndLibraryParent, parent) : nullptr;
-    insert.hInsertAfter = NCI_LAST;
-    auto& item = insert.item;
-    item.cbSize = sizeof(item);
-    item.mask = NIMF_TEXT | NIMF_TEXTINVARIANT | NIMF_STYLE;
-    item.pszText = label.data();
-    item.pszInvariant = invariant.data();
-    item.styleMask = NIS_HASCHILDREN | NIS_DEFAULTIMAGE;
-    item.style = NIS_DEFAULTIMAGE | (branch ? NIS_HASCHILDREN : 0);
-    item.hItem = MLNavCtrl_InsertItem(plugin.hwndLibraryParent, &insert);
-    item.mask = NIMF_ITEMID;
-    if (!item.hItem || !MLNavItem_GetInfo(plugin.hwndLibraryParent, &item))
-        throw Error(TS_PRODUCT_NAME " could not add its Media Library entry.");
-    return item.id;
+    return hostLibrary.insert(std::move(label), std::move(invariant), parent, branch);
 }
 
 // In the grouped tree the root represents <All>; its view retains the requested category.
@@ -3243,10 +3208,8 @@ void selectCategory(BrowseKind category, Id server) {
     }
     app->filterServer = server;
     if (server) app->selectedServer = server;
-    const auto handle = library(ML_IPC_TREEITEM_GETHANDLE, target);
-    if (handle && handle != library(ML_IPC_TREEITEM_GETSELECTED))
-        library(ML_IPC_TREEITEM_SELECT, handle);
-    else if (handle && app->activeView)
+    if (hostLibrary.selection() != target) hostLibrary.select(target);
+    else if (app->activeView)
         SendMessageW(app->activeView, profilesChanged, static_cast<WPARAM>(category), 1);
 }
 
@@ -3258,24 +3221,13 @@ void refreshNavigation() {
     if (!app->navigation.empty() && branches == app->serverBranches) return;
 
     const auto root = app->treeId;
-    const auto rootHandle = library(ML_IPC_TREEITEM_GETHANDLE, root);
-    const auto selectedHandle = library(ML_IPC_TREEITEM_GETSELECTED);
-    MLTREEITEMINFOW info{};
-    info.item.size = sizeof(info.item);
-    info.handle = selectedHandle;
-    info.mask = MLTI_ID;
-    if (selectedHandle) library(ML_IPC_TREEITEM_GETINFOW, reinterpret_cast<WPARAM>(&info));
-    const auto selected = app->navigation.find(info.item.id);
+    const auto selectedId = hostLibrary.selection();
+    const auto selected = app->navigation.find(selectedId);
     const bool restore = selected != app->navigation.end();
     const auto category = restore ? selected->second.category : BrowseKind::albums;
     const auto filter = app->filterServer;
-    if (restore && selectedHandle != rootHandle) library(ML_IPC_TREEITEM_SELECT, rootHandle);
-
-    while (const auto child = library(ML_IPC_TREEITEM_GETCHILD, rootHandle)) {
-        library(ML_IPC_TREEITEM_DELETE, child);
-        if (library(ML_IPC_TREEITEM_GETCHILD, rootHandle) == child)
-            throw Error("WACUP could not refresh the " TS_PRODUCT_NAME " tree.");
-    }
+    if (restore && selectedId != root) hostLibrary.select(root);
+    hostLibrary.clearChildren(root);
     app->navigation.clear();
     app->navigation.emplace(root, Navigation{BrowseKind::albums, 0, true});
     auto addCategories = [&](UINT_PTR parent, Id server) {
@@ -3295,10 +3247,12 @@ void refreshNavigation() {
 int init() {
     try {
         closingInput = false;
+        hostPlayer.attach(plugin.hwndWinampParent);
+        hostLibrary.attach(plugin.hwndLibraryParent, plugin.hwndWinampParent, hostPlayer.unicode());
         INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
         if (!InitCommonControlsEx(&controls)) throw Error("Windows could not initialize Media Library controls.");
         const auto settings = settingsDirectory(plugin.hwndWinampParent);
-        if (settings.empty()) throw Error("WACUP did not provide its profile directory.");
+        if (settings.empty()) throw Error("The player did not provide its profile directory.");
         const auto services = static_cast<UINT_PTR>(player(IPC_GET_API_SERVICE));
         app = std::make_unique<App>(settings / L"Plugins" / pluginName,
                                     services > 1 ? reinterpret_cast<api_service*>(services) : nullptr);
@@ -3316,8 +3270,7 @@ int init() {
     } catch (const std::exception& error) {
         // Roll back a failed registration. At normal shutdown WACUP saves the tree order itself.
         if (app && app->treeId) {
-            auto handle = library(ML_IPC_TREEITEM_GETHANDLE, app->treeId);
-            if (handle) library(ML_IPC_TREEITEM_DELETE, handle);
+            hostLibrary.remove(app->treeId);
         }
         quit();
         showError(plugin.hwndLibraryParent, error);

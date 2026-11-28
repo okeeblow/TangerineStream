@@ -14,16 +14,19 @@
 #include <Winamp/in2.h>
 
 #include "host_profile.hpp"
+#include "host_player.hpp"
 
 namespace {
 using tangerine::InputRequest;
 In_Module input{};
+tangerine::HostPlayer hostPlayer;
 std::mutex nameMutex;
 std::wstring current;
 std::weak_ptr<tangerine::ProgressiveInput> metadataPlayer;
 int duration = -1;
 In_Module* nativePlayer = nullptr;
 Out_Module* previousOutput = nullptr;
+In_Module previousCallbacks{};
 std::string ansiSource;
 bool paused = false;
 int pendingSeek = -1, volume = -1, pan = 0;
@@ -63,9 +66,23 @@ HWND receiver = nullptr;
 constexpr wchar_t receiverClass[] = L"TangerineStream.InputPlayback";
 
 In_Module* selectInput(const wchar_t* source) {
-    auto* module = reinterpret_cast<In_Module*>(SendMessageW(input.hMainWindow, WM_WA_IPC,
-        reinterpret_cast<WPARAM>(source), IPC_CANPLAY));
-    return reinterpret_cast<UINT_PTR>(module) > 1 && module != &input ? module : nullptr;
+    return hostPlayer.selectInput(source, &input);
+}
+
+void copyHostCallbacks(In_Module& target, const In_Module& source) {
+    target.hMainWindow = source.hMainWindow;
+    target.SAVSAInit = source.SAVSAInit;
+    target.SAVSADeInit = source.SAVSADeInit;
+    target.SAAddPCMData = source.SAAddPCMData;
+    target.SAGetMode = source.SAGetMode;
+    target.SAAdd = source.SAAdd;
+    target.VSAAddPCMData = source.VSAAddPCMData;
+    target.VSAGetMode = source.VSAGetMode;
+    target.VSAAdd = source.VSAAdd;
+    target.VSASetInfo = source.VSASetInfo;
+    target.dsp_isactive = source.dsp_isactive;
+    target.dsp_dosamples = source.dsp_dosamples;
+    target.SetInfo = source.SetInfo;
 }
 
 int query(InputRequest op, const wchar_t* filename, const wchar_t* field = nullptr,
@@ -115,6 +132,7 @@ void stop() {
     if (nativePlayer) {
         nativePlayer->Stop();
         nativePlayer->outMod = previousOutput;
+        if (hostPlayer.lateInputCallbacks()) copyHostCallbacks(*nativePlayer, previousCallbacks);
         nativePlayer = nullptr;
     }
     ansiSource.clear();
@@ -139,13 +157,14 @@ bool playNative(const wchar_t* source) {
     if (!module || !module->Play || !module->Stop) return false;
     const wchar_t* name = source; // playingFile owns the path until the decoder stops.
     if (!(module->version & IN_UNICODE)) {
-        int n = WideCharToMultiByte(CP_ACP, 0, name, -1, nullptr, 0, nullptr, nullptr);
-        if (n <= 0) return false;
-        ansiSource.resize(n);
-        WideCharToMultiByte(CP_ACP, 0, name, -1, ansiSource.data(), n, nullptr, nullptr);
+        ansiSource = tangerine::toHostFilename(name);
         name = reinterpret_cast<const wchar_t*>(ansiSource.data());
     }
     previousOutput = module->outMod;
+    if (hostPlayer.lateInputCallbacks()) {
+        copyHostCallbacks(previousCallbacks, *module);
+        copyHostCallbacks(*module, input);
+    }
     module->outMod = input.outMod;
     nativePlayer = module;
     if (!module->Play(name)) {
@@ -153,6 +172,7 @@ bool playNative(const wchar_t* source) {
         return true;
     }
     module->outMod = previousOutput;
+    if (hostPlayer.lateInputCallbacks()) copyHostCallbacks(*module, previousCallbacks);
     nativePlayer = nullptr;
     return false;
 }
@@ -276,6 +296,7 @@ int play(const wchar_t* filename) {
     stop();
     try {
         if (!filename || !input.outMod) return 1;
+        hostPlayer.attach(input.hMainWindow);
         {
             std::scoped_lock lock(nameMutex);
             current = filename;
@@ -316,6 +337,28 @@ void registerDescription() noexcept {
             L"input", L"in_tangerinestream.dll", L"Plays tracks from your server or cache with WACUP's audio decoders.");
     } catch (...) {} // The Preferences subtitle is optional during input initialization.
 }
+
+void getFileInfoAnsi(const char* filename, char* title, int* length) {
+    try {
+        const auto file = tangerine::fromHostFilename(filename);
+        wchar_t caption[GETFILEINFO_TITLE_LENGTH]{};
+        getFileInfo(file.c_str(), title ? caption : nullptr, length);
+        if (title) lstrcpynA(title, tangerine::toHostText(caption).c_str(), GETFILEINFO_TITLE_LENGTH);
+    } catch (...) {
+        if (title) *title = 0;
+        if (length) *length = -1;
+    }
+}
+
+int playAnsi(const char* filename) {
+    try { return play(tangerine::fromHostFilename(filename).c_str()); }
+    catch (...) { return 1; }
+}
+
+int recognizeAnsi(const char* filename) {
+    try { return query(InputRequest::recognize, tangerine::fromHostFilename(filename).c_str()); }
+    catch (...) { return 0; }
+}
 }
 
 extern "C" __declspec(dllexport) int winampGetExtendedFileInfoW(
@@ -331,6 +374,18 @@ extern "C" __declspec(dllexport) int winampGetExtendedFileInfoW(
     wchar_t tag[80]{};
     if (!field || !MultiByteToWideChar(CP_ACP, 0, field, -1, tag, 80)) return 0;
     return metadata(filename, tag, output, capacity);
+}
+
+extern "C" __declspec(dllexport) int winampGetExtendedFileInfo(
+    const char* filename, const char* field, char* output, int capacity) {
+    if (!output || capacity <= 0) return 0;
+    try {
+        const auto file = tangerine::fromHostFilename(filename);
+        std::vector<wchar_t> value(capacity);
+        if (!winampGetExtendedFileInfoW(file.c_str(), field, value.data(), capacity)) return 0;
+        lstrcpynA(output, tangerine::toHostText(value.data()).c_str(), capacity);
+        return 1;
+    } catch (...) { return 0; }
 }
 
 extern "C" __declspec(dllexport) In_Module* winampGetInModule2() {
@@ -386,6 +441,15 @@ extern "C" __declspec(dllexport) In_Module* winampGetInModule2() {
             }
             if (nativePlayer && nativePlayer->EQSet) nativePlayer->EQSet(on, bands, preamp);
         };
+        if (tangerine::needsAnsiInputAbi()) {
+            static char description[] = TS_PRODUCT_NAME " Input v" TS_VERSION_STRING;
+            input.version = 0x100; // Original ANSI description and callbacks; void Init on the host side.
+            input.description = description;
+            input.GetFileInfo = reinterpret_cast<decltype(input.GetFileInfo)>(getFileInfoAnsi);
+            input.InfoBox = reinterpret_cast<decltype(input.InfoBox)>(+[](const char*, HWND) { return 1; });
+            input.IsOurFile = reinterpret_cast<decltype(input.IsOurFile)>(recognizeAnsi);
+            input.Play = reinterpret_cast<decltype(input.Play)>(playAnsi);
+        }
         return true;
     }();
     (void)initialized;

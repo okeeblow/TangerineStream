@@ -208,8 +208,9 @@ std::filesystem::path Playback::reference(const Track& track) const {
     return items_ / std::to_wstring(track.key) / (L"Song - " + label + L".tstream");
 }
 
-std::wstring Playback::playlistFile(const Track& track) const {
+std::wstring Playback::playlistFile(const Track& track, bool ansiHost) const {
     auto file = reference(track);
+    if (ansiHost) file.replace_filename(L"Song.tstream");
     std::filesystem::create_directories(file.parent_path());
     File marker(CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));

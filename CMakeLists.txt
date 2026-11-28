@@ -11,7 +11,7 @@ HunterGate(
     SHA1 6498c5d0dec25d7fffb2b0574ebaf265179b894d
     LOCAL
 )
-project(ml_tangerinestream VERSION 0.7.7 LANGUAGES C CXX RC)
+project(ml_tangerinestream VERSION 0.8.0 LANGUAGES C CXX RC)
 set(TANGERINE_PRODUCT_NAME "Tangerine Stream")
 # Windows VERSIONINFO requires four components.
 string(REPLACE "." ";" version_components "${PROJECT_VERSION};0;0;0")
@@ -131,14 +131,14 @@ endfunction()
 set_property(SOURCE src/input.rc src/plugin.rc APPEND PROPERTY OBJECT_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/tangerine.ico"
     "${CMAKE_CURRENT_BINARY_DIR}/generated/tangerine_product.h")
-add_wacup_plugin(in_tangerinestream src/input.cpp src/progressive_input.cpp src/input.rc)
+add_wacup_plugin(in_tangerinestream src/input.cpp src/progressive_input.cpp src/host_player.cpp src/input.rc)
 target_compile_definitions(in_tangerinestream PRIVATE UNICODE_INPUT_PLUGIN)
 target_link_libraries(in_tangerinestream PRIVATE user32)
 
 add_wacup_plugin(ml_tangerinestream
     src/plugin.cpp src/list_scroll.cpp src/server.cpp src/store.cpp src/playback.cpp src/artwork.cpp src/browse_sort.cpp
     src/library_view.cpp src/view_editor.cpp
-    src/host_metadata.cpp src/plugin.rc)
+    src/host_metadata.cpp src/host_player.cpp src/host_library.cpp src/legacy_skin.cpp src/plugin.rc)
 add_library(tangerine_migrations STATIC src/migrations.cpp)
 target_compile_features(tangerine_migrations PRIVATE cxx_std_17)
 target_link_libraries(tangerine_migrations PUBLIC tangerine_sqlite)
@@ -154,7 +154,7 @@ foreach(target IN ITEMS in_tangerinestream ml_tangerinestream)
         "${CMAKE_CURRENT_SOURCE_DIR}/SDKs/Winamp-5.55/Agave")
 endforeach()
 target_link_libraries(ml_tangerinestream PRIVATE
-    date::date simdjson::simdjson uriparser::uriparser tangerine_migrations comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid)
+    date::date simdjson::simdjson uriparser::uriparser tangerine_migrations comctl32 winhttp crypt32 bcrypt windowscodecs ole32 gdi32 uuid uxtheme)
 
 if(TANGERINE_SCREENSHOTS)
     add_subdirectory(tools/screenshots)
