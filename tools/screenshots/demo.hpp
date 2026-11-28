@@ -75,6 +75,7 @@ using ObjectKey = std::pair<std::string,std::string>;
 struct Collection {
     int total = 0;
     std::vector<ObjectKey> members;
+    int leadingBlanks = 0;
 };
 struct Fixture {
     std::map<ObjectKey,Entry> objects;

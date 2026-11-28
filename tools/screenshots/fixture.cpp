@@ -111,7 +111,8 @@ void Fixture::save(Database& db) const {
         if (collection.total<static_cast<int>(collection.members.size())) throw Error("Library changed during export: "+name);
         std::string members="[";
         for (const auto& [kind,id]:collection.members) append(members,"["+jsonString(kind)+","+jsonString(id)+"]");
-        setting(db,"collection."+name,"{\"total\":"+std::to_string(collection.total)+",\"members\":"+members+"]}");
+        setting(db,"collection."+name,"{\"total\":"+std::to_string(collection.total)+",\"leading\":"+
+                std::to_string(collection.leadingBlanks)+",\"members\":"+members+"]}");
     }
     for (const auto& [name,value]:poses) setting(db,"pose."+name,value);
     for (const auto& [id,digest]:coverAliases) setting(db,"cover."+id,digest);
@@ -134,6 +135,8 @@ void Fixture::load(Database& db) {
             const auto doc=parser.parse(value).value();
             auto& list=collections[name.substr(11)];
             list.total=static_cast<int>(doc["total"].get_int64().value());
+            int64_t leading=0;
+            if (!doc["leading"].get_int64().get(leading)) list.leadingBlanks=static_cast<int>(leading);
             for (auto item:doc["members"].get_array().value()) {
                 ObjectKey key{std::string(item.at(0).get_string().value()),std::string(item.at(1).get_string().value())};
                 if (!objects.count(key)) throw Error("Missing library object for "+name);

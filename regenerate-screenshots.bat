@@ -4,7 +4,13 @@ set "TS_SHOT_FILE=%~f0"
 set "TS_SHOT_ARGS=%*"
 powershell.exe -NoLogo -NoProfile -Command "$file=[IO.File]::ReadAllText($env:TS_SHOT_FILE); . ([scriptblock]::Create($file.Substring($file.IndexOf([char]10+'# PowerShell')+1)))"
 set "ts_result=%errorlevel%"
-if not "%ts_result%"=="0" if not defined TS_SHOT_WORKER if "%ts_shot_args:--no-pause=%"=="%ts_shot_args%" pause
+if "%ts_result%"=="0" goto finished
+if defined TS_SHOT_WORKER goto finished
+if not defined TS_SHOT_ARGS goto failed
+if not "%TS_SHOT_ARGS:--no-pause=%"=="%TS_SHOT_ARGS%" goto finished
+:failed
+pause
+:finished
 exit /b %ts_result%
 
 # PowerShell
@@ -354,6 +360,48 @@ public sealed class CaptureWindows
             for(int x=20;x<width-18;x++) if(brightness[x]>threshold) {pixels++;sum+=x;}
             return pixels<12 || pixels>75 ? -1 : (sum/(double)pixels-50)/(width-98);
         }
+    }
+    public double BentoSeekFraction(IntPtr player) {
+        using(var frame=Print(player)) {
+            // The silver thumb on Big Bento's 428px progress bar is 43px wide.
+            for(int x=10;x<435;x++) {
+                var pixel=frame.GetPixel(x,138);
+                if(pixel.R>210 && pixel.G>210 && pixel.B>210) return (x-10)/385.0;
+            }
+            return -1;
+        }
+    }
+    public string RowStatus { get; private set; }
+    public bool TopReportRow(IntPtr list,int start,int total,string title) {
+        Check(list);
+        int count=(int)Send(list,0x1004,0,0);
+        if(count!=total) {RowStatus="Loaded "+count+" of "+total+" rows.";return false;}
+        var guid=typeof(IAccessible).GUID; IAccessible rows;
+        if(AccessibleObjectFromWindow(list,0xfffffffc,ref guid,out rows)!=0) return false;
+        try {
+            var first=rows.get_accName(start+1);
+            if(first!=title) {RowStatus="Row "+start+" contains ["+first+"], expected ["+title+"].";return false;}
+            Send(list,0x1013,start,0);
+            int top=(int)Send(list,0x1027,0,0), x,y,w,h;
+            rows.accLocation(out x,out y,out w,out h,start+1);
+            if(top!=start) Send(list,0x1014,0,(start-top)*h);
+            top=(int)Send(list,0x1027,0,0);
+            if(top!=start) {RowStatus="Top row is "+top+", expected "+start+".";return false;}
+            var bounds=Rect(list);
+            var last=first;
+            for(int i=top;i<count;i++) {
+                rows.accLocation(out x,out y,out w,out h,i+1);
+                if(y>=bounds.Bottom) break;
+                last=rows.get_accName(i+1);
+                if(String.IsNullOrEmpty(last) || last.Trim(' ','\u2800','\u2060','\u200b').Length==0) {
+                    RowStatus="Unpopulated visible row at "+i+" following "+first+".";return false;
+                }
+            }
+            RowStatus="row "+(top+1)+" of "+count+", "+first+" through "+last;
+            return true;
+        } catch(ArgumentException) {return false;}
+        catch(COMException) {return false;}
+        finally {Marshal.ReleaseComObject(rows);}
     }
     public string FitPopulatedColumns(IntPtr list) {
         Check(list);
@@ -811,7 +859,7 @@ function Set-TrackEqualizer($song) {
         'soundtrack' {if ($song.artist -eq 'Jerry Martin') {'Live'} else {'Classical'};break}
         'folk|acoustic|ambient' {'Soft';break}
         'pop|indietronica' {'Pop';break}
-        default {'Flat'}
+        default {if ($song.artist -eq 'Scapegoat Wax') {'Party'} else {'Flat'}}
     }
     $curve=$factoryPresets[$preset]
     if ($curve.Count -ne 11) {throw "WACUP did not supply its $preset preset."}
@@ -853,15 +901,45 @@ function Start-PoseTrack($name) {
     try {[void](Wait-For {$ui.Send($main,0x400,0,105) -gt 0 -and $ui.Send($main,0x400,0,125) -eq $slot} 'decoder playback clock' 12)}
     catch {throw "Decoder stalled on $name (time $($ui.Send($main,0x400,0,105)), state $($ui.Send($main,0x400,0,104)), slot $($ui.Send($main,0x400,0,125)), track $($ui.Text($main)))."}
 }
-function Save-Shot($name,$only=[IntPtr]::Zero) {
-    $slot=[array]::IndexOf($shotOrder,$name)
-    Start-PoseTrack $name
-    $preset=Set-TrackEqualizer $pose.queue[$slot]
-    if ($visualizer -ne [IntPtr]::Zero -and $only -eq [IntPtr]::Zero) {
-        $visualPreset=$visualPresets[$slot%$visualPresets.Count]
-        Set-AnalyzerPreset $visualizer $visualPreset
+function Set-CapturePosition($name,$slot,$only,$visualPreset) {
+    $seconds=$seekPositions[$slot]
+    [void](Wait-For {$ui.Send($main,0x400,0,105) -gt 0 -and $ui.Send($main,0x400,0,125) -eq $slot} 'decoder playback clock')
+    $seekResult=$ui.Send($main,0x400,($seconds*1000),106)
+    try {
+        [void](Wait-For {
+            $ms=$ui.Send($main,0x400,0,105)
+            $ms -ge 1000*$seconds -and $ms -lt 1000*($seconds+2)
+        } 'assigned playback position' 8)
+    } catch {throw "Could not seek $name to ${seconds}s (result $seekResult, time $($ui.Send($main,0x400,0,105))ms, index $($ui.Send($main,0x400,0,125)), state $($ui.Send($main,0x400,0,104)), title $($ui.Text($main)))."}
+    if ($only -eq [IntPtr]::Zero -and !$classic) {
+        $duration=[double]$pose.queue[$slot].duration
+        $seekTimer=[Diagnostics.Stopwatch]::StartNew()
+        do {
+            $shown=if ($skin -eq 'Big Bento Modern') {$ui.BentoSeekFraction($layoutPlayer)} else {$ui.ClassicModernSeekFraction($layoutPlayer)}
+            $expected=$ui.Send($main,0x400,0,105)/(1000*$duration)
+            if ([Math]::Abs($shown-$expected) -lt 0.025) {break}
+            if ($seekTimer.Elapsed.TotalSeconds -gt 8) {throw "Seek thumb for $name shows $shown, expected $expected."}
+            Start-Sleep -Milliseconds 100
+        } while ($true)
     }
-    if ($name -in 'classic-modern-album-tracks','classic-modern-folder-contents','classic-modern-playlist-tracks') {
+    Start-Sleep -Milliseconds 250
+    if ($visualizer -ne [IntPtr]::Zero -and $only -eq [IntPtr]::Zero) {
+        [void](Wait-For {$ui.SpectrumMoving($ui.Root($visualizer))} "the $visualPreset spectrum to animate" 8)
+    }
+    return $seconds
+}
+function Save-Shot($name,$only=[IntPtr]::Zero) {
+    $welcomeShot=$name -eq 'classic-modern-welcome'
+    $slot=[array]::IndexOf($shotOrder,$name)
+    if (!$welcomeShot) {
+        Start-PoseTrack $name
+        $preset=Set-TrackEqualizer $pose.queue[$slot]
+        if ($visualizer -ne [IntPtr]::Zero -and $only -eq [IntPtr]::Zero) {
+            $visualPreset=$visualPresets[$slot%$visualPresets.Count]
+            Set-AnalyzerPreset $visualizer $visualPreset
+        }
+    }
+    if ($name -in 'classic-modern-album-tracks','classic-modern-playlist-tracks') {
         $ui.FitBackButton((Find-Form 1003))
     }
     if ($only -eq [IntPtr]::Zero) {
@@ -870,6 +948,21 @@ function Save-Shot($name,$only=[IntPtr]::Zero) {
             $list=$ui.Item($browser,1006)
             if ([CaptureWindows]::IsWindowVisible($ui.Item($browser,1043))) {$list=$ui.Item($browser,1043)}
             [void](Wait-For {$ui.Send($list,0x1004,0,0) -gt 1} "multiple visible search results for $name")
+        }
+        $section=switch ($name) {
+            'classic-modern-genres' {'genre'}
+            'classic-modern-album-artists' {'albumartist'}
+            'classic-modern-artists' {'artist'}
+            'classic-modern-tracks' {'song'}
+            'classic-modern-playlists' {'playlist'}
+            'classic-modern-playlist-tracks' {'playlistTracks'}
+        }
+        if ($section -and $pose.textWindows.$section) {
+            $view=$pose.textWindows.$section
+            $list=$ui.Item($browser,1006)
+            try {[void](Wait-For {$ui.TopReportRow($list,$view.start,$view.total,$view.first)} "the $section viewport" 45)}
+            catch {throw "$($_.Exception.Message) $($ui.RowStatus)"}
+            Write-Log "$name shows $($ui.RowStatus)"
         }
     }
     if ($name -match '(-albums|-favorites|-album-search|-olive-playback)$') {
@@ -915,6 +1008,13 @@ function Save-Shot($name,$only=[IntPtr]::Zero) {
             }
         }
     }
+    if ($only -eq [IntPtr]::Zero -and $browser) {
+        foreach ($list in $ui.Windows($browser)) {
+            if ($ui.Class($list) -ne 'SysListView32' -or ![CaptureWindows]::IsWindowVisible($list)) {continue}
+            $columns=$ui.FitPopulatedColumns($list)
+            if ($columns) {Write-Log "$name columns - $columns"}
+        }
+    }
     $focusField=switch ($name) {
         'classic-modern-welcome' {$ui.Item((Find-Form 1001),1001)}
         'add-server' {$ui.Item((Find-Form 1021),1021)}
@@ -926,43 +1026,21 @@ function Save-Shot($name,$only=[IntPtr]::Zero) {
     if ($only -ne [IntPtr]::Zero -and $focusFrame -ne $only) {throw "Unexpected focus target for $name."}
     $ui.FocusFrame($focusFrame,$focusField)
     # Let the skin return from its temporary EQ adjustment text to the song title.
-    Start-Sleep -Milliseconds 1800
+    if (!$welcomeShot) {Start-Sleep -Milliseconds 1800}
     if ($only -eq [IntPtr]::Zero) {
         [void](Wait-For {
             $unexpected = @(Get-Frames | Where-Object {!$placements.ContainsKey($_.ToInt64())})
             return $unexpected.Count -eq 0
         } 'WACUP track notification to close' 20)
     }
-    $seconds=$seekPositions[$slot]
-    [void](Wait-For {$ui.Send($main,0x400,0,105) -gt 0 -and $ui.Send($main,0x400,0,125) -eq $slot} 'decoder playback clock')
-    $seekResult=$ui.Send($main,0x400,($seconds*1000),106)
-    try {
-        [void](Wait-For {
-            $ms=$ui.Send($main,0x400,0,105)
-            $ms -ge 1000*$seconds -and $ms -lt 1000*($seconds+2)
-        } 'assigned playback position' 8)
-    } catch {throw "Could not seek $name to ${seconds}s (result $seekResult, time $($ui.Send($main,0x400,0,105))ms, index $($ui.Send($main,0x400,0,125)), state $($ui.Send($main,0x400,0,104)), title $($ui.Text($main)))."}
-    if ($only -eq [IntPtr]::Zero -and $skin -in 'Winamp Classic Modern','Olive') {
-        $duration=[double]$pose.queue[$slot].duration
-        $seekTimer=[Diagnostics.Stopwatch]::StartNew()
-        do {
-            $shown=$ui.ClassicModernSeekFraction($layoutPlayer)
-            $expected=$ui.Send($main,0x400,0,105)/(1000*$duration)
-            if ([Math]::Abs($shown-$expected) -lt 0.025) {break}
-            if ($seekTimer.Elapsed.TotalSeconds -gt 8) {throw "Seek thumb for $name shows $shown, expected $expected."}
-            Start-Sleep -Milliseconds 100
-        } while ($true)
-    }
-    Start-Sleep -Milliseconds 250
-    if ($visualizer -ne [IntPtr]::Zero -and $only -eq [IntPtr]::Zero) {
-        [void](Wait-For {$ui.SpectrumMoving($ui.Root($visualizer))} "the $visualPreset spectrum to animate" 8)
-    }
-    if ($only -eq [IntPtr]::Zero -and $browser) {
-        foreach ($list in $ui.Windows($browser)) {
-            if ($ui.Class($list) -ne 'SysListView32' -or ![CaptureWindows]::IsWindowVisible($list)) {continue}
-            $columns=$ui.FitPopulatedColumns($list)
-            if ($columns) {Write-Log "$name columns - $columns"}
+    if ($welcomeShot) {
+        if ($ui.Send($main,0x400,0,104) -ne 0 -or $ui.Send($main,0x400,0,124) -ne 0) {
+            throw 'Welcome needs a stopped player and an empty playlist.'
         }
+        $playbackStatus='stopped with an empty playlist'
+    } else {
+        $seconds=Set-CapturePosition $name $slot $only $visualPreset
+        $playbackStatus='playing '+$pose.queue[$slot].title+' at '+$seconds+'s, EQ '+$preset
     }
     $ui.CheckFocus($focusFrame,$focusField)
     [array]$frames = if ($only -ne [IntPtr]::Zero) { $only } else { Get-Frames }
@@ -1009,7 +1087,7 @@ function Save-Shot($name,$only=[IntPtr]::Zero) {
             }
         } finally { $g.Dispose() }
         $canvas.Save((Join-Path $shots ($name+'.png')),[Drawing.Imaging.ImageFormat]::Png)
-        Write-Log ("Captured $name ("+$bounds.Width+' x '+$bounds.Height+') playing '+$pose.queue[$slot].title+' at '+$seconds+'s, EQ '+$preset)
+        Write-Log ("Captured $name ("+$bounds.Width+' x '+$bounds.Height+') '+$playbackStatus)
     } finally { $canvas.Dispose() }
 
 }
@@ -1125,15 +1203,23 @@ function Search-Album {
 }
 function Set-DemoQueue {
     if ($ui.Send($main,0x400,0,124) -ne $pose.queue.Count) {
+        $ui.Post($main,0x111,40047,0)
+        [void](Wait-For {$ui.Send($main,0x400,0,104) -eq 0} 'stopped before assembling the library playlist')
         [void]$ui.Send($main,0x400,0,101)
-        Select-View 'Tracks'
-        $view=Wait-For {Find-Form 1003} 'track browser'
+        # Saving the first server rebuilds the navigation tree. Wait for its actual
+        # Tracks view before addressing the search field shared by every category.
+        $view=Wait-For {
+            if (!$ui.SelectTree($tree,'Tangerine Stream/Tracks')) {return}
+            $candidate=Find-Form 1003
+            if ($candidate -and $ui.Send($ui.Item($candidate,1006),0x1004,0,0) -eq $pose.textWindows.song.total) {return $candidate}
+        } 'the connected Tracks view' 150
         Command $view 1051
         for ($i=0;$i -lt $pose.queue.Count;++$i) {
             $song=$pose.queue[$i]
             $ui.SetText($ui.Item($view,1003),$song.title)
             Command $view 1004
-            [void](Wait-For {$ui.SelectListItem($ui.Item($view,1006),$song.title)} ('queue track '+$song.title))
+            try {[void](Wait-For {$ui.SelectListItem($ui.Item($view,1006),$song.title)} ('queue track '+$song.title))}
+            catch {throw "$($_.Exception.Message) Search field [$($ui.ControlText($ui.Item($view,1003)))], status [$($ui.ControlText($ui.Item($view,1013)))]."}
             Command $view 1010
             [void](Wait-For {$ui.Send($main,0x400,0,124) -eq $i+1} 'playlist enqueue')
             if ($shotOrder[$i] -eq 'classic-modern-offline-cache') {Command $view 1011}
@@ -1233,10 +1319,12 @@ show_art=0
         [IntPtr]$layoutPlayer=Set-Layout $skin
         if ($skin -eq 'Winamp Classic Modern') {
             $welcome = Wait-For { Find-Form 1001 } 'Add server button'
+            $ui.Post($main,0x111,40047,0)
             [void]$ui.Send($main,0x400,0,101)
-            foreach ($i in 0,1) {$ui.EnqueueFile($main,(New-Intro $i))}
-            [void](Wait-For {$ui.Send($main,0x400,0,124) -eq 2} 'two silent welcome tracks')
+            [void](Wait-For {$ui.Send($main,0x400,0,104) -eq 0 -and $ui.Send($main,0x400,0,124) -eq 0} 'stopped player and empty playlist')
             Save-Shot 'classic-modern-welcome'
+            $ui.EnqueueFile($main,(New-Intro 0))
+            [void](Wait-For {$ui.Send($main,0x400,0,124) -eq 1} 'the Add Server track')
             Start-PoseTrack 'add-server'
             $ui.Post($ui.Item($welcome,1001),0xf5,0,0)
             $settings = Wait-For { Find-Form 1021 } 'server settings'
@@ -1278,19 +1366,17 @@ show_art=0
             Command $form 1011
             Save-Shot 'classic-modern-album-tracks'
             foreach ($pair in @(@('Genres','genres'),@('Album Artists','album-artists'),@('Artists','artists'),@('Tracks','tracks'),
-                                 @('Folders','folders'),@('Playlists','playlists'))) {
+                                 @('Playlists','playlists'))) {
                 Save-Category $pair[0] ('classic-modern-'+$pair[1]) $true ($pair[0] -eq 'Playlists')
-                if ($pair[0] -eq 'Folders' -or ($pair[0] -eq 'Playlists' -and $pose.playlist)) {
+                if ($pair[0] -eq 'Playlists' -and $pose.playlist) {
                     $form=Wait-Library
-                    if ($pair[0] -eq 'Playlists') {
-                        $ui.SetText($ui.Item($form,1003),$pose.playlist); Command $form 1004
-                        [void](Wait-For {$ui.SelectListItem($ui.Item($form,1006),$pose.playlist)} 'the featured playlist')
-                    } else {Click-First $ui.Item($form,1006)}
+                    $ui.SetText($ui.Item($form,1003),$pose.playlist); Command $form 1004
+                    [void](Wait-For {$ui.SelectListItem($ui.Item($form,1006),$pose.playlist)} 'the featured playlist')
                     Command $form 1008
                     [void](Wait-For {$ui.ControlText($ui.Item($form,1013)).Contains('  |  ')} 'opened contents view')
                     Command $form 1051
                     [void](Wait-Library)
-                    Save-Shot $(if ($pair[0] -eq 'Folders') {'classic-modern-folder-contents'} else {'classic-modern-playlist-tracks'})
+                    Save-Shot 'classic-modern-playlist-tracks'
                 }
             }
             Save-Category 'Favorites' 'classic-modern-favorites' $false
@@ -1367,9 +1453,9 @@ function Invoke-Capture {
         $login = @{username=$demoUser;password=$demoPassword}|ConvertTo-Json
         $token = (Invoke-RestMethod -Method Post -Uri ($api+'/auth/login') -ContentType 'application/json' -Body $login).token
         $pose = Invoke-RestMethod ($api+'/api/pose') -Headers @{'x-nd-authorization'='Bearer '+$token}
-        $shotOrder=@('classic-modern-welcome','add-server','classic-modern-albums','classic-modern-album-search',
+        $shotOrder=@('add-server','classic-modern-albums','classic-modern-album-search',
             'classic-modern-album-tracks','classic-modern-genres','classic-modern-album-artists','classic-modern-artists',
-            'classic-modern-tracks','classic-modern-folders','classic-modern-folder-contents','classic-modern-playlists')
+            'classic-modern-tracks','classic-modern-playlists')
         if ($pose.playlist) {$shotOrder+='classic-modern-playlist-tracks'}
         $shotOrder+=@('classic-modern-favorites','classic-modern-filtered-tracks','edit-view-mode','edit-columns',
             'classic-modern-offline-cache','big-bento-modern-albums','wacup-classic-albums','classic-modern-olive-playback')
@@ -1384,6 +1470,9 @@ function Invoke-Capture {
             $seekPositions+=$position
         }
         foreach ($skin in 'Winamp Classic Modern','Big Bento Modern','WACUP Classic','Olive') { Pose-Player $skin }
+        $captured=@(Get-ChildItem -LiteralPath $shots -File -Filter '*.png' | ForEach-Object BaseName)
+        $expected=@('classic-modern-welcome')+$shotOrder
+        if (Compare-Object $expected $captured) {throw 'The captured PNGs do not match the requested gallery.'}
     } finally {
         if (!$server.HasExited) {$server.Kill(); $server.WaitForExit()}
         $server.Dispose()
@@ -1427,9 +1516,11 @@ function Publish-Gallery {
             if (Test-Path -LiteralPath $output) {[IO.File]::Replace($inputFile,$output,(Join-Path $backup $file.Name))}
             else {[IO.File]::Move($inputFile,$output)}
         }
-        $optional='classic-modern-playlist-tracks.png'
-        if ($optional -notin $files.Name -and (Test-Path -LiteralPath (Join-Path $gallery $optional))) {
-            [IO.File]::Move((Join-Path $gallery $optional),(Join-Path $backup $optional))
+        foreach ($retired in 'layouts.png','classic-modern-folders.png','classic-modern-folder-contents.png','classic-modern-folder-contents-library.png',
+                              'classic-modern-folders-library.png','classic-modern-playlist-tracks.png') {
+            if ($retired -notin $files.Name -and (Test-Path -LiteralPath (Join-Path $gallery $retired))) {
+                [IO.File]::Move((Join-Path $gallery $retired),(Join-Path $backup $retired))
+            }
         }
         [IO.File]::WriteAllText((Join-Path $publishDir 'complete'),'ok')
     } finally {Restore-Publish}

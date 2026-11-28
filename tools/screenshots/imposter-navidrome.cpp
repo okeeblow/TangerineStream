@@ -63,35 +63,36 @@ public:
         const auto& list=where->second;
         const auto needle=lower(filter);
         std::string result="[";
-        int matching=0, emitted=0;
+        int emitted=0, index=0;
         auto append=[&](const std::string& object){
             if (emitted++) result+=',';
             result+=object;
         };
+        // Two counts stand in for the unphotographed rows. Expand only the requested page.
+        auto padTo=[&](int end,bool leading) {
+            for (int i=std::max(index,start);i<end && emitted<count;++i) {
+                const std::string blank=leading?" ":"\xe2\xa0\x80"; // U+2800 sorts after the visible titles.
+                if (name=="genre") {
+                    // OpenSubsonic uses the genre label itself as its key.
+                    std::string label=blank;
+                    for(unsigned bits=i+1;bits;bits>>=1) label+=bits&1?"\xe2\x80\x8b":"\xe2\x81\xa0";
+                    append("{"+property("value",jsonString(label))+"}");
+                } else {
+                    auto id=jsonString("padding-"+name+"-"+std::to_string(i));
+                    auto plays=leading && name=="album" ? ",\"playCount\":2147483647" : "";
+                    append("{"+property("id",id)+","+property("name",jsonString(blank))+","+property("title",jsonString(blank))+plays+"}");
+                }
+            }
+            index=end;
+        };
+        if (needle.empty()) padTo(list.leadingBlanks,true);
         for (const auto& key:list.members) {
             const auto& item=fixture_.objects.at(key);
             if (!needle.empty() && lower(item.name).find(needle)==std::string::npos) continue;
-            if (matching++>=start && emitted<count) append(item.data);
+            if (index++>=start && emitted<count) append(item.data);
         }
-        int total=needle.empty()?list.total:matching;
-        const int leadingBlanks=name=="album" ? std::stoi(pose("albumLeadingBlanks")) : 0;
-        // Unseen objects share one empty representation on disk (the remaining count).
-        // Distinct wire IDs keep paginated rows distinct in the plug-in's own catalog.
-        for (int i=std::max(matching,start);i<total && emitted<count;++i) {
-            // U+2800 is visibly blank and sorts after names in Windows' library collation.
-            const std::string blank="\xe2\xa0\x80";
-            if (name=="genre") {
-                // OpenSubsonic uses the genre label itself as its key.
-                std::string label=blank;
-                for(unsigned bits=i+1;bits;bits>>=1) label+=bits&1?"\xe2\x80\x8b":"\xe2\x81\xa0";
-                append("{"+property("value",jsonString(label))+"}");
-            } else {
-                auto id=jsonString("padding-"+name+"-"+std::to_string(i));
-                auto higherRank=i-matching<leadingBlanks ? ",\"playCount\":2147483647" : "";
-                append("{"+property("id",id)+","+property("name",jsonString(blank))+","+property("title",jsonString(blank))+higherRank+"}");
-            }
-        }
-        if (totalOut) *totalOut=total;
+        if (needle.empty()) padTo(list.total,false);
+        if (totalOut) *totalOut=index;
         return result+"]";
     }
     std::string object(const std::string& kind,const std::string& id) {
@@ -222,7 +223,7 @@ void serve(const std::filesystem::path& file,const std::string& user,const std::
             property("song",jsonString(catalog.pose("song")))+","+property("playlist",jsonString(catalog.pose("playlist")))+","+
             property("albums",std::to_string(catalog.total("album")))+","+property("filter",jsonString(catalog.pose("filter")))+","+
             property("albumStart",catalog.pose("albumStart"))+","+property("albumShowcase",catalog.list("album-showcase",0,INT_MAX))+","+
-            property("bentoSeek",catalog.pose("bentoSeek"))+","+
+            property("bentoSeek",catalog.pose("bentoSeek"))+","+property("textWindows",catalog.pose("textWindows"))+","+
             property("albumQuery",jsonString(catalog.pose("albumQuery")))+","+property("albumMatches",std::to_string(catalog.total("album-search")))+","+
             property("favoriteAlbums",catalog.list("starred/album",0,INT_MAX))+","+
             property("queue",catalog.queue())+"}");
