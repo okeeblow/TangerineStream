@@ -414,6 +414,7 @@ public sealed class CaptureWindows
     public string CoverStatus { get; private set; }
     public int FullCovers { get; private set; }
     public int CoversAcross { get; private set; }
+    public double BottomArtworkFraction { get; private set; }
     public bool TopAlbum(IntPtr list,int index) {
         Check(list);
         var guid=typeof(IAccessible).GUID; IAccessible acc;
@@ -437,7 +438,8 @@ public sealed class CaptureWindows
         if(AccessibleObjectFromWindow(list,0xfffffffc,ref guid,out acc)!=0) return false;
         try {
             var box=Rect(list);
-            int checkedTiles=0; FullCovers=0; CoversAcross=0;
+            int checkedTiles=0, bottomRow=Int32.MinValue;
+            FullCovers=0; CoversAcross=0; BottomArtworkFraction=0;
             var rowCounts=new Dictionary<int,int>();
             int background=(int)Send(list,0x1000,0,0), ink=(int)Send(list,0x1023,0,0);
             var paper=background==-1 ? SystemColors.Window : ColorTranslator.FromWin32(background);
@@ -473,6 +475,10 @@ public sealed class CaptureWindows
                     int across; rowCounts.TryGetValue(y,out across);
                     rowCounts[y]=++across;
                     CoversAcross=Math.Max(CoversAcross,across);
+                    if(y>bottomRow) {
+                        bottomRow=y;
+                        BottomArtworkFraction=Math.Min(1,(box.Height-y)/(double)Math.Min(w,h));
+                    }
                     if(y>=0 && y+h<=box.Height) FullCovers++;
                 }
             }
@@ -853,7 +859,11 @@ function Save-Shot($name,$only=[IntPtr]::Zero) {
         }
         try {[void](Wait-For {$ui.CoversPainted($ui.Item($view,1006),$allowed,$firstIndex)} 'all visible covers to paint' 35)}
         catch {throw "$($_.Exception.Message) $($ui.CoverStatus)"}
-        if ($name -eq 'classic-modern-olive-playback' -and $ui.CoversAcross -ne 6) {throw 'The Olive layout must fit six 200px covers across.'}
+        if ($name -eq 'classic-modern-olive-playback') {
+            if ($ui.CoversAcross -ne 6 -or $ui.FullCovers -ne 12 -or [Math]::Abs($ui.BottomArtworkFraction-0.77) -gt 0.045) {
+                throw ("Olive shows "+$ui.CoversAcross+" covers across, "+$ui.FullCovers+" complete, and "+$ui.BottomArtworkFraction.ToString('P0')+" of the bottom covers.")
+            }
+        }
         if ($name -eq 'big-bento-modern-albums') {
             if ($ui.FullCovers -le 4) {throw 'Big Bento must show more than four complete album tiles.'}
             $reference=Join-Path $run 'now-playing-cover.jpg'
@@ -977,7 +987,7 @@ function Set-ModernProfile($profile,$skin) {
     $windows = if ($olive) {
         @(@('main','Main Window','normal','32,32,550,243'),
           @('PLEdit','Playlist Editor','normalpl','32,275,550,246'),
-          @('MLibrary','Media Library','normal','32,521,1500,462'),
+          @('MLibrary','Media Library','normal','32,521,1500,784'),
           @('winamp.albumart','Album Art','normal','1072,32,460,489'),
           @('resizable_nostatus','Lyrics','resizable_nostatus','582,32,490,489'))
     } else {
@@ -1042,7 +1052,7 @@ function Set-Layout($skin) {
         $art = Wait-For { Get-Frame 'Album Art' } 'Album Art window'
         Place $lyrics ($x+550) $y 490 489
         Place $art ($x+1040) $y 460 489
-        Place $library $x ($y+489) 1500 462
+        Place $library $x ($y+489) 1500 784
     } else {
         $right = $x+$playerSize.Width
         $width = 1100

@@ -6,7 +6,7 @@
 namespace demo {
 namespace {
 constexpr char origin[] = "https://music.cooltrainer.org";
-constexpr int coverTiles = 12;
+constexpr int visibleFavoriteCovers = 18; // six columns and three visible rows in the Olive layout
 constexpr int listRows = 23; // visible rows including the partial bottom row of the Classic Modern library
 
 struct Document {
@@ -209,7 +209,7 @@ public:
         std::stable_sort(favoriteAlbums.begin(), favoriteAlbums.end(), [&](const Entry& a, const Entry& b) {
             return songCount(a) > songCount(b);
         });
-        for (size_t i = 0; i < std::min<size_t>(coverTiles,favoriteAlbums.size()); ++i) wantCover(favoriteAlbums[i]);
+        for (size_t i = 0; i < std::min<size_t>(visibleFavoriteCovers,favoriteAlbums.size()); ++i) wantCover(favoriteAlbums[i]);
         Document genreDoc(source_.sub("getGenres"));
         auto genres = rows(genreDoc.root["genres"].value(),"genre");
         std::vector<Entry> sortedGenres;
