@@ -1,4 +1,5 @@
 #include "host/legacy/skin.hpp"
+#include "ui/list_scroll.hpp"
 #include <algorithm>
 #include <memory>
 #include <string>
@@ -9,6 +10,7 @@ namespace tangerine {
 namespace {
 constexpr UINT_PTR skinSubclass = 0x54534b49;
 const UINT applySkin = RegisterWindowMessageW(L"Tangerine Stream.ApplyLegacySkin");
+const UINT restoreScrollStyles = RegisterWindowMessageW(L"Tangerine Stream.RestoreLegacyScrollStyles");
 
 struct ControlSkin { HWND window; UINT type; LRESULT handle = 0; bool applied = false; };
 struct DialogSkin {
@@ -17,6 +19,7 @@ struct DialogSkin {
     INT_PTR (*dialogMessage)(HWND, UINT, WPARAM, LPARAM);
     HBITMAP buttons = nullptr;
     std::vector<ControlSkin> controls;
+    bool scrollStylesPending = false;
 
     ~DialogSkin() { if (buttons) DeleteObject(buttons); }
     void loadButtons() {
@@ -176,14 +179,39 @@ LRESULT CALLBACK comboProc(HWND window, UINT msg, WPARAM w, LPARAM l, UINT_PTR i
     return result;
 }
 
+LRESULT CALLBACK listPaintProc(HWND list, UINT msg, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR data) {
+    auto& skin = *reinterpret_cast<DialogSkin*>(data);
+    if (msg == WM_ERASEBKGND && !skin.scrollStylesPending)
+        skin.scrollStylesPending = PostMessageW(GetParent(list), restoreScrollStyles, 0, 0) != FALSE;
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(list, listPaintProc, id);
+    return DefSubclassProc(list, msg, w, l);
+}
+
 LRESULT CALLBACK dialogProc(HWND window, UINT msg, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR data) {
     auto& skin = *reinterpret_cast<DialogSkin*>(data);
+    if (msg == restoreScrollStyles) {
+        skin.scrollStylesPending = false;
+        // CoolSB clears the native styles to paint its own bars. Windows
+        // checks these bits between paints when routing precision touchpad pans.
+        for (const auto& control : skin.controls) {
+            if (control.type != SKINNEDWND_TYPE_LISTVIEW || !control.handle) continue;
+            const auto list = control.window;
+            const auto style = GetWindowLongPtrW(list, GWL_STYLE);
+            const auto bars = (listCanScroll(list, SB_VERT) ? WS_VSCROLL : 0) |
+                              (listCanScroll(list, SB_HORZ) ? WS_HSCROLL : 0);
+            const auto updated = (style & ~(WS_VSCROLL | WS_HSCROLL)) | bars;
+            if (updated != style) SetWindowLongPtrW(list, GWL_STYLE, updated);
+        }
+        return 0;
+    }
     if (msg == applySkin) {
         // CoolSB replaces GWLP_WNDPROC. Install it after our common-controls
         // subclasses, so unskinning restores a live chain instead of leaving
         // DefSubclassProc pointing at an already freed CoolSB instance.
         for (auto& control : skin.controls) if (!control.applied && IsWindow(control.window)) {
             control.applied = true;
+            if (control.type == SKINNEDWND_TYPE_LISTVIEW)
+                SetWindowSubclass(control.window, listPaintProc, skinSubclass, data);
             const auto command = control.type == SKINNEDWND_TYPE_LISTVIEW ? ML_IPC_SKIN_LISTVIEW : ML_IPC_SKIN_COMBOBOX;
             control.handle = skin.send(command, reinterpret_cast<WPARAM>(control.window));
             if (control.handle <= 1) control.handle = 0;

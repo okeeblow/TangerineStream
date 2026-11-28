@@ -12,10 +12,6 @@
 namespace tangerine {
 namespace {
 
-bool scrollable(const SCROLLINFO& info) {
-    return info.nPage && static_cast<long long>(info.nMax) - info.nMin + 1 > info.nPage;
-}
-
 struct ListScroll {
     HWND list;
     int wheelRemainder = 0;
@@ -112,17 +108,22 @@ LRESULT CALLBACK listProc(HWND list, UINT msg, WPARAM w, LPARAM l, UINT_PTR id, 
 
 } // namespace
 
+bool listCanScroll(HWND list, int bar) {
+    SCROLLINFO info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SIF_RANGE | SIF_PAGE;
+    return GetScrollInfo(list, bar, &info) && info.nPage &&
+           static_cast<long long>(info.nMax) - info.nMin + 1 > info.nPage;
+}
+
 int listViewportWidth(HWND list) {
     RECT client{}, outer{};
     GetClientRect(list, &client);
     GetWindowRect(list, &outer);
-    SCROLLINFO vertical{};
-    vertical.cbSize = sizeof(vertical);
-    vertical.fMask = SIF_RANGE | SIF_PAGE;
     // SysListView32 calculates its page with system metrics. WACUP may
     // paint a narrower scrollbar in that same window.
     int width = outer.right - outer.left;
-    if (GetScrollInfo(list, SB_VERT, &vertical) && scrollable(vertical))
+    if (listCanScroll(list, SB_VERT))
         width -= systemMetricForDpi(SM_CXVSCROLL, windowDpi(list));
     return std::max(0, std::min<int>(client.right, width));
 }
