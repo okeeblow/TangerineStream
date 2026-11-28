@@ -129,13 +129,17 @@ void showError(HWND window, const std::exception& error) {
     MessageBoxW(window, wide(error.what()).c_str(), pluginName, MB_OK | MB_ICONERROR);
 }
 
-std::string getText(HWND dialog, int item) {
+std::wstring dialogText(HWND dialog, int item) {
     auto control = GetDlgItem(dialog, item);
     int length = GetWindowTextLengthW(control);
     std::wstring text(length + 1, L'\0');
     auto written = GetWindowTextW(control, text.data(), length + 1);
     text.resize(written);
-    return utf8(text);
+    return text;
+}
+
+std::string getText(HWND dialog, int item) {
+    return utf8(dialogText(dialog, item));
 }
 
 struct Navigation {
@@ -1340,7 +1344,7 @@ public:
             MLSkinnedDivider_SetCallback(divider, dividerMoved, reinterpret_cast<LPARAM>(this));
         }
         skinWindow(GetDlgItem(hwnd, IDC_QUERY), SKINNEDWND_TYPE_EDIT, SWES_VCENTER);
-        for (int id : {IDC_SEARCH_LABEL, IDC_STATUS})
+        for (int id : {IDC_SEARCH_LABEL, IDC_STATUS, IDC_WELCOME_TEXT})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_STATIC);
         for (int id : {IDC_SORT_MENU, IDC_VIEW_OPTIONS, IDC_SOURCE_MENU, IDC_ADD_SERVER, IDC_BACK, IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_CACHE_MENU})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_BUTTON);
@@ -1358,7 +1362,6 @@ public:
         }
         preferredCoverSize = app->store.coverSize();
         tileSize = preferredCoverSize ? preferredCoverSize : automaticCoverSize();
-        SetTimer(hwnd, viewTimer, 2000, nullptr);
         SendDlgItemMessageW(hwnd, IDC_QUERY, EM_SETLIMITTEXT, 256, 0);
     }
     ~View() {
@@ -1586,10 +1589,24 @@ const Server* View::selected() const {
 }
 
 void View::populateServers() {
+    const bool wasWelcome = servers.empty();
+    const bool hadFocus = IsChild(hwnd, GetFocus());
     servers = app->store.servers();
+    const bool welcome = servers.empty();
+    if (welcome) {
+        KillTimer(hwnd, viewTimer);
+        for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+            const int id = GetDlgCtrlID(child);
+            if (id != IDC_WELCOME_TEXT && id != IDC_ADD_SERVER) ShowWindow(child, SW_HIDE);
+        }
+    } else SetTimer(hwnd, viewTimer, 2000, nullptr);
+    for (int id : {IDC_WELCOME_TEXT, IDC_ADD_SERVER})
+        ShowWindow(GetDlgItem(hwnd, id), welcome ? SW_SHOWNA : SW_HIDE);
     currentServer = treeServer ? treeServer : app->selectedServer;
     if (!selected()) currentServer = servers.empty() ? 0 : servers.front().id;
     resetLocation();
+    if (hadFocus && wasWelcome != welcome)
+        SetFocus(welcome ? GetDlgItem(hwnd, IDC_ADD_SERVER) : list);
 }
 
 void View::resetLocation() {
@@ -1619,12 +1636,18 @@ void View::resetContent() {
     projection = {};
     projectionSource.reset();
     filterSelection = {};
-    options = readViewOptions(location.kind, app->store.viewSettings(location.kind), app->store.textCatalog());
     items.clear();
     tracks.clear();
     knownItems.clear();
     knownTracks.clear();
     resetImages();
+    if (servers.empty()) {
+        RECT bounds{};
+        GetClientRect(hwnd, &bounds);
+        layout(bounds.right, bounds.bottom);
+        return;
+    }
+    options = readViewOptions(location.kind, app->store.viewSettings(location.kind), app->store.textCatalog());
     order = defaultSort(sourceKind());
     descending = order.descending;
     auto saved = sourceKind() == location.kind ? app->store.browseOrder(location.kind) : options.trackSort;
@@ -2394,9 +2417,9 @@ void View::updateSelection() {
 
 void View::updateStatus() {
     auto server = selected();
+    if (!server) return;
     std::wstring status;
-    if (!server) status = L"Add a Navidrome or OpenSubsonic server to get started.";
-    else if ((loading || more || projecting) && !ListView_GetItemCount(list)) {
+    if ((loading || more || projecting) && !ListView_GetItemCount(list)) {
         const auto loaded = items.size() + tracks.size();
         status = loaded ? L"Loading... " + std::to_wstring(loaded) : L"Loading...";
     }
@@ -2661,6 +2684,10 @@ void View::popup(int button) {
 }
 
 void View::command(int id, int notification) {
+    if (servers.empty()) {
+        if (id == IDC_ADD_SERVER) configure(hwnd, 0, true);
+        return;
+    }
     if (id >= static_cast<int>(allServersCommand)) {
         const auto index = static_cast<size_t>(id - allServersCommand);
         if (index <= servers.size()) selectCategory(category, index ? servers[index - 1].id : 0);
@@ -2678,7 +2705,6 @@ void View::command(int id, int notification) {
     }
     switch (id) {
     case directionCommand: chooseOrder(order, !descending); break;
-    case IDC_ADD_SERVER: configure(hwnd, currentServer, true); break;
     case IDC_SORT_MENU: case IDC_VIEW_OPTIONS: case IDC_SOURCE_MENU: case IDC_CACHE_MENU: popup(id); break;
     case IDC_QUERY:
         if (notification == EN_CHANGE) SetTimer(hwnd, searchTimer, 300, nullptr);
@@ -2823,7 +2849,36 @@ void CALLBACK View::dividerMoved(HWND, INT, LPARAM param) {
     SetTimer(view.hwnd, splitTimer, 200, nullptr);
 }
 
+void layoutWelcome(HWND hwnd, int width, int height) {
+    const HWND label = GetDlgItem(hwnd, IDC_WELCOME_TEXT);
+    const auto message = dialogText(hwnd, IDC_WELCOME_TEXT);
+    HDC dc = GetDC(label);
+    auto previous = SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(label, WM_GETFONT, 0, 0)));
+    TEXTMETRICW metrics{};
+    GetTextMetricsW(dc, &metrics);
+    const int line = std::max(1L, metrics.tmHeight);
+    const int inset = std::min(line / 2, width / 4);
+    const int textWidth = std::min<int>(width - 2 * inset, 60 * std::max(1L, metrics.tmAveCharWidth));
+    RECT text{0, 0, textWidth, 0};
+    DrawTextW(dc, message.c_str(), -1, &text, DT_CALCRECT | DT_WORDBREAK | DT_CENTER | DT_NOPREFIX);
+    SelectObject(dc, previous);
+    ReleaseDC(label, dc);
+
+    const int top = line / 4;
+    const int buttonWidth = std::min(textWidth, 11 * line);
+    const int buttonHeight = std::min(height, std::clamp<int>(height - top - text.bottom - line, line * 2, line * 7 / 2));
+    const int buttonY = std::min<int>(top + text.bottom + line, height - buttonHeight);
+    SetWindowPos(label, nullptr, (width - textWidth) / 2, top, textWidth,
+                 std::max(0, buttonY - top), SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(GetDlgItem(hwnd, IDC_ADD_SERVER), nullptr, (width - buttonWidth) / 2, buttonY,
+                 buttonWidth, buttonHeight, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 void View::layout(int width, int height) {
+    if (servers.empty()) {
+        layoutWelcome(hwnd, width, height);
+        return;
+    }
     const int dpi = windowDpi(hwnd);
     const int gap = std::max(1, MulDiv(3, dpi, 96));
     HDC dc = GetDC(hwnd);
@@ -2840,7 +2895,7 @@ void View::layout(int width, int height) {
     };
     auto move = [&](int id, int x, int y, int w, int h) {
         SetWindowPos(GetDlgItem(hwnd, id), nullptr, x, y, std::max(0, w), std::max(0, h),
-                     SWP_NOACTIVATE | SWP_NOZORDER);
+                     SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
     };
     auto visible = [&](int id, bool show) { ShowWindow(GetDlgItem(hwnd, id), show ? SW_SHOWNA : SW_HIDE); };
     int left = gap;
@@ -2923,7 +2978,6 @@ void View::layout(int width, int height) {
         visible(id, show);
         if (show) place(id, footer, 10);
     };
-    action(IDC_ADD_SERVER, !currentServer);
     action(IDC_PLAY, currentServer && (showTracks() || albumActions() || preview));
     action(IDC_ENQUEUE, currentServer && (showTracks() || albumActions() || preview));
     action(IDC_OPEN, currentServer && !showTracks());
@@ -3012,11 +3066,14 @@ void View::resizeColumns() {
 }
 
 LRESULT CALLBACK searchProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR view) {
-    if (msg == WM_GETDLGCODE && (w == VK_F2 || w == VK_F5 || (w == VK_RETURN && GetDlgCtrlID(hwnd) == IDC_QUERY)))
-        return DefSubclassProc(hwnd, msg, w, l) | DLGC_WANTMESSAGE;
-    if (msg == WM_KEYDOWN && (w == VK_F2 || w == VK_F5 || (w == VK_RETURN && GetDlgCtrlID(hwnd) == IDC_QUERY))) {
-        SendMessageW(reinterpret_cast<HWND>(view), WM_COMMAND, w == VK_F2 ? IDC_EDIT_VIEW : IDC_SEARCH, 0);
-        return 0;
+    if (msg == WM_GETDLGCODE || msg == WM_KEYDOWN) {
+        const int id = GetDlgCtrlID(hwnd);
+        if (w == VK_F2 || w == VK_F5 || (w == VK_RETURN && (id == IDC_QUERY || id == IDC_ADD_SERVER))) {
+            if (msg == WM_GETDLGCODE) return DefSubclassProc(hwnd, msg, w, l) | DLGC_WANTMESSAGE;
+            const int command = w == VK_RETURN && id == IDC_ADD_SERVER ? id : (w == VK_F2 ? IDC_EDIT_VIEW : IDC_SEARCH);
+            SendMessageW(reinterpret_cast<HWND>(view), WM_COMMAND, command, 0);
+            return 0;
+        }
     }
     return DefSubclassProc(hwnd, msg, w, l);
 }
