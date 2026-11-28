@@ -78,7 +78,8 @@ public:
     std::filesystem::path partialPath(Id key) const;
     bool reserve(Id key, std::int64_t bytes, bool upgrade);
     bool growReservation(Id key, std::int64_t bytes);
-    bool publish(Id key, std::int64_t bytes, const std::string& format);
+    bool publish(Id key, std::int64_t bytes, const std::string& format, std::filesystem::path& file,
+                 HANDLE* playbackLease = nullptr);
     void release(Id key);
     void touch(Id key);
     void trim();

@@ -1,10 +1,14 @@
 #include "input_bridge.hpp"
 #include "tangerine_product.h"
 #include <algorithm>
+#include <array>
 #include <climits>
+#include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 #include <Winamp/in2.h>
 
@@ -21,14 +25,46 @@
 namespace {
 using tangerine::InputRequest;
 In_Module input{};
-HANDLE lease = INVALID_HANDLE_VALUE;
 std::mutex nameMutex;
 std::wstring current;
 int duration = -1;
 In_Module* nativePlayer = nullptr;
 Out_Module* previousOutput = nullptr;
-std::wstring nativeSource;
 std::string ansiSource;
+bool paused = false;
+int pendingSeek = -1, volume = -1, pan = 0;
+int equalizerEnabled = 0, equalizerPreamp = 0;
+std::array<char, 10> equalizerBands{};
+bool haveEqualizer = false;
+
+struct AudioFile {
+    std::vector<wchar_t> path = std::vector<wchar_t>(32768);
+    HANDLE lease = INVALID_HANDLE_VALUE;
+    tangerine::SourceAttempts attempts;
+    ~AudioFile() {
+        if (lease != INVALID_HANDLE_VALUE) CloseHandle(lease);
+        if (attempts.temporary && path.front()) DeleteFileW(path.data());
+    }
+};
+std::unique_ptr<AudioFile> playingFile;
+
+struct Download {
+    std::wstring filename;
+    unsigned excluded;
+    UINT_PTR serial;
+    HANDLE cancel = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ~Download() { if (cancel) CloseHandle(cancel); }
+};
+std::mutex downloadMutex;
+std::condition_variable downloadReady;
+std::shared_ptr<Download> loading, queued;
+std::unique_ptr<AudioFile> completed;
+std::thread downloader;
+bool shuttingDown = false;
+UINT_PTR serial = 0;
+HWND receiver = nullptr;
+constexpr wchar_t receiverClass[] = L"TangerineStream.InputPlayback";
+constexpr UINT fileReadyMessage = WM_APP + 1;
 
 In_Module* selectInput(const wchar_t* source) {
     auto* module = reinterpret_cast<In_Module*>(SendMessageW(input.hMainWindow, WM_WA_IPC,
@@ -44,7 +80,7 @@ int query(InputRequest op, const wchar_t* filename, const wchar_t* field = nullp
     if (!marker && name.substr(0, 17) != L"http://127.0.0.1:") return 0;
     HMODULE library = nullptr;
     if (!GetModuleHandleExW(0, L"ml_tangerinestream.dll", &library)) return 0;
-    auto address = reinterpret_cast<void*>(GetProcAddress(library, "tangerineInputQueryV2"));
+    auto address = reinterpret_cast<void*>(GetProcAddress(library, "tangerineInputQueryV3"));
     auto fn = reinterpret_cast<tangerine::InputQuery>(address);
     int result = fn ? fn(op, filename, field, value, capacity, file, attempts) : 0;
     FreeLibrary(library);
@@ -71,16 +107,20 @@ void getFileInfo(const wchar_t* filename, wchar_t* title, int* length) {
 }
 
 void stop() {
+    {
+        std::scoped_lock lock(downloadMutex);
+        if (loading) SetEvent(loading->cancel);
+        loading.reset();
+        queued.reset();
+        completed.reset();
+    }
     if (nativePlayer) {
         nativePlayer->Stop();
         nativePlayer->outMod = previousOutput;
         nativePlayer = nullptr;
     }
-    SecureZeroMemory(nativeSource.data(), nativeSource.size() * sizeof(wchar_t));
-    nativeSource.clear();
-    SecureZeroMemory(ansiSource.data(), ansiSource.size());
     ansiSource.clear();
-    if (lease != INVALID_HANDLE_VALUE) { CloseHandle(lease); lease = INVALID_HANDLE_VALUE; }
+    playingFile.reset();
     std::wstring finished;
     {
         std::scoped_lock lock(nameMutex);
@@ -89,6 +129,8 @@ void stop() {
     query(InputRequest::ended, finished.c_str());
     input.is_seekable = 0;
     duration = -1;
+    pendingSeek = -1;
+    paused = false;
 }
 
 // WACUP selects the input module for the real audio source. It drives the
@@ -96,8 +138,7 @@ void stop() {
 bool playNative(const wchar_t* source) {
     auto* module = selectInput(source);
     if (!module || !module->Play || !module->Stop) return false;
-    nativeSource = source;
-    const wchar_t* name = nativeSource.c_str();
+    const wchar_t* name = source; // playingFile owns the path until the decoder stops.
     if (!(module->version & IN_UNICODE)) {
         int n = WideCharToMultiByte(CP_ACP, 0, name, -1, nullptr, 0, nullptr, nullptr);
         if (n <= 0) return false;
@@ -117,6 +158,91 @@ bool playNative(const wchar_t* source) {
     return false;
 }
 
+void downloadLoop() {
+    for (;;) {
+        std::shared_ptr<Download> job;
+        {
+            std::unique_lock lock(downloadMutex);
+            downloadReady.wait(lock, [] { return shuttingDown || queued; });
+            if (shuttingDown) return;
+            job = std::move(queued);
+        }
+        std::unique_ptr<AudioFile> file;
+        try {
+            file = std::make_unique<AudioFile>();
+            file->attempts.excluded = job->excluded;
+            file->attempts.cancel = job->cancel;
+            if (query(InputRequest::fetch, job->filename.c_str(), nullptr, file->path.data(), file->path.size(),
+                      &file->lease, &file->attempts) != tangerine::fileReady) file.reset();
+        } catch (...) { file.reset(); }
+        std::scoped_lock lock(downloadMutex);
+        if (loading == job) {
+            completed = std::move(file);
+            PostMessageW(receiver, fileReadyMessage, job->serial, 0);
+        }
+    }
+}
+
+bool startFile(std::unique_ptr<AudioFile>& file) {
+    if (!playNative(file->path.data())) return false;
+    playingFile = std::move(file);
+    if (volume >= 0 && nativePlayer->SetVolume) nativePlayer->SetVolume(volume);
+    if (nativePlayer->SetPan) nativePlayer->SetPan(pan);
+    if (haveEqualizer && nativePlayer->EQSet) nativePlayer->EQSet(equalizerEnabled, equalizerBands.data(), equalizerPreamp);
+    if (pendingSeek >= 0 && input.is_seekable && nativePlayer->SetOutputTime) nativePlayer->SetOutputTime(pendingSeek);
+    pendingSeek = -1;
+    if (paused && nativePlayer->Pause) nativePlayer->Pause();
+    return true;
+}
+
+bool queueDownload(const std::wstring& filename, unsigned excluded);
+LRESULT CALLBACK receiverProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
+    if (msg != fileReadyMessage) return DefWindowProcW(hwnd, msg, w, l);
+    std::unique_ptr<AudioFile> file;
+    std::shared_ptr<Download> job;
+    {
+        std::scoped_lock lock(downloadMutex);
+        if (!loading || loading->serial != w) return 0;
+        job = std::move(loading);
+        file = std::move(completed);
+    }
+    try {
+        if (file) {
+            if (startFile(file)) return 0;
+            if (file->attempts.excluded != job->excluded && queueDownload(job->filename, file->attempts.excluded))
+                return 0;
+        }
+    } catch (...) {}
+    // Already on WACUP's thread. Advance this item before a later Play can replace it.
+    SendMessageW(input.hMainWindow, WM_WA_MPEG_EOF, 0, 0);
+    return 0;
+}
+
+bool queueDownload(const std::wstring& filename, unsigned excluded) {
+    if (!receiver) {
+        WNDCLASSW cls{};
+        cls.lpfnWndProc = receiverProc;
+        cls.hInstance = input.hDllInstance;
+        cls.lpszClassName = receiverClass;
+        if (!RegisterClassW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+        receiver = CreateWindowExW(0, receiverClass, nullptr, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, cls.hInstance, nullptr);
+        if (!receiver) return false;
+    }
+    auto job = std::make_shared<Download>();
+    if (!job->cancel) return false;
+    job->filename = filename;
+    job->excluded = excluded;
+    job->serial = ++serial;
+    {
+        std::scoped_lock lock(downloadMutex);
+        if (!downloader.joinable()) downloader = std::thread(downloadLoop);
+        loading = queued = std::move(job);
+    }
+    input.is_seekable = 1; // Remember a seek made while the file is buffering.
+    downloadReady.notify_one();
+    return true;
+}
+
 int play(const wchar_t* filename) {
     stop();
     try {
@@ -125,24 +251,28 @@ int play(const wchar_t* filename) {
             std::scoped_lock lock(nameMutex);
             current = filename;
         }
-        std::vector<wchar_t> source(32768);
-        tangerine::SourceAttempts attempts;
         getFileInfo(filename, nullptr, &duration);
-        for (;;) {
-            auto previous = attempts;
-            if (!query(InputRequest::source, filename, nullptr, source.data(), source.size(), &lease, &attempts)) break;
-            const bool started = playNative(source.data());
-            SecureZeroMemory(source.data(), source.size() * sizeof(wchar_t));
-            if (started) {
-                if (attempts.rolling) query(InputRequest::started, filename, nullptr, nullptr, 0, nullptr, &previous);
-                return 0;
-            }
-            if (lease != INVALID_HANDLE_VALUE) { CloseHandle(lease); lease = INVALID_HANDLE_VALUE; }
-            if (previous.triedCache == attempts.triedCache && previous.excluded == attempts.excluded) break;
-        }
+        auto file = std::make_unique<AudioFile>();
+        int status = query(InputRequest::begin, filename, nullptr, file->path.data(), file->path.size(),
+                           &file->lease, &file->attempts);
+        if (status == tangerine::fileReady && startFile(file)) return 0;
+        if (status != tangerine::unavailable && queueDownload(filename, file->attempts.excluded)) return 0;
     } catch (...) {}
     stop();
     return 1;
+}
+
+void quit() {
+    stop();
+    {
+        std::scoped_lock lock(downloadMutex);
+        shuttingDown = true;
+    }
+    downloadReady.notify_one();
+    if (downloader.joinable()) downloader.join();
+    if (receiver) { DestroyWindow(receiver); receiver = nullptr; }
+    UnregisterClassW(receiverClass, input.hDllInstance);
+    shuttingDown = false;
 }
 
 void about(HWND w) {
@@ -175,25 +305,32 @@ extern "C" __declspec(dllexport) In_Module* winampGetInModule2() {
         input.FileExtensions = extensions;
         input.UsesOutputPlug = IN_MODULE_FLAG_USES_OUTPUT_PLUGIN;
         input.Config = input.About = about;
-        input.Quit = stop;
+        input.Quit = quit;
         input.GetFileInfo = getFileInfo;
         input.InfoBox = [](const wchar_t*, HWND) { return 1; }; // File info unchanged
         input.IsOurFile = [](const wchar_t* file) { return query(InputRequest::recognize, file); };
         input.Play = play;
         input.Stop = stop;
-        input.Pause = [] { if (nativePlayer) nativePlayer->Pause(); };
-        input.UnPause = [] { if (nativePlayer) nativePlayer->UnPause(); };
-        input.IsPaused = [] { return nativePlayer ? nativePlayer->IsPaused() : 0; };
+        input.Pause = [] { paused = true; if (nativePlayer) nativePlayer->Pause(); };
+        input.UnPause = [] { paused = false; if (nativePlayer) nativePlayer->UnPause(); };
+        input.IsPaused = [] { return nativePlayer ? nativePlayer->IsPaused() : int(paused); };
         input.GetLength = [] {
             return duration >= 0 || !nativePlayer ? duration : nativePlayer->GetLength();
         };
-        input.GetOutputTime = [] { return nativePlayer ? nativePlayer->GetOutputTime() : 0; };
+        input.GetOutputTime = [] { return nativePlayer ? nativePlayer->GetOutputTime() : std::max(0, pendingSeek); };
         input.SetOutputTime = [](int ms) {
             if (ms >= 0 && nativePlayer && nativePlayer->is_seekable) nativePlayer->SetOutputTime(ms);
+            else if (ms >= 0 && !nativePlayer) pendingSeek = ms;
         };
-        input.SetVolume = [](int volume) { if (nativePlayer) nativePlayer->SetVolume(volume); };
-        input.SetPan = [](int pan) { if (nativePlayer) nativePlayer->SetPan(pan); };
+        input.SetVolume = [](int level) { if (level >= 0) volume = level; if (nativePlayer) nativePlayer->SetVolume(level); };
+        input.SetPan = [](int level) { pan = level; if (nativePlayer) nativePlayer->SetPan(level); };
         input.EQSet = [](int on, char bands[10], int preamp) {
+            if (bands) {
+                equalizerEnabled = on;
+                equalizerPreamp = preamp;
+                std::copy_n(bands, equalizerBands.size(), equalizerBands.begin());
+                haveEqualizer = true;
+            }
             if (nativePlayer && nativePlayer->EQSet) nativePlayer->EQSet(on, bands, preamp);
         };
         return true;

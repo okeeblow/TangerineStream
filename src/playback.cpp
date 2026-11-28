@@ -42,6 +42,93 @@ bool audioType(std::string_view mime) {
         mime == "application/octet-stream" || mime == "application/flac" || mime == "application/x-flac";
 }
 
+void checkAudioResponse(Response& response, AudioStream& stream, const InputExtensions& inputs) {
+    if (response.status == 408 || response.status == 429 || response.status >= 500)
+        throw ConnectionError("The server returned HTTP " + std::to_string(response.status) + ".");
+    auto mime = response.header(WINHTTP_QUERY_CONTENT_TYPE);
+    mime = mime.substr(0, mime.find(';'));
+    if ((response.status != 200 && response.status != 206) || (!mime.empty() && !audioType(mime)))
+        throw Error("The server did not return an audio file.");
+    if (stream.format.empty()) return;
+    // Some legacy servers send AAC in MP4 even when asked for a bare AAC stream.
+    if (mime == "audio/mp4" || mime == "video/mp4" || mime == "audio/x-m4a")
+        stream.format = inputs.count("m4a") ? "m4a" : "mp4";
+    else if (mime == "audio/aac") stream.format = "aac";
+    else if (mime == "audio/ogg" && stream.format != "opus") stream.format = "ogg";
+    else if (mime == "audio/mpeg") stream.format = "mp3";
+    else if (mime == "audio/flac" || mime == "audio/x-flac") stream.format = "flac";
+}
+
+class PlaybackDownload {
+public:
+    PlaybackDownload(Store& store, Id key) : store_(store), key_(key),
+        path_(store.partialPath(key).parent_path() / (L"play-" + wide(randomHex()) + L".part")),
+        file_(CreateFileW(path_.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr)) {
+        if (!file_) throw Error("Could not create a playback file.");
+    }
+    ~PlaybackDownload() {
+        file_.close();
+        if (!path_.empty()) DeleteFileW(path_.c_str());
+        if (reserved_) store_.release(key_);
+    }
+    void start(std::int64_t length, bool retain) {
+        LARGE_INTEGER zero{};
+        if (!SetFilePointerEx(file_.get(), zero, nullptr, FILE_BEGIN) || !SetEndOfFile(file_.get()))
+            throw Error("Could not restart the playback download.");
+        bytes = 0;
+        if (retain && !reserved_) reserved_ = store_.reserve(key_, length, false);
+        reservedBytes_ = std::max<std::int64_t>(0, length);
+        if (reserved_ && !store_.growReservation(key_, reservedBytes_)) discardReservation();
+    }
+    void write(const char* data, DWORD size) {
+        if (reserved_ && bytes + size > reservedBytes_) {
+            reservedBytes_ = ((bytes + size + MiB - 1) / MiB) * MiB;
+            if (!store_.growReservation(key_, reservedBytes_)) discardReservation();
+        }
+        DWORD written = 0;
+        if (!WriteFile(file_.get(), data, size, &written, nullptr) || written != size)
+            throw Error("Could not write the playback file. Check the free disk space.");
+        bytes += written;
+    }
+    HANDLE finish(const Track& track, const std::string& format, std::filesystem::path& result, bool& temporary) {
+        file_.close();
+        HANDLE lease = INVALID_HANDLE_VALUE;
+        result = path_;
+        if (reserved_ && store_.publish(key_, bytes, format, result, &lease)) {
+            path_.clear();
+            temporary = false;
+        } else {
+            const auto& suffix = format.empty() ? track.suffix : format;
+            if (suffix.empty() || suffix.size() > 12 ||
+                suffix.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != suffix.npos)
+                throw Error("Invalid audio file extension.");
+            result.replace_extension(wide(suffix));
+            if (!MoveFileW(path_.c_str(), result.c_str())) throw Error("Could not name the playback file.");
+            path_ = result;
+            lease = CreateFileW(result.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            temporary = true;
+            if (lease != INVALID_HANDLE_VALUE) path_.clear();
+        }
+        if (lease == INVALID_HANDLE_VALUE) throw Error("Could not open the downloaded track for playback.");
+        return lease;
+    }
+    std::int64_t bytes = 0;
+private:
+    void discardReservation() { store_.release(key_); reserved_ = false; }
+    Store& store_;
+    Id key_;
+    std::filesystem::path path_;
+    File file_;
+    std::int64_t reservedBytes_ = 0;
+    bool reserved_ = false;
+};
+
+std::string validator(Response& response) {
+    auto tag = response.header(WINHTTP_QUERY_ETAG);
+    if (tag.size() >= 2 && tag.front() == '"' && tag.back() == '"') return tag;
+    return response.header(WINHTTP_QUERY_LAST_MODIFIED);
+}
+
 class CacheWrite {
 public:
     CacheWrite(Store& store, const Track& track, std::int64_t expected, bool upgrade)
@@ -76,7 +163,8 @@ public:
         if (!file_ || bytes_ == 0 || (expected_ >= 0 && expected_ != bytes_) ||
             !FlushFileBuffers(file_.get())) return false;
         file_.close();
-        return store_.publish(key_, bytes_, format);
+        auto path = store_.partialPath(key_);
+        return store_.publish(key_, bytes_, format, path);
     }
 
 private:
@@ -164,6 +252,75 @@ bool meteredInternet() {
                  NLM_CONNECTION_COST_APPROACHINGDATALIMIT)) != 0;
 }
 
+HANDLE prepareAudio(Store& store, HttpClient& http, const Track& track, const Server& profile,
+                    const InputExtensions& inputs, unsigned& excluded, const std::function<bool()>& cancelled,
+                    std::filesystem::path& path, bool& temporary) {
+    auto api = http.connect(profile);
+    for (;;) {
+        if (cancelled()) throw Error("Playback cancelled.");
+        if (!store.networkAvailable(track.server)) throw Error("The server is offline.");
+        const bool metered = meteredInternet();
+        const auto& quality = metered ? profile.metered : profile.unmetered;
+        const bool retain = !metered || track.favorite || track.pinned;
+        const unsigned previousChoices = excluded;
+        bool costChanged = false;
+        auto nextCheck = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        auto continueTransfer = [&] {
+            if (cancelled()) throw Error("Playback cancelled.");
+            auto now = std::chrono::steady_clock::now();
+            if (now >= nextCheck) {
+                if (!store.networkAvailable(track.server)) throw Error("The server is offline.");
+                costChanged = meteredInternet() != metered;
+                nextCheck = now + std::chrono::seconds(1);
+            }
+            return !costChanged;
+        };
+        auto stream = api->stream(track, quality, inputs, excluded);
+        excluded |= stream.choice;
+        PlaybackDownload file(store, track.key);
+        std::int64_t total = -1;
+        std::string version;
+        for (int attempt = 0; continueTransfer(); ++attempt) {
+            const bool resume = file.bytes > 0 && total > file.bytes && !version.empty();
+            const auto headers = resume ? L"Range: bytes=" + std::to_wstring(file.bytes) +
+                L"-\r\nIf-Range: " + wide(version) + L"\r\n" : L"";
+            try {
+                Response response(http, stream.url, L"GET", headers);
+                if (resume && response.status == 416) { version.clear(); throw ConnectionError("The audio file changed."); }
+                checkAudioResponse(response, stream, inputs);
+                if (!stream.format.empty() && !acceptsExtension(inputs, stream.format)) break;
+                const auto length = number(response.header(WINHTTP_QUERY_CONTENT_LENGTH));
+                if (response.status == 206) {
+                    const auto range = "bytes " + std::to_string(file.bytes) + "-" + std::to_string(total-1) + "/" + std::to_string(total);
+                    auto current = validator(response);
+                    if (!resume || response.header(WINHTTP_QUERY_CONTENT_RANGE) != range ||
+                        (!current.empty() && current != version) || (length >= 0 && length != total - file.bytes)) {
+                        version.clear();
+                        throw ConnectionError("The server returned an inconsistent audio range.");
+                    }
+                } else {
+                    total = length;
+                    version = stream.choice == originalSource ? validator(response) : std::string{};
+                    file.start(total, retain);
+                }
+                char buffer[64 * 1024];
+                while (auto count = response.read(buffer, sizeof(buffer))) {
+                    if (!continueTransfer()) break;
+                    if (total >= 0 && count > total - file.bytes) throw Error("The server exceeded the audio file length.");
+                    file.write(buffer, count);
+                }
+                if (!continueTransfer()) break;
+                if (!file.bytes || (total >= 0 && file.bytes != total))
+                    throw ConnectionError("The audio download ended early.");
+                return file.finish(track, stream.format, path, temporary);
+            } catch (const ConnectionError&) {
+                if (attempt >= 2) throw;
+            }
+        }
+        if (costChanged) excluded = previousChoices;
+    }
+}
+
 void downloadAudio(Store& store, HttpClient& http, const Track& track, const Server& profile, ServerApi& api,
                    bool metered, const std::atomic_bool& stopping, const InputExtensions& inputs,
                    unsigned excluded, bool (*currentCost)()) {
@@ -184,21 +341,9 @@ void downloadAudio(Store& store, HttpClient& http, const Track& track, const Ser
         }
         if (stopping || !store.networkAvailable(track.server) || currentCost() != metered) return;
         response.emplace(http, stream.url, L"GET", L"");
-        auto mime = response->header(WINHTTP_QUERY_CONTENT_TYPE);
-        if (response->status == 408 || response->status >= 500)
-            throw ConnectionError("The server returned HTTP " + std::to_string(response->status) + ".");
-        if (response->status != 200 || (!mime.empty() && !audioType(mime)))
+        checkAudioResponse(*response, stream, inputs);
+        if (response->status != 200)
             throw Error("The server did not provide a complete audio file.");
-        // Legacy servers can pick a different container (notably AAC in MP4).
-        if (!stream.format.empty()) {
-            mime = mime.substr(0, mime.find(';'));
-            if (mime == "audio/mp4" || mime == "video/mp4" || mime == "audio/x-m4a")
-                stream.format = inputs.count("m4a") ? "m4a" : "mp4";
-            else if (mime == "audio/aac") stream.format = "aac";
-            else if (mime == "audio/ogg" && stream.format != "opus") stream.format = "ogg";
-            else if (mime == "audio/mpeg") stream.format = "mp3";
-            else if (mime == "audio/flac" || mime == "audio/x-flac") stream.format = "flac";
-        }
         if (stream.format.empty() || acceptsExtension(inputs, stream.format)) break;
         // A legacy encoder can return a different container from the one requested.
         excluded |= stream.choice;

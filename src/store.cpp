@@ -955,6 +955,11 @@ void Store::reconcile() {
     for (const auto& entry : std::filesystem::directory_iterator(cache_)) {
         auto extension = entry.path().extension();
         auto stem = entry.path().stem().string();
+        if (stem.size() == 37 && stem.compare(0, 5, "play-") == 0 &&
+            stem.find_first_not_of("0123456789abcdef", 5) == std::string::npos) {
+            DeleteFileW(entry.path().c_str());
+            continue;
+        }
         const bool media = stem.size() > 6 && stem.compare(stem.size()-6, 6, ".media") == 0;
         const bool encoded = stem.size() > 8 && stem.compare(stem.size()-8, 8, ".encoded") == 0;
         if (media) stem.resize(stem.size()-6);
@@ -1016,7 +1021,8 @@ bool Store::growReservation(Id key, std::int64_t bytes) {
     return true;
 }
 
-bool Store::publish(Id key, std::int64_t bytes, const std::string& format) {
+bool Store::publish(Id key, std::int64_t bytes, const std::string& format, std::filesystem::path& file,
+                    HANDLE* playbackLease) {
     std::scoped_lock lock(mutex_);
     downloads_.at(key) = 0;
     auto track = loadTrack(key, true);
@@ -1028,9 +1034,12 @@ bool Store::publish(Id key, std::int64_t bytes, const std::string& format) {
     }
     const auto previous = track.bytes ? audioPath(track) : std::filesystem::path{};
     track.cachedFormat = format;
-    if (!MoveFileExW(partialPath(key).c_str(), audioPath(track).c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    const auto target = audioPath(track);
+    if (!MoveFileExW(file.c_str(), target.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        if (playbackLease) return false; // The staged file is still playable.
         throw Error("The completed audio file could not be saved.");
+    }
     try {
         prepare("UPDATE tracks SET bytes=?,last_use=?,cached_format=?,retry_at=0 WHERE key=?")
             .bind(bytes).bind(nowMs()).bind(format).bind(key).run();
@@ -1039,6 +1048,10 @@ bool Store::publish(Id key, std::int64_t bytes, const std::string& format) {
         throw;
     }
     if (!previous.empty()) DeleteFileW(previous.c_str());
+    file = target;
+    // Hold the new track open before another thread can evict it.
+    if (playbackLease)
+        *playbackLease = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     return true;
 }
 
