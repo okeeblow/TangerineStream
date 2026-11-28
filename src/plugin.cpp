@@ -1313,6 +1313,8 @@ LRESULT CALLBACK libraryListProc(HWND list, UINT msg, WPARAM w, LPARAM l) {
     return CallWindowProcW(skinProc, list, msg, w, l);
 }
 
+INT_PTR CALLBACK welcomeProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l);
+
 class View {
 public:
     View(HWND window, const Navigation& node)
@@ -1344,9 +1346,9 @@ public:
             MLSkinnedDivider_SetCallback(divider, dividerMoved, reinterpret_cast<LPARAM>(this));
         }
         skinWindow(GetDlgItem(hwnd, IDC_QUERY), SKINNEDWND_TYPE_EDIT, SWES_VCENTER);
-        for (int id : {IDC_SEARCH_LABEL, IDC_STATUS, IDC_WELCOME_TEXT})
+        for (int id : {IDC_SEARCH_LABEL, IDC_STATUS})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_STATIC);
-        for (int id : {IDC_SORT_MENU, IDC_VIEW_OPTIONS, IDC_SOURCE_MENU, IDC_ADD_SERVER, IDC_BACK, IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_CACHE_MENU})
+        for (int id : {IDC_SORT_MENU, IDC_VIEW_OPTIONS, IDC_SOURCE_MENU, IDC_BACK, IDC_OPEN, IDC_PLAY, IDC_ENQUEUE, IDC_CACHE_MENU})
             skinWindow(GetDlgItem(hwnd, id), SKINNEDWND_TYPE_BUTTON);
         SetDlgItemTextW(hwnd, IDC_VIEW_OPTIONS, L"\u2261");
         tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
@@ -1468,6 +1470,7 @@ private:
     std::wstring selectionSummary;
     std::string message;
     std::vector<LRESULT> legacySkins;
+    HWND welcomePane = nullptr;
     HWND tip = nullptr;
     const Id treeServer;
     Id currentServer = 0;
@@ -1592,21 +1595,26 @@ void View::populateServers() {
     const bool wasWelcome = servers.empty();
     const bool hadFocus = IsChild(hwnd, GetFocus());
     servers = app->store.servers();
-    const bool welcome = servers.empty();
-    if (welcome) {
+    if (servers.empty()) {
         KillTimer(hwnd, viewTimer);
-        for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
-            const int id = GetDlgCtrlID(child);
-            if (id != IDC_WELCOME_TEXT && id != IDC_ADD_SERVER) ShowWindow(child, SW_HIDE);
+        for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
+            if (child != welcomePane) ShowWindow(child, SW_HIDE);
+        if (!welcomePane) {
+            welcomePane = CreateDialogW(plugin.hDllInstance, MAKEINTRESOURCEW(IDD_LIBRARY_WELCOME), hwnd, welcomeProc);
+            if (!welcomePane) throw Error("Could not open the library welcome screen.");
         }
-    } else SetTimer(hwnd, viewTimer, 2000, nullptr);
-    for (int id : {IDC_WELCOME_TEXT, IDC_ADD_SERVER})
-        ShowWindow(GetDlgItem(hwnd, id), welcome ? SW_SHOWNA : SW_HIDE);
+    } else {
+        if (welcomePane) {
+            DestroyWindow(welcomePane);
+            welcomePane = nullptr;
+        }
+        SetTimer(hwnd, viewTimer, 2000, nullptr);
+    }
     currentServer = treeServer ? treeServer : app->selectedServer;
     if (!selected()) currentServer = servers.empty() ? 0 : servers.front().id;
     resetLocation();
-    if (hadFocus && wasWelcome != welcome)
-        SetFocus(welcome ? GetDlgItem(hwnd, IDC_ADD_SERVER) : list);
+    if (hadFocus && wasWelcome != servers.empty())
+        SetFocus(welcomePane ? GetDlgItem(welcomePane, IDC_ADD_SERVER) : list);
 }
 
 void View::resetLocation() {
@@ -2877,7 +2885,10 @@ void layoutWelcome(HWND hwnd, int width, int height) {
 
 void View::layout(int width, int height) {
     if (servers.empty()) {
-        layoutWelcome(hwnd, width, height);
+        if (welcomePane) {
+            layoutWelcome(welcomePane, width, height);
+            SetWindowPos(welcomePane, HWND_TOP, 0, 0, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
         return;
     }
     const int dpi = windowDpi(hwnd);
@@ -3077,6 +3088,22 @@ LRESULT CALLBACK searchProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l, UINT_PTR, D
         }
     }
     return DefSubclassProc(hwnd, msg, w, l);
+}
+
+INT_PTR CALLBACK welcomeProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_INITDIALOG) {
+        skinWindow(hwnd, SKINNEDWND_TYPE_DIALOG);
+        skinWindow(GetDlgItem(hwnd, IDC_WELCOME_TEXT), SKINNEDWND_TYPE_STATIC);
+        HWND button = GetDlgItem(hwnd, IDC_ADD_SERVER);
+        skinWindow(button, SKINNEDWND_TYPE_BUTTON);
+        SetWindowSubclass(button, searchProc, 1, reinterpret_cast<DWORD_PTR>(GetParent(hwnd)));
+        return TRUE;
+    }
+    if (msg == WM_COMMAND && LOWORD(w) == IDC_ADD_SERVER && HIWORD(w) == BN_CLICKED) {
+        SendMessageW(GetParent(hwnd), msg, w, l);
+        return TRUE;
+    }
+    return FALSE;
 }
 
 INT_PTR CALLBACK viewProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {

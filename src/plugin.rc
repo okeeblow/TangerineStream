@@ -48,13 +48,19 @@ BEGIN
     CONTROL "", IDC_FILTER_THIRD, "SysListView32", LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_TABSTOP | NOT WS_VISIBLE, 0, 0, 1, 1
     CONTROL "", IDC_DIVIDER_H, "Static", SS_NOTIFY | NOT WS_VISIBLE, 0, 0, 1, 1
     CONTROL "", IDC_DIVIDER_V, "Static", SS_NOTIFY | NOT WS_VISIBLE, 0, 0, 1, 1
-    CTEXT "Browse and play music from your Navidrome or OpenSubsonic server in WACUP.\r\n\r\nTo connect, you'll need your server address, username, and password.", IDC_WELCOME_TEXT, 2, 2, 426, 45, SS_NOPREFIX | NOT WS_VISIBLE
-    PUSHBUTTON "&Add server...", IDC_ADD_SERVER, 165, 52, 100, 30, BS_MULTILINE | NOT WS_VISIBLE
     PUSHBUTTON "Open", IDC_OPEN, 2, 235, 30, 13
     PUSHBUTTON "Play", IDC_PLAY, 2, 235, 30, 13
     PUSHBUTTON "Enqueue", IDC_ENQUEUE, 34, 235, 40, 13
     PUSHBUTTON "Cache", IDC_CACHE_MENU, 76, 235, 34, 13
     LTEXT "", IDC_STATUS, 112, 235, 316, 13, SS_CENTERIMAGE | SS_NOPREFIX | SS_ENDELLIPSIS
+END
+
+IDD_LIBRARY_WELCOME DIALOGEX 0, 0, 430, 250
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD | WS_CLIPCHILDREN
+FONT 9, "Segoe UI"
+BEGIN
+    CTEXT "Browse and play music from your Navidrome or OpenSubsonic server in WACUP.\r\n\r\nTo connect, you'll need your server address, username, and password.", IDC_WELCOME_TEXT, 2, 2, 426, 45, SS_NOPREFIX
+    PUSHBUTTON "&Add server...", IDC_ADD_SERVER, 165, 52, 100, 30, BS_MULTILINE
 END
 
 #define VIEW_WIDTH 310
