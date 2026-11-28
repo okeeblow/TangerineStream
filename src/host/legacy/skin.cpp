@@ -188,6 +188,9 @@ LRESULT CALLBACK dialogProc(HWND window, UINT msg, WPARAM w, LPARAM l, UINT_PTR 
             control.handle = skin.send(command, reinterpret_cast<WPARAM>(control.window));
             if (control.handle <= 1) control.handle = 0;
             if (control.type == SKINNEDWND_TYPE_LISTVIEW) {
+                // Initialize the skinned scrollbars before a column resize can
+                // trigger their first update from inside a header notification.
+                if (control.handle) skin.send(ML_IPC_LISTVIEW_UPDATE, control.handle);
                 ListView_SetUnicodeFormat(control.window, TRUE);
                 skin.palette(control.window);
             } else if (!control.handle && skin.color) {
